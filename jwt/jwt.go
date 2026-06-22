@@ -37,18 +37,18 @@ var (
 )
 
 // generateJTI 生成唯一的 JWT ID
-func generateJTI() string {
+func generateJTI() (string, error) {
 	bytes := make([]byte, 16)
-	rand.Read(bytes)
-	return base64.URLEncoding.EncodeToString(bytes)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("生成 JTI 失败: %w", err)
+	}
+	return base64.URLEncoding.EncodeToString(bytes), nil
 }
 
 // TokenBlacklist Token 黑名单管理（使用 JTI 优化）
 type TokenBlacklist struct{}
 
 // Add 将 Token 的 JTI 加入黑名单
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 JTI（32字节）替代完整 Token（数百字节），大幅节省 Redis 内存
 // 参数: jti JWT ID，expiry Token 过期时间
 func (tb *TokenBlacklist) Add(jti string, expiry time.Time) error {
 	if database.RedisClient == nil {
@@ -84,13 +84,14 @@ func (tb *TokenBlacklist) IsBlacklisted(jti string) bool {
 var tokenBlacklist = &TokenBlacklist{}
 
 // GenerateToken 生成 JWT Token
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动生成 JTI，支持高效黑名单机制
 func GenerateToken(userID uint, username, role, userType string) (string, error) {
 	cfg := config.Get()
 
 	// 生成唯一的 JWT ID
-	jti := generateJTI()
+	jti, err := generateJTI()
+	if err != nil {
+		return "", err
+	}
 
 	claims := Claims{
 		UserID:   userID,
@@ -115,7 +116,10 @@ func GenerateToken(userID uint, username, role, userType string) (string, error)
 func GenerateTokenWithCustomExpiry(userID uint, username, role, userType string, expireSeconds int) (string, error) {
 	cfg := config.Get()
 
-	jti := generateJTI()
+	jti, err := generateJTI()
+	if err != nil {
+		return "", err
+	}
 
 	claims := Claims{
 		UserID:   userID,
@@ -137,8 +141,6 @@ func GenerateTokenWithCustomExpiry(userID uint, username, role, userType string,
 }
 
 // ParseToken 解析 JWT Token
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 JTI 检查黑名单，效率更高
 func ParseToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
@@ -171,8 +173,6 @@ func ParseToken(tokenString string) (*Claims, error) {
 }
 
 // InvalidateToken 使 Token 失效（加入黑名单）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 JTI 而非完整 Token，节省 Redis 内存
 func InvalidateToken(tokenString string) error {
 	cfg := config.Get()
 

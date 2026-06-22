@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
+
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
 )
 
 func createProject(name string) {
@@ -56,7 +58,7 @@ func createProject(name string) {
 	files := map[string]string{
 		name + "/main.go":         templates.Main,
 		name + "/config.yaml":     templates.Config,
-		name + "/go.mod":          fmt.Sprintf(templates.GoMod, module),
+		name + "/go.mod":          fmt.Sprintf(templates.GoMod, module, xlgo.Version),
 		name + "/Makefile":        templates.Makefile,
 		name + "/.gitignore":      templates.Gitignore,
 		name + "/handler/home.go": templates.Handler,
@@ -125,6 +127,7 @@ func createHandler(name, nameTitle string) {
 		nameTitle, name, name, nameTitle,
 		nameTitle, name, name, nameTitle,
 	)
+	content = replaceModuleImports(content)
 
 	writeFile(path, content)
 	fmt.Printf("✓ 创建处理器: %s\n", path)
@@ -142,6 +145,7 @@ func createRepository(name, nameTitle string) {
 		nameTitle, name, nameTitle, nameTitle, nameTitle, nameTitle,
 		nameTitle, nameTitle, nameTitle,
 	)
+	content = replaceModuleImports(content)
 
 	writeFile(path, content)
 	fmt.Printf("✓ 创建仓库: %s\n", path)
@@ -177,6 +181,7 @@ func createService(name, nameTitle string) {
 		nameTitle, nameTitle,
 		nameTitle, nameTitle,
 	)
+	content = replaceModuleImports(content)
 
 	writeFile(path, content)
 	fmt.Printf("✓ 创建服务: %s\n", path)

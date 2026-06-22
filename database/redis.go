@@ -36,10 +36,20 @@ func InitRedis(cfg *config.Config) error {
 
 // CloseRedis 关闭 Redis 连接
 func CloseRedis() error {
-	if RedisClient != nil {
-		return RedisClient.Close()
+	if RedisClient == nil {
+		return nil
 	}
-	return nil
+	err := RedisClient.Close()
+	RedisClient = nil
+	return err
+}
+
+// HealthCheckRedis Redis 健康检查
+func HealthCheckRedis(ctx context.Context) error {
+	if RedisClient == nil {
+		return fmt.Errorf("Redis 未初始化")
+	}
+	return RedisClient.Ping(ctx).Err()
 }
 
 // GetRedis 获取 Redis 客户端

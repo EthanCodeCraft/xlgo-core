@@ -5,8 +5,6 @@ import (
 )
 
 // IsPhone 检查是否为有效的中国大陆手机号
-// 评分: ⭐⭐⭐⭐
-// 理由: 常用验证，但正则需要随运营商号段更新
 // 注意: 正则基于当前号段，新号段开放时需更新
 func IsPhone(phone string) bool {
 	// 1开头，第二位为3-9，共11位
@@ -16,8 +14,6 @@ func IsPhone(phone string) bool {
 }
 
 // IsEmail 检查是否为有效的邮箱地址
-// 评分: ⭐⭐⭐⭐
-// 理由: 常用验证，简单正则覆盖大部分场景
 func IsEmail(email string) bool {
 	// 简单邮箱验证：xxx@xxx.xxx
 	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
@@ -26,8 +22,6 @@ func IsEmail(email string) bool {
 }
 
 // IsIPv4 检查是否为有效的 IPv4 地址
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 网络编程常用验证
 func IsIPv4(ip string) bool {
 	pattern := `^(\d{1,3}\.){3}\d{1,3}$`
 	matched, _ := regexp.MatchString(pattern, ip)
@@ -46,8 +40,6 @@ func IsIPv4(ip string) bool {
 }
 
 // IsIDCard 检查是否为有效的中国身份证号（18位）
-// 评分: ⭐⭐⭐
-// 理由: 身份证验证需求常见，但校验位算法复杂，此为简化版
 // 注意: 仅校验格式，不校验校验位
 func IsIDCard(id string) bool {
 	// 18位身份证：6位地区码 + 8位生日 + 3位顺序码 + 1位校验码
@@ -57,8 +49,6 @@ func IsIDCard(id string) bool {
 }
 
 // IsChinese 检查字符串是否全部为中文字符
-// 评分: ⭐⭐⭐⭐
-// 理由: 中文内容校验常用
 func IsChinese(s string) bool {
 	for _, r := range s {
 		if r < 0x4E00 || r > 0x9FFF {
@@ -69,8 +59,6 @@ func IsChinese(s string) bool {
 }
 
 // HasChinese 检查字符串是否包含中文字符
-// 评分: ⭐⭐⭐⭐
-// 理由: 混合内容检测
 func HasChinese(s string) bool {
 	for _, r := range s {
 		if r >= 0x4E00 && r <= 0x9FFF {
@@ -81,8 +69,6 @@ func HasChinese(s string) bool {
 }
 
 // IsNumeric 检查字符串是否全部为数字
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 简单高效的数字检测
 func IsNumeric(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -96,8 +82,6 @@ func IsNumeric(s string) bool {
 }
 
 // IsAlpha 检查字符串是否全部为字母
-// 评分: ⭐⭐⭐⭐
-// 理由: 字母检测
 func IsAlpha(s string) bool {
 	if len(s) == 0 {
 		return false
@@ -111,8 +95,6 @@ func IsAlpha(s string) bool {
 }
 
 // IsAlphanumeric 检查字符串是否全部为字母或数字
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 用户名、密码等常用验证
 func IsAlphanumeric(s string) bool {
 	if len(s) == 0 {
 		return false

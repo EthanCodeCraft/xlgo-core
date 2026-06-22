@@ -13,8 +13,6 @@ import (
 )
 
 // GzipCompress 压缩数据
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: API响应压缩、数据传输常用
 func GzipCompress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -29,8 +27,6 @@ func GzipCompress(data []byte) ([]byte, error) {
 }
 
 // GzipDecompress 解压缩数据
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: GzipCompress 的反向操作
 func GzipDecompress(data []byte) ([]byte, error) {
 	buf := bytes.NewReader(data)
 	gz, err := gzip.NewReader(buf)
@@ -42,8 +38,6 @@ func GzipDecompress(data []byte) ([]byte, error) {
 }
 
 // GzipCompressFile 压缩文件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 日志归档、文件传输常用
 func GzipCompressFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -71,8 +65,6 @@ func GzipCompressFile(src, dst string) error {
 }
 
 // GzipDecompressFile 解压文件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: GzipCompressFile 的反向操作
 func GzipDecompressFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -97,8 +89,6 @@ func GzipDecompressFile(src, dst string) error {
 }
 
 // Zip 压缩文件或目录
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 批量打包下载、备份常用
 // 参数: zipPath 目标zip文件路径，paths 要压缩的文件或目录列表
 func Zip(zipPath string, paths []string) error {
 	// 创建目标目录
@@ -166,8 +156,6 @@ func Zip(zipPath string, paths []string) error {
 }
 
 // Unzip 解压 zip 文件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: Zip 的反向操作
 // 参数: zipPath zip文件路径，dstDir 目标目录
 func Unzip(zipPath, dstDir string) error {
 	reader, err := zip.OpenReader(zipPath)

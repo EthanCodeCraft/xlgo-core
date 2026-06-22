@@ -1,21 +1,64 @@
 package router
 
 import (
+	"context"
+	"net/http"
+
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 )
 
+// HealthCheck 健康检查项
+type HealthCheck struct {
+	Name     string
+	Check    func(context.Context) error
+	Disabled bool
+}
+
+// RegisterHealthRoute 注册健康检查路由
+func RegisterHealthRoute(r *gin.Engine, checks ...HealthCheck) {
+	r.GET("/health", func(c *gin.Context) {
+		if len(checks) == 0 {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+			return
+		}
+
+		status := "ok"
+		code := http.StatusOK
+		result := make(map[string]string, len(checks))
+		ctx := c.Request.Context()
+		for _, check := range checks {
+			if check.Name == "" {
+				continue
+			}
+			if check.Disabled || check.Check == nil {
+				result[check.Name] = "disabled"
+				continue
+			}
+			if err := check.Check(ctx); err != nil {
+				result[check.Name] = "error"
+				status = "error"
+				code = http.StatusServiceUnavailable
+				continue
+			}
+			result[check.Name] = "ok"
+		}
+
+		c.JSON(code, gin.H{"status": status, "checks": result})
+	})
+}
+
+// RegisterSwaggerRoutes 注册 Swagger 文档路由
+func RegisterSwaggerRoutes(r *gin.Engine) {
+	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+}
+
 // RegisterDefaultRoutes 注册框架默认路由（健康检查、Swagger）
 // 用户可以选择使用或不使用这些默认路由
-func RegisterDefaultRoutes(r *gin.Engine) {
-	// Swagger 文档路由
-	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
-
-	// 健康检查
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
-	})
+func RegisterDefaultRoutes(r *gin.Engine, checks ...HealthCheck) {
+	RegisterSwaggerRoutes(r)
+	RegisterHealthRoute(r, checks...)
 }
 
 // DefaultModule 默认路由模块（可用于 WithModules）
@@ -28,7 +71,7 @@ func (m *defaultModule) Register(r *gin.RouterGroup) {
 	// 作为模块注册时，路由在根路径
 	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "ok"})
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 }
 

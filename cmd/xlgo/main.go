@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
 )
 
 func printUsage() {
@@ -47,7 +49,7 @@ func main() {
 		makeFile(os.Args[2], os.Args[3])
 
 	case "version":
-		fmt.Println("xlgo v1.0.0")
+		fmt.Printf("xlgo v%s\n", xlgo.Version)
 
 	default:
 		printUsage()

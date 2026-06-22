@@ -23,8 +23,6 @@ const (
 )
 
 // RandString 生成指定长度的随机字符串（字母+数字）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 sync.Pool 复用 rand.Source，性能优秀；位运算优化高效
 func RandString(n int) string {
 	if n <= 0 {
 		return ""
@@ -48,8 +46,6 @@ func RandString(n int) string {
 }
 
 // RandDigit 生成指定长度的随机数字字符串
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 同 RandString，适用于验证码、订单号等场景
 func RandDigit(n int) string {
 	if n <= 0 {
 		return ""
@@ -73,8 +69,6 @@ func RandDigit(n int) string {
 }
 
 // RandInt 返回 [min, max) 范围内的随机整数
-// 评分: ⭐⭐⭐⭐
-// 理由: 实用函数，自动处理 min > max 的情况
 func RandInt(min, max int) int {
 	if min == max {
 		return min
@@ -88,8 +82,6 @@ func RandInt(min, max int) int {
 }
 
 // RandInt64 返回 [min, max) 范围内的随机 int64
-// 评分: ⭐⭐⭐⭐
-// 理由: RandInt 的 int64 版本，适用于大范围随机数
 func RandInt64(min, max int64) int64 {
 	if min == max {
 		return min

@@ -69,8 +69,6 @@ func GetIDFromPath(c *gin.Context, paramName string) (uint, bool) {
 // ===== 类型安全的参数获取函数 =====
 
 // QueryInt 获取 Query 参数中的整数（带默认值）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 类型安全，避免每次手动转换
 func QueryInt(c *gin.Context, key string, def int) int {
 	return utils.ToIntDefault(c.Query(key), def)
 }
@@ -95,8 +93,6 @@ func QueryBool(c *gin.Context, key string, def bool) bool {
 }
 
 // PathInt 从路径参数获取整数（带默认值）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: RESTful API 常用，如 /users/:id
 func PathInt(c *gin.Context, key string, def int) int {
 	val := strings.Trim(c.Param(key), "/")
 	return utils.ToIntDefault(val, def)
@@ -115,8 +111,6 @@ func PathUint64(c *gin.Context, key string, def uint64) uint64 {
 }
 
 // FormInt 获取 POST 表单参数中的整数（带默认值）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 传统表单提交常用
 func FormInt(c *gin.Context, key string, def int) int {
 	return utils.ToIntDefault(c.PostForm(key), def)
 }

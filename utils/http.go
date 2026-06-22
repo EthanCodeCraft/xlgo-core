@@ -17,8 +17,6 @@ import (
 )
 
 // HTTPClient HTTP 客户端封装
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 链式调用设计优雅，Transport 复用，连接池优化
 type HTTPClient struct {
 	client    *http.Client
 	transport *http.Transport
@@ -56,8 +54,6 @@ var DefaultHTTPClientConfig = HTTPClientConfig{
 }
 
 // NewHTTPClient 创建 HTTP 客户端
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: Transport 在初始化时创建，连接池可复用
 func NewHTTPClient() *HTTPClient {
 	cfg := DefaultHTTPClientConfig
 	return NewHTTPClientWithConfig(cfg)
@@ -93,8 +89,6 @@ func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 }
 
 // SetTimeout 设置超时时间
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 链式调用，动态调整超时
 func (c *HTTPClient) SetTimeout(timeout time.Duration) *HTTPClient {
 	c.timeout = timeout
 	c.client.Timeout = timeout
@@ -330,8 +324,6 @@ func (c *HTTPClient) DoWithResponse(req *http.Request) (*http.Response, error) {
 }
 
 // Close 关闭客户端（释放连接池资源）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 清理资源，避免连接泄漏
 func (c *HTTPClient) Close() {
 	c.transport.CloseIdleConnections()
 }

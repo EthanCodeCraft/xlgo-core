@@ -25,6 +25,8 @@
 
 ## 1. 快速开始
 
+> **环境要求**：xlgo 需要 **Go 1.25+**。本项目作为新框架不背负旧版本兼容包袱，可直接使用 Go 1.25 的新特性。
+
 ### 1.1 安装框架
 
 ```bash
@@ -57,36 +59,37 @@ myproject/
 package main
 
 import (
-    "github.com/EthanCodeCraft/xlgo-core"
-    "github.com/EthanCodeCraft/xlgo-core/config"
+    xlgo "github.com/EthanCodeCraft/xlgo-core"
     "github.com/EthanCodeCraft/xlgo-core/middleware"
     "github.com/EthanCodeCraft/xlgo-core/response"
     "github.com/gin-gonic/gin"
 )
 
 func main() {
-    // 1. 加载配置
-    cfg, err := config.Load("./config.yaml")
-    if err != nil {
-        panic(err)
-    }
-
-    // 2. 创建应用
+    // v1.0.2 起 xlgo.New 默认是轻量应用，不会自动初始化 MySQL/Redis/Storage，
+    // 也不会自动注册 /health 或 /swagger/* 路由。
+    // 通过 Option 显式启用所需组件即可。
     app := xlgo.New(
+        xlgo.WithConfigPath("./config.yaml"),
+        xlgo.WithLogger(),
+        xlgo.WithDefaultRoutes(), // 同时启用 /health 与 /swagger/*
         xlgo.WithMiddlewares(middleware.Logger(), middleware.CORS()),
     )
 
-    // 3. 注册路由
+    // 通过 Engine 直接挂路由，或使用 xlgo.WithModules(...) 注册模块
     app.GetRouter().GET("/hello", func(c *gin.Context) {
         response.Success(c, gin.H{"message": "Hello World"})
     })
 
-    // 4. 启动应用（支持优雅关闭）
     if err := app.Run(); err != nil {
         panic(err)
     }
 }
 ```
+
+> 想要 batteries-included 体验，可改用 `xlgo.NewFullStack(...)` 或
+> `xlgo.RunFullStack(...)`，它会一次性启用 Logger / MySQL / Redis / Storage /
+> Wire / Health / Swagger / AutoMigrate 等组件。
 
 **优雅关闭特性：**
 - 监听系统信号（SIGINT、SIGTERM）
@@ -183,7 +186,8 @@ import "github.com/EthanCodeCraft/xlgo-core/logger"
 logger.Init(cfg)
 
 // 程序退出前同步
-defer logger.Sync()
+// v1.0.2 起 Sync 返回 error，可按需处理
+_ = logger.Sync()
 ```
 
 ### 3.2 日志级别
@@ -199,7 +203,8 @@ logger.Error("错误信息")
 logger.Infof("用户 %s 登录成功", username)
 logger.Warnf("请求失败: %v", err)
 
-// 致命错误（会终止程序）
+// 致命错误（会终止程序）—— 仅在业务进程入口（main 等）使用
+// v1.0.2 起，框架内部已禁止使用 Fatal/Fatalf，初始化错误改为 error 返回
 logger.Fatalf("数据库连接失败: %v", err)
 
 // 结构化日志
@@ -211,7 +216,7 @@ logger.Info("用户登录",
 
 ### 3.3 彩色控制台输出
 
-开发调试时使用彩色输出，一眼识别日志级别：
+`console` 包定位是**开发期彩色 stdout 工具**——跟 `fmt.Println` 同级，不写文件、不感知运行环境、不做任何隐式行为。
 
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/console"
@@ -226,29 +231,141 @@ console.Error("错误信息")   // 红色
 c := console.New(
     console.WithColor(true),
     console.WithTime(true),
-    console.WithCaller(true, 2),
+    console.WithCaller(true),       // skip 可选，默认 2
+    console.WithLevel(console.LevelInfo),
 )
-c.Debug("自定义输出")
+c.Debug("此条不会输出，已被 LevelInfo 过滤")
+c.Info("自定义输出")
 ```
+
+#### console vs logger：怎么选？
+
+| 维度 | `console` | `logger` |
+|---|---|---|
+| 定位 | 开发期肉眼调试 | 业务可观测性记录 |
+| 输出目标 | stdout（彩色） | 文件 + stdout |
+| 持久化 | ❌ | ✅ 滚动归档 |
+| 结构化 | 文本 | JSON 字段 |
+| 性能 | 一般 | zap 高性能 |
+| 默认级别 | `LevelDebug`（全开） | dev=Debug / prod=Info |
+| 适用场景 | 临时打印、开发联调 | 用户登录、订单事件、审计日志 |
+
+**简单判断**：
+
+- 这条信息上线后想留 → 用 `logger`
+- 这条信息上线就该消失 → 用 `console`，并在 main 中显式切到高级别
+
+#### 上线前显式收紧 console 输出
+
+```go
+func main() {
+    cfg, _ := config.Load("./config.yaml")
+
+    // 显式选择：生产期 console 只看 Warn / Error
+    if cfg.IsProduction() {
+        console.SetLevel(console.LevelWarn)
+    }
+
+    // 或者完全静默 console（业务全靠 logger）
+    // console.SetLevel(console.LevelSilent)
+
+    app := xlgo.New(...)
+    app.Run()
+}
+```
+
+> **注意**：xlgo 不会自动根据 `app.env` 切换 console 级别——选择权完全在调用方。
+> 我们认为隐式切换会带来"开发期看到的 / 生产期看到的"行为不一致，调试体验更糟。
 
 ---
 
 ## 4. 数据库操作
+
+xlgo 基于 GORM，驱动由配置 `database.driver` 决定。v1.0.2 起 GORM 方言通过 **可插拔注册表** 管理：内置 `mysql`（默认）与 `postgres`（含 `postgresql`、`pg` 别名），应用可通过 `database.RegisterDialect` 接入任意 GORM 驱动；`database.dsn` 字段始终可用于手写连接串。
 
 ### 4.1 初始化数据库
 
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/database"
 
-// 初始化 MySQL
-database.InitMySQL(cfg)
+// 初始化数据库（驱动由配置决定，等价于 database.DefaultManager.InitDB(cfg)）
+database.InitDB(cfg)
 
-// 关闭连接
-defer database.Close()
+// 关闭全部连接（含从库）
+defer database.CloseAll()
 
 // 获取数据库实例
-db := database.GetDB()
+db := database.GetDB()         // 主库
+read := database.GetReadDB()   // 从库（无从库时回退主库）
 ```
+
+### 4.1.1 主从读写分离
+
+```go
+// 从库 DSN 列表需与主库驱动匹配
+database.InitDBWithReplicas(cfg, []string{
+    "root:pass@tcp(slave1:3306)/db",
+    "root:pass@tcp(slave2:3306)/db",
+})
+
+// 选择策略：默认 Random，可换成 RoundRobin
+database.SetReplicaPicker(&database.RoundRobinPicker{})
+
+// 强制使用主库（事务、需要实时数据的场景）
+ctx := database.UseMaster(context.Background())
+database.GetDBFromContext(ctx).Find(&users)
+
+// 强制使用从库（报表查询）
+ctx = database.UseReplica(context.Background())
+database.GetDBFromContext(ctx).Find(&reports)
+```
+
+### 4.1.2 实例化 Manager
+
+需要多套数据库连接（如平台库 + 租户库）时，`database.NewManager(cfg)` 创建独立管理器，互不影响：
+
+```go
+mgr := database.NewManager(cfg)
+if err := mgr.Open(context.Background()); err != nil {
+    return err
+}
+defer mgr.Close()
+
+mgr.SetPicker(&database.RoundRobinPicker{})
+db := mgr.FromContext(ctx)
+```
+
+### 4.1.3 注册自定义 GORM 驱动
+
+`database.RegisterDialect` 一次注册即让 `database.driver: <name>` 生效，DSN 构建器同步登记到 `config` 包：
+
+```go
+import (
+    "github.com/EthanCodeCraft/xlgo-core/config"
+    "github.com/EthanCodeCraft/xlgo-core/database"
+    "gorm.io/driver/sqlite"
+    "gorm.io/gorm"
+)
+
+func init() {
+    database.RegisterDialect(database.DialectSpec{
+        Name:      "sqlite",
+        Aliases:   []string{"sqlite3"},
+        Dialector: func(dsn string) gorm.Dialector { return sqlite.Open(dsn) },
+        DSN:       func(c *config.DatabaseConfig) string { return c.Name }, // Name 当作文件路径
+    })
+}
+```
+
+之后只需把配置改成 `database.driver: sqlite` 即可。SQL Server / ClickHouse / TiDB 等同理。
+
+诊断接口：
+
+- `database.RegisteredDialects()` - 列出已注册驱动（含别名）
+- `database.LookupDialect(name)` - 检查某驱动是否可用
+- `config.RegisteredDrivers()` - 列出已登记的 DSN 构建器
+
+未注册的驱动会回退到 MySQL 以保持向后兼容。
 
 ### 4.2 定义模型
 
@@ -614,14 +731,18 @@ response.FailWithDetail(c, response.ErrPasswordWrong, "连续错误3次将锁定
 
 ### 7.4 预定义错误码
 
+> 注：参数错误等业务化错误码请由业务项目自行定义，框架不再内置 `ErrInvalidParams`。
+> 推荐使用 `response.NewError(40001, "参数错误")` 在业务侧统一管理。
+
 | 错误               | 码     | 说明       |
 | ------------------ | ------ | ---------- |
-| `ErrInvalidParams` | 000001 | 参数错误   |
-| `ErrUnauthorized`  | 000401 | 未授权     |
-| `ErrNotFound`      | 000404 | 资源不存在 |
-| `ErrServerError`   | 000500 | 服务器错误 |
-| `ErrUserNotFound`  | 010001 | 用户不存在 |
-| `ErrPasswordWrong` | 010004 | 密码错误   |
+| `ErrUnauthorized`  | 401    | 未授权     |
+| `ErrForbidden`     | 403    | 无权限访问 |
+| `ErrNotFound`      | 404    | 资源不存在 |
+| `ErrRateLimit`     | 429    | 请求过于频繁 |
+| `ErrServerError`   | 500    | 服务器错误 |
+| `ErrUserNotFound`  | 10001  | 用户不存在 |
+| `ErrPasswordWrong` | 10004  | 密码错误   |
 
 ### 7.5 特殊响应
 
@@ -678,7 +799,13 @@ r.Use(middleware.Recover())
 // 认证中间件
 r.Use(middleware.AuthRequired())
 
-// 角色检查
+// 自定义用户类型权限
+r.Use(middleware.RequireUserTypes("tenant_admin", "platform_admin"))
+
+// 自定义角色权限
+r.Use(middleware.RequireRoles("owner", "manager"))
+
+// 默认快捷权限（super_admin/admin/staff 只是默认常量）
 r.Use(middleware.AdminRequired())
 
 // CSRF防护
@@ -856,7 +983,7 @@ v1.AddModuleFunc("user", userRoutes)
 // 创建分组
 authGroup := router.NewMiddlewareGroup("auth",
     middleware.AuthRequired(),
-    middleware.AdminRequired(),
+    middleware.RequireUserTypes("tenant_admin", "platform_admin"),
 )
 
 publicGroup := router.NewMiddlewareGroup("public",
@@ -920,14 +1047,21 @@ xlgo.StartServer(engine, 8080)
 
 #### 8.4.7 默认路由
 
-框架自动注册以下默认路由：
+v1.0.2 起，`xlgo.New()` 默认是 **轻量应用**，不会自动注册任何默认路由。
+按需通过下列 Option 显式启用：
 
-```
-/health           -> 健康检查
-/swagger/*any     -> Swagger 文档
+```go
+xlgo.New(
+    xlgo.WithHealthRoutes(),  // 注册 /health
+    xlgo.WithSwaggerRoutes(), // 注册 /swagger/*any
+    // 或一步到位：
+    xlgo.WithDefaultRoutes(), // 同时注册 /health 与 /swagger/*any
+)
 ```
 
-如需禁用，创建应用时不传入默认模块即可。
+也可以使用 `xlgo.NewFullStack(...)` / `xlgo.RunFullStack(...)` 启用全部默认组件。
+
+> 生产环境建议关闭 Swagger，仅保留 `WithHealthRoutes()`，避免文档接口意外暴露。
 
 ---
 
@@ -973,14 +1107,18 @@ claims, err := jwt.GetClaimsFromToken(tokenString)
 ### 9.2 获取用户信息
 
 ```go
-// 从上下文获取用户ID
+// 一次性取出全部认证信息（v1.0.2 推荐）
+if user, ok := middleware.GetAuthUser(c); ok {
+    _ = user.UserID
+    _ = user.Username
+    _ = user.Role
+    _ = user.UserType
+}
+
+// 单字段便捷函数（与旧版兼容）
 userID := middleware.GetUserID(c)
-
-// 获取用户名
 username := middleware.GetUsername(c)
-
-// 获取用户类型（super_admin/admin/staff）
-userType := middleware.GetUserType(c)
+userType := middleware.GetUserType(c) // super_admin/admin/staff 等，由业务定义
 ```
 
 ### 9.3 密码加密
@@ -1527,7 +1665,8 @@ model/      → 数据模型定义
 func GetUser(c *gin.Context) {
     id := handler.PathInt64(c, "id", 0)
     if id == 0 {
-        response.FailWithError(c, response.ErrInvalidParams)
+        // 参数错误码由业务侧定义；这里直接返回通用失败 + 自定义消息
+        response.Fail(c, "参数错误")
         return
     }
 
@@ -1564,8 +1703,9 @@ app:
 ```go
 if cfg.IsProduction() {
     gin.SetMode(gin.ReleaseMode)
-    // 生产环境禁用彩色输出
-    console.Default = console.New(console.WithColor(false))
+    // 生产环境收紧 console 输出（仅保留 Warn / Error）
+    // 业务事件请使用 logger 包记录
+    console.SetLevel(console.LevelWarn)
 }
 ```
 
@@ -1628,5 +1768,5 @@ func Login(c *gin.Context) {
 
 ---
 
-_文档版本: v2.1_
-_最后更新: 2026-04-30_
+_文档版本: v1.0.2_
+_最后更新: 2026-06-20_

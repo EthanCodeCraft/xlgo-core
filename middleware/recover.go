@@ -12,8 +12,6 @@ import (
 )
 
 // Recover panic恢复中间件，捕获panic并返回统一错误响应
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 生产环境必备，防止panic导致服务崩溃
 func Recover() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
@@ -40,8 +38,6 @@ func Recover() gin.HandlerFunc {
 }
 
 // RecoverWithDetail panic恢复中间件（详细版本，返回更多信息）
-// 评分: ⭐⭐⭐⭐
-// 理由: 开发环境使用，返回详细错误信息便于调试
 // 注意: 生产环境不应使用，会暴露敏感信息
 func RecoverWithDetail() gin.HandlerFunc {
 	return func(c *gin.Context) {

@@ -9,8 +9,6 @@ import (
 )
 
 // KeyBuilder 缓存键名构建器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 多项目共用 Redis 时，通过前缀避免 key 冲突
 // 使用场景: 多个小项目共用一台 Redis 服务器，每个项目设置不同前缀
 type KeyBuilder struct {
 	prefix     string // 项目/站点前缀，如 "site_a"
@@ -22,8 +20,6 @@ type KeyBuilder struct {
 type KeyBuilderOption func(*KeyBuilder)
 
 // WithPrefix 设置前缀（项目/站点别名）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 核心配置，用于区分不同项目
 // 示例: WithPrefix("site_a") -> 所有 key 自动添加 "site_a" 前缀
 func WithPrefix(prefix string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
@@ -32,8 +28,6 @@ func WithPrefix(prefix string) KeyBuilderOption {
 }
 
 // WithSeparator 设置分隔符
-// 评分: ⭐⭐⭐⭐
-// 理由: 可自定义分隔符，适应不同命名风格
 // 示例: WithSeparator(":") -> "site_a:user:1"
 func WithSeparator(separator string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
@@ -42,8 +36,6 @@ func WithSeparator(separator string) KeyBuilderOption {
 }
 
 // WithCacheType 设置缓存类型标识
-// 评分: ⭐⭐⭐⭐
-// 理由: 区分缓存用途，便于管理
 // 示例: WithCacheType("session") -> "session_site_a_user:1"
 func WithCacheType(cacheType string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
@@ -52,8 +44,6 @@ func WithCacheType(cacheType string) KeyBuilderOption {
 }
 
 // NewKeyBuilder 创建键名构建器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 链式配置，灵活易用
 func NewKeyBuilder(opts ...KeyBuilderOption) *KeyBuilder {
 	kb := &KeyBuilder{
 		prefix:     "",
@@ -67,8 +57,6 @@ func NewKeyBuilder(opts ...KeyBuilderOption) *KeyBuilder {
 }
 
 // Build 构建完整键名
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动拼接前缀，避免手动拼接错误
 // 格式: {cacheType}{separator}{prefix}{separator}{key}
 // 示例: kb.Build("user:1") -> "cache_site_a_user:1"
 func (kb *KeyBuilder) Build(key string) string {
@@ -84,8 +72,6 @@ func (kb *KeyBuilder) Build(key string) string {
 }
 
 // BuildTemp 构建临时缓存键名（带过期时间）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 区分临时和永久缓存，便于批量管理
 // 格式: "temp{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildTemp(key string) string {
 	parts := []string{"temp"}
@@ -97,8 +83,6 @@ func (kb *KeyBuilder) BuildTemp(key string) string {
 }
 
 // BuildPerm 构建永久缓存键名（不带过期时间）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 永久存储的数据使用不同标识
 // 格式: "perm{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildPerm(key string) string {
 	parts := []string{"perm"}
@@ -110,8 +94,6 @@ func (kb *KeyBuilder) BuildPerm(key string) string {
 }
 
 // BuildLock 构建分布式锁键名
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 锁使用独立命名空间，避免与业务缓存冲突
 // 格式: "lock{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildLock(key string) string {
 	parts := []string{"lock"}
@@ -123,8 +105,6 @@ func (kb *KeyBuilder) BuildLock(key string) string {
 }
 
 // BuildCounter 构建计数器键名
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 计数器使用独立命名空间
 // 格式: "counter{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildCounter(key string) string {
 	parts := []string{"counter"}
@@ -136,8 +116,6 @@ func (kb *KeyBuilder) BuildCounter(key string) string {
 }
 
 // BuildSession 构建会话键名
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 会话缓存统一管理
 // 格式: "session{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildSession(key string) string {
 	parts := []string{"session"}
@@ -149,8 +127,6 @@ func (kb *KeyBuilder) BuildSession(key string) string {
 }
 
 // BuildPattern 构建匹配模式（用于 SCAN/Keys）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 批量查询/删除时使用
 // 示例: kb.BuildPattern("user:*") -> "cache_site_a_user:*"
 func (kb *KeyBuilder) BuildPattern(pattern string) string {
 	return kb.Build(pattern)
@@ -162,8 +138,6 @@ func (kb *KeyBuilder) GetPrefix() string {
 }
 
 // SetPrefix 动态设置前缀
-// 评分: ⭐⭐⭐⭐
-// 理由: 运行时可切换前缀，适用于多租户场景
 func (kb *KeyBuilder) SetPrefix(prefix string) *KeyBuilder {
 	kb.prefix = prefix
 	return kb
@@ -174,8 +148,6 @@ func (kb *KeyBuilder) SetPrefix(prefix string) *KeyBuilder {
 var globalKeyBuilder *KeyBuilder
 
 // InitKeyBuilder 初始化全局键名构建器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 应用启动时配置，全局统一命名
 // 参数: prefix 站点别名，如果为空则自动从配置读取
 // 示例:
 //
@@ -196,8 +168,6 @@ func InitKeyBuilder(prefix string, opts ...KeyBuilderOption) {
 }
 
 // AutoInitKeyBuilder 自动从配置初始化键名构建器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 无需手动传入参数，完全依赖配置文件
 // 配置示例:
 //
 //	app:
@@ -208,8 +178,6 @@ func AutoInitKeyBuilder(opts ...KeyBuilderOption) {
 }
 
 // GetKeyBuilder 获取全局键名构建器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 如果未初始化，自动从配置创建
 func GetKeyBuilder() *KeyBuilder {
 	if globalKeyBuilder == nil {
 		// 自动从配置初始化
@@ -219,8 +187,6 @@ func GetKeyBuilder() *KeyBuilder {
 }
 
 // K 快捷构建键名（使用全局构建器）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 简短易用，减少代码量
 // 示例: cache.K("user:1") -> 自动添加前缀
 func K(key string) string {
 	return GetKeyBuilder().Build(key)
@@ -254,8 +220,6 @@ func KSession(key string) string {
 // ===== 带键名构建器的缓存操作 =====
 
 // SetWithPrefix 带前缀的缓存设置
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动添加前缀，简化调用
 func SetWithPrefix(ctx context.Context, key string, value any, ttl time.Duration, prefix string) error {
 	kb := NewKeyBuilder(WithPrefix(prefix))
 	return GetCache().Set(ctx, kb.Build(key), value, ttl)

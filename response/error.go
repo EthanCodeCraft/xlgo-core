@@ -8,11 +8,16 @@ import (
 
 // 业务错误码定义
 // 格式：模块(2位) + 功能(2位) + 错误类型(2位)
+//
+// 约定：
+//   - CodeSuccess = 0：成功
+//   - CodeFail    = 1：通用失败
+//   - 其余 framework 内置错误码使用 HTTP 风格（401/403/404/429/500/503）或 5 位业务码段
+//   - 参数错误等业务化错误码请由业务项目自行定义，框架不再内置 CodeInvalidParams
 const (
 	// 通用错误 00xxxx
-	CodeSuccess            = 1   // 成功
-	CodeFail               = 0   // 通用失败
-	CodeInvalidParams      = 1   // 参数错误
+	CodeSuccess            = 0   // 成功
+	CodeFail               = 1   // 通用失败
 	CodeUnauthorized       = 401 // 未授权
 	CodeForbidden          = 403 // 无权限
 	CodeNotFound           = 404 // 资源不存在
@@ -98,7 +103,6 @@ func (e *Error) ToResponse() Response {
 
 // 预定义错误
 var (
-	ErrInvalidParams      = NewError(CodeInvalidParams, "参数错误")
 	ErrUnauthorized       = NewError(CodeUnauthorized, "请先登录")
 	ErrForbidden          = NewError(CodeForbidden, "无权限访问")
 	ErrNotFound           = NewError(CodeNotFound, "资源不存在")
@@ -135,6 +139,49 @@ var (
 	ErrOperationTimeout = NewError(CodeOperationTimeout, "操作超时")
 	ErrBusinessRule     = NewError(CodeBusinessRuleError, "业务规则错误")
 )
+
+// _errorCodeUniquenessGuard 在编译期保证所有内置 Code* 不重复。
+// Go spec: 同一个常量 key 在 map 字面量中出现两次会触发
+// "duplicate key in map literal" 编译错误，从而把"错误码不能撞"
+// 这件事写进类型系统，比 init() 里 panic 检查更早、更安全。
+//
+// 维护规则：新增 Code* 常量时，**必须**把它登记到这里。
+// 注意：变量名故意以下划线开头并赋给 _，避免 unused 报错且不会进入 runtime。
+var _ = map[int]string{
+	CodeSuccess:            "CodeSuccess",
+	CodeFail:               "CodeFail",
+	CodeUnauthorized:       "CodeUnauthorized",
+	CodeForbidden:          "CodeForbidden",
+	CodeNotFound:           "CodeNotFound",
+	CodeRateLimit:          "CodeRateLimit",
+	CodeServerError:        "CodeServerError",
+	CodeServiceUnavailable: "CodeServiceUnavailable",
+
+	CodeUserNotFound:      "CodeUserNotFound",
+	CodeUserAlreadyExists: "CodeUserAlreadyExists",
+	CodeUserDisabled:      "CodeUserDisabled",
+	CodePasswordWrong:     "CodePasswordWrong",
+	CodePasswordWeak:      "CodePasswordWeak",
+	CodePhoneInvalid:      "CodePhoneInvalid",
+	CodeEmailInvalid:      "CodeEmailInvalid",
+	CodeLoginFailed:       "CodeLoginFailed",
+	CodeTokenExpired:      "CodeTokenExpired",
+	CodeTokenInvalid:      "CodeTokenInvalid",
+
+	CodeFileNotFound:     "CodeFileNotFound",
+	CodeFileTooLarge:     "CodeFileTooLarge",
+	CodeFileTypeInvalid:  "CodeFileTypeInvalid",
+	CodeFileUploadFailed: "CodeFileUploadFailed",
+
+	CodeDataNotFound:      "CodeDataNotFound",
+	CodeDataAlreadyExists: "CodeDataAlreadyExists",
+	CodeDataInvalid:       "CodeDataInvalid",
+	CodeDataConflict:      "CodeDataConflict",
+
+	CodeOperationFailed:   "CodeOperationFailed",
+	CodeOperationTimeout:  "CodeOperationTimeout",
+	CodeBusinessRuleError: "CodeBusinessRuleError",
+}
 
 // FailWithError 使用预定义错误响应
 func FailWithError(c *gin.Context, err *Error) {

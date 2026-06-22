@@ -43,8 +43,6 @@ func Logger() gin.HandlerFunc {
 }
 
 // LoggerWithConfig 使用自定义配置的日志中间件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 可配置是否记录请求体/响应体，跳过静态资源路径，慢请求警告
 func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 检查是否跳过此路径

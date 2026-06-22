@@ -29,8 +29,6 @@ type Config struct {
 }
 
 // AppConfig 应用配置
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 多站点共用 Redis/日志时，通过 SiteName 区分来源
 // 使用场景:
 //   - 缓存键名前缀: cache:{site_name}:user:1
 //   - 日志标识: [site_a] 2024-01-01 10:00:00 ...
@@ -47,8 +45,6 @@ type AppConfig struct {
 }
 
 // GetSiteName 获取站点别名，如果未设置则返回空字符串
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 安全获取，避免空指针
 func (c *AppConfig) GetSiteName() string {
 	if c == nil {
 		return ""
@@ -57,8 +53,6 @@ func (c *AppConfig) GetSiteName() string {
 }
 
 // GetCachePrefix 获取缓存键名前缀
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 统一的缓存前缀生成方法
 func (c *AppConfig) GetCachePrefix() string {
 	return c.GetSiteName()
 }
@@ -93,21 +87,110 @@ type ServerConfig struct {
 	Mode string `mapstructure:"mode"` // development 或 production
 }
 
-// DatabaseConfig 数据库配置
-type DatabaseConfig struct {
-	Host         string `mapstructure:"host"`
-	Port         int    `mapstructure:"port"`
-	User         string `mapstructure:"user"`
-	Password     string `mapstructure:"password"`
-	Name         string `mapstructure:"name"`
-	MaxIdleConns int    `mapstructure:"max_idle_conns"`
-	MaxOpenConns int    `mapstructure:"max_open_conns"`
+// 数据库驱动常量
+const (
+	DriverMySQL    = "mysql"
+	DriverPostgres = "postgres"
+)
+
+// DSNBuilder 根据 DatabaseConfig 生成连接字符串
+type DSNBuilder func(*DatabaseConfig) string
+
+var (
+	dsnBuildersMu sync.RWMutex
+	dsnBuilders   = map[string]DSNBuilder{}
+)
+
+// RegisterDSNBuilder 为指定驱动注册 DSN 构建器（驱动名大小写不敏感）。
+// aliases 用于注册同一驱动的别名，例如 postgres 的 "postgresql"、"pg"。
+// 通常由 database 包通过 database.RegisterDialect 间接调用，
+// 应用代码也可直接使用以扩展自定义驱动。
+func RegisterDSNBuilder(name string, builder DSNBuilder, aliases ...string) {
+	if builder == nil {
+		return
+	}
+	dsnBuildersMu.Lock()
+	defer dsnBuildersMu.Unlock()
+	for _, n := range append([]string{name}, aliases...) {
+		key := strings.ToLower(strings.TrimSpace(n))
+		if key != "" {
+			dsnBuilders[key] = builder
+		}
+	}
 }
 
-// DSN 返回 MySQL 连接字符串
+// LookupDSNBuilder 查找已注册的 DSN 构建器
+func LookupDSNBuilder(name string) (DSNBuilder, bool) {
+	key := strings.ToLower(strings.TrimSpace(name))
+	dsnBuildersMu.RLock()
+	defer dsnBuildersMu.RUnlock()
+	b, ok := dsnBuilders[key]
+	return b, ok
+}
+
+// RegisteredDrivers 返回所有已注册 DSN 构建器的驱动名（用于诊断）
+func RegisteredDrivers() []string {
+	dsnBuildersMu.RLock()
+	defer dsnBuildersMu.RUnlock()
+	names := make([]string, 0, len(dsnBuilders))
+	for k := range dsnBuilders {
+		names = append(names, k)
+	}
+	return names
+}
+
+func init() {
+	// 内置 MySQL / PostgreSQL 的 DSN 构建器
+	RegisterDSNBuilder(DriverMySQL, func(c *DatabaseConfig) string { return c.MySQLDSN() })
+	RegisterDSNBuilder(DriverPostgres, func(c *DatabaseConfig) string { return c.PostgresDSN() }, "postgresql", "pg")
+}
+
+// DatabaseConfig 数据库配置
+type DatabaseConfig struct {
+	// Driver 数据库驱动，支持 mysql（默认）与 postgres
+	Driver string `mapstructure:"driver"`
+	// Host 数据库主机
+	Host string `mapstructure:"host"`
+	// Port 数据库端口
+	Port int `mapstructure:"port"`
+	// User 数据库用户名
+	User string `mapstructure:"user"`
+	// Password 数据库密码
+	Password string `mapstructure:"password"`
+	// Name 数据库名
+	Name string `mapstructure:"name"`
+	// CustomDSN 自定义连接字符串，设置后优先于由 Host/Port 等字段生成的 DSN
+	CustomDSN string `mapstructure:"dsn"`
+	// MaxIdleConns 最大空闲连接数
+	MaxIdleConns int `mapstructure:"max_idle_conns"`
+	// MaxOpenConns 最大打开连接数
+	MaxOpenConns int `mapstructure:"max_open_conns"`
+}
+
+// DSN 根据驱动返回连接字符串。设置了 CustomDSN 时优先返回 CustomDSN；
+// 未指定 Driver 时按 MySQL 处理（向后兼容）。
+// 若驱动通过 RegisterDSNBuilder 注册过自定义构建器，则使用注册的构建器。
 func (c *DatabaseConfig) DSN() string {
+	if c.CustomDSN != "" {
+		return c.CustomDSN
+	}
+	if builder, ok := LookupDSNBuilder(c.Driver); ok {
+		return builder(c)
+	}
+	// 未注册时回退到 MySQL（保持向后兼容）
+	return c.MySQLDSN()
+}
+
+// MySQLDSN 返回 MySQL 连接字符串
+func (c *DatabaseConfig) MySQLDSN() string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		c.User, c.Password, c.Host, c.Port, c.Name)
+}
+
+// PostgresDSN 返回 PostgreSQL 连接字符串
+func (c *DatabaseConfig) PostgresDSN() string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable TimeZone=Asia/Shanghai",
+		c.Host, c.Port, c.User, c.Password, c.Name)
 }
 
 // RedisConfig Redis 配置
@@ -229,104 +312,104 @@ func (c *CORSConfig) GetMaxAge() int {
 	return c.MaxAge
 }
 
-var (
-	globalConfig  *Config
-	configOnce    sync.Once
-	configMutex   sync.RWMutex
-	loadErr       error
-	viperInstance *viper.Viper
-	callbacks     []func(*Config)
-	callbacksMu   sync.RWMutex
-)
+// Manager 配置管理器
+type Manager struct {
+	mu        sync.RWMutex
+	path      string
+	v         *viper.Viper
+	cfg       *Config
+	callbacks []func(*Config)
+}
 
-// Load 加载配置文件（使用 sync.Once 确保只加载一次）
-func Load(configPath string) (*Config, error) {
-	configOnce.Do(func() {
-		v := viper.New()
-		v.SetConfigFile(configPath)
-		v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-		v.AutomaticEnv()
+var defaultManager = NewManager("")
 
-		if err := v.ReadInConfig(); err != nil {
-			loadErr = fmt.Errorf("读取配置文件失败: %w", err)
-			return
-		}
+// NewManager 创建配置管理器
+func NewManager(configPath string) *Manager {
+	return &Manager{path: configPath}
+}
 
-		var cfg Config
-		if err := v.Unmarshal(&cfg); err != nil {
-			loadErr = fmt.Errorf("解析配置文件失败: %w", err)
-			return
-		}
+func newViper(configPath string) *viper.Viper {
+	v := viper.New()
+	v.SetConfigFile(configPath)
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+	return v
+}
 
-		configMutex.Lock()
-		globalConfig = &cfg
-		viperInstance = v
-		configMutex.Unlock()
-	})
-
-	if loadErr != nil {
-		return nil, loadErr
+// Load 加载配置文件
+func (m *Manager) Load() (*Config, error) {
+	if m == nil || m.path == "" {
+		return nil, ErrConfigNotLoaded
 	}
 
-	return Get(), nil
+	v := newViper(m.path)
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+
+	m.mu.Lock()
+	m.v = v
+	m.cfg = &cfg
+	m.mu.Unlock()
+
+	return &cfg, nil
 }
 
 // LoadWithWatch 加载配置文件并启用热更新
-func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
-	cfg, err := Load(configPath)
+func (m *Manager) LoadWithWatch(onChange func(*Config)) (*Config, error) {
+	cfg, err := m.Load()
 	if err != nil {
 		return nil, err
 	}
-
-	// 注册回调
 	if onChange != nil {
-		RegisterCallback(onChange)
+		m.RegisterCallback(onChange)
 	}
-
-	// 启动文件监听
-	if err := StartWatcher(); err != nil {
+	if err := m.StartWatcher(); err != nil {
 		return nil, fmt.Errorf("启动配置监听失败: %w", err)
 	}
-
 	return cfg, nil
 }
 
 // RegisterCallback 注册配置变更回调
-func RegisterCallback(cb func(*Config)) {
-	callbacksMu.Lock()
-	defer callbacksMu.Unlock()
-	callbacks = append(callbacks, cb)
+func (m *Manager) RegisterCallback(cb func(*Config)) {
+	if m == nil || cb == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.callbacks = append(m.callbacks, cb)
 }
 
 // StartWatcher 启动配置文件监听
-func StartWatcher() error {
-	configMutex.RLock()
-	v := viperInstance
-	configMutex.RUnlock()
-
-	if v == nil {
-		return fmt.Errorf("配置未加载")
+func (m *Manager) StartWatcher() error {
+	if m == nil {
+		return ErrConfigNotLoaded
 	}
 
-	// 使用 viper 内置的文件监听
-	v.WatchConfig()
+	m.mu.RLock()
+	v := m.v
+	m.mu.RUnlock()
+	if v == nil {
+		return ErrConfigNotLoaded
+	}
 
-	// 设置配置变更回调
+	v.WatchConfig()
 	v.OnConfigChange(func(e fsnotify.Event) {
 		var newCfg Config
 		if err := v.Unmarshal(&newCfg); err != nil {
 			return
 		}
 
-		configMutex.Lock()
-		globalConfig = &newCfg
-		configMutex.Unlock()
-
-		// 触发所有回调
-		callbacksMu.RLock()
-		cbs := make([]func(*Config), len(callbacks))
-		copy(cbs, callbacks)
-		callbacksMu.RUnlock()
+		m.mu.Lock()
+		m.cfg = &newCfg
+		cbs := make([]func(*Config), len(m.callbacks))
+		copy(cbs, m.callbacks)
+		m.mu.Unlock()
 
 		for _, cb := range cbs {
 			cb(&newCfg)
@@ -337,44 +420,50 @@ func StartWatcher() error {
 }
 
 // StopWatcher 停止配置文件监听
-func StopWatcher() {
-	configMutex.RLock()
-	v := viperInstance
-	configMutex.RUnlock()
+func (m *Manager) StopWatcher() {}
 
-	if v != nil {
-		// viper 的 WatchConfig 没有直接的停止方法
-		// 但会在 viper 实例销毁时自动停止
+// Get 获取配置
+func (m *Manager) Get() *Config {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.cfg
+}
+
+// GetViper 获取 viper 实例
+func (m *Manager) GetViper() *viper.Viper {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.v
+}
+
+// Set 手动设置配置
+func (m *Manager) Set(cfg *Config) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg = cfg
+	if cfg == nil {
+		m.v = nil
 	}
 }
 
-// Get 获取全局配置（使用读锁保护）
-func Get() *Config {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	return globalConfig
-}
-
-// GetViper 获取 viper 实例（用于扩展配置）
-func GetViper() *viper.Viper {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	return viperInstance
-}
-
-// Set 手动设置配置（用于测试或动态修改）
-func Set(cfg *Config) {
-	configMutex.Lock()
-	defer configMutex.Unlock()
-	globalConfig = cfg
-}
-
 // Reload 重新加载配置文件
-func Reload() error {
-	configMutex.RLock()
-	v := viperInstance
-	configMutex.RUnlock()
+func (m *Manager) Reload() error {
+	if m == nil {
+		return ErrConfigNotLoaded
+	}
 
+	m.mu.RLock()
+	v := m.v
+	m.mu.RUnlock()
 	if v == nil {
 		return ErrConfigNotLoaded
 	}
@@ -388,15 +477,11 @@ func Reload() error {
 		return fmt.Errorf("解析配置文件失败: %w", err)
 	}
 
-	configMutex.Lock()
-	globalConfig = &newCfg
-	configMutex.Unlock()
-
-	// 触发回调
-	callbacksMu.RLock()
-	cbs := make([]func(*Config), len(callbacks))
-	copy(cbs, callbacks)
-	callbacksMu.RUnlock()
+	m.mu.Lock()
+	m.cfg = &newCfg
+	cbs := make([]func(*Config), len(m.callbacks))
+	copy(cbs, m.callbacks)
+	m.mu.Unlock()
 
 	for _, cb := range cbs {
 		cb(&newCfg)
@@ -405,44 +490,99 @@ func Reload() error {
 	return nil
 }
 
+// Load 加载配置文件
+func Load(configPath string) (*Config, error) {
+	defaultManager = NewManager(configPath)
+	return defaultManager.Load()
+}
+
+// LoadWithWatch 加载配置文件并启用热更新
+func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
+	defaultManager = NewManager(configPath)
+	return defaultManager.LoadWithWatch(onChange)
+}
+
+// RegisterCallback 注册配置变更回调
+func RegisterCallback(cb func(*Config)) {
+	defaultManager.RegisterCallback(cb)
+}
+
+// StartWatcher 启动配置文件监听
+func StartWatcher() error {
+	return defaultManager.StartWatcher()
+}
+
+// StopWatcher 停止配置文件监听
+func StopWatcher() {
+	defaultManager.StopWatcher()
+}
+
+// Get 获取全局配置
+func Get() *Config {
+	return defaultManager.Get()
+}
+
+// GetViper 获取 viper 实例（用于扩展配置）
+func GetViper() *viper.Viper {
+	return defaultManager.GetViper()
+}
+
+// Set 手动设置配置（用于测试或动态修改）
+func Set(cfg *Config) {
+	defaultManager.Set(cfg)
+}
+
+// Reload 重新加载配置文件
+func Reload() error {
+	return defaultManager.Reload()
+}
+
+// SetDefaultManager 替换全局默认配置管理器。
+// 主要供应用层（如 App）在持有自己的 Manager 时使用，
+// 使 config.Get / config.GetString 等便捷函数仍然能取到正确的配置。
+// 传入 nil 表示重置为空管理器。
+func SetDefaultManager(m *Manager) {
+	if m == nil {
+		defaultManager = NewManager("")
+		return
+	}
+	defaultManager = m
+}
+
 // GetString 获取字符串配置
 func GetString(key string) string {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	if viperInstance == nil {
+	v := GetViper()
+	if v == nil {
 		return ""
 	}
-	return viperInstance.GetString(key)
+	return v.GetString(key)
 }
 
 // GetInt 获取整数配置
 func GetInt(key string) int {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	if viperInstance == nil {
+	v := GetViper()
+	if v == nil {
 		return 0
 	}
-	return viperInstance.GetInt(key)
+	return v.GetInt(key)
 }
 
 // GetBool 获取布尔配置
 func GetBool(key string) bool {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	if viperInstance == nil {
+	v := GetViper()
+	if v == nil {
 		return false
 	}
-	return viperInstance.GetBool(key)
+	return v.GetBool(key)
 }
 
 // GetStringMap 获取字符串映射配置
 func GetStringMap(key string) map[string]any {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	if viperInstance == nil {
+	v := GetViper()
+	if v == nil {
 		return nil
 	}
-	return viperInstance.GetStringMap(key)
+	return v.GetStringMap(key)
 }
 
 // IsDevelopment 是否开发环境
@@ -478,8 +618,6 @@ func (c *Config) GetAppName() string {
 }
 
 // GetSiteName 获取站点别名
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 全局统一获取站点别名，用于缓存前缀、日志标识等
 func (c *Config) GetSiteName() string {
 	if c == nil {
 		return ""

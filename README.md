@@ -11,7 +11,7 @@ xlgo 是一个基于 Go + Gin 的轻量级 Web 开发框架，提供了完整的
 ## 框架特性
 
 - **配置管理** - 支持 YAML 配置文件，环境变量覆盖，配置热更新
-- **数据库** - MySQL + GORM，支持自动迁移、重试机制、连接池、读写分离
+- **数据库** - 基于 GORM 的可插拔方言注册表，内置 MySQL / PostgreSQL，可注册任意 GORM 驱动；支持自动迁移、重试、连接池、读写分离
 - **缓存** - Redis 缓存，支持分布式缓存、键前缀、TTL，SCAN 优化
 - **认证** - JWT 认证，支持 Token 黑名单、刷新机制
 - **日志** - 分级日志（API、数据库），日志轮转
@@ -24,6 +24,8 @@ xlgo 是一个基于 Go + Gin 的轻量级 Web 开发框架，提供了完整的
 - **CLI 工具** - 脚手架工具，快速创建项目和代码
 
 ## 快速开始
+
+> **环境要求**：xlgo 基于 Go 1.25+ 构建，请确保本地已安装 Go 1.25 或更高版本。
 
 ### 1. 安装
 
@@ -49,6 +51,7 @@ server:
   mode: development
 
 database:
+  driver: mysql          # mysql（默认）或 postgres
   host: localhost
   port: 3306
   user: root
@@ -56,6 +59,7 @@ database:
   name: your_database
   max_idle_conns: 10
   max_open_conns: 100
+  # dsn: "自定义连接字符串，设置后优先于上面的字段"
 
 redis:
   host: localhost
@@ -89,6 +93,8 @@ go run main.go
 
 访问 http://localhost:8080/health 检查服务状态。
 
+> v1.0.2 起，`xlgo.New()` 默认是轻量应用，不会自动初始化 MySQL、Redis、Storage 或 Swagger。需要完整基础设施时请显式使用 `WithMySQL()`、`WithRedis()`、`WithStorage()`、`WithSwaggerRoutes()`，或直接使用 `xlgo.NewFullStack()`。
+
 ---
 
 ## 核心功能
@@ -119,13 +125,15 @@ config.Reload()
 
 ### 数据库操作
 
+xlgo 基于 GORM，主库与从库的驱动由配置 `database.driver` 决定，内置支持 `mysql`（默认）与 `postgres`，也可通过 `database.dsn` 使用任意自定义连接字符串。v1.0.2 起 GORM 方言通过 **可插拔注册表** 管理，应用可自行接入 SQLite、SQL Server、ClickHouse 等任意 GORM 驱动而无需修改框架。
+
 ```go
-// 初始化 MySQL
-database.InitMySQL(cfg)
+// 初始化数据库（驱动由配置决定）
+database.InitDB(cfg)
 defer database.Close()
 
-// 主从读写分离
-database.InitMySQLWithReplicas(cfg, []string{
+// 主从读写分离（从库 DSN 需与主库驱动匹配）
+database.InitDBWithReplicas(cfg, []string{
     "root:pass@tcp(slave1:3306)/db",
     "root:pass@tcp(slave2:3306)/db",
 })
@@ -145,6 +153,44 @@ database.Transaction(func(tx *gorm.DB) error {
 // 健康检查
 status := database.HealthCheck()
 ```
+
+v1.0.2 起数据库状态由实例化的 `database.Manager` 管理，全局函数（`GetDB`、`GetReadDB`、`CloseAll` 等）作为默认 `DefaultManager` 的 facade 保留。可通过 `database.NewManager(cfg)` 创建独立管理器，并通过 `ReplicaPicker` 自定义从库选择策略：
+
+```go
+// 独立管理器（不影响全局 DefaultManager）
+mgr := database.NewManager(cfg)
+if err := mgr.Open(context.Background()); err != nil {
+    return err
+}
+defer mgr.Close()
+
+// 从库选择策略：轮询（默认随机）
+database.SetReplicaPicker(&database.RoundRobinPicker{})
+```
+
+#### 注册自定义 GORM 方言
+
+通过 `database.RegisterDialect` 一次注册即可让 `database.driver: <name>` 生效，DSN 构建器会同步登记到 `config` 包，因此 `cfg.Database.DSN()` 也会识别新驱动：
+
+```go
+import (
+    "github.com/EthanCodeCraft/xlgo-core/config"
+    "github.com/EthanCodeCraft/xlgo-core/database"
+    "gorm.io/driver/sqlite"
+    "gorm.io/gorm"
+)
+
+func init() {
+    database.RegisterDialect(database.DialectSpec{
+        Name:      "sqlite",
+        Aliases:   []string{"sqlite3"},
+        Dialector: func(dsn string) gorm.Dialector { return sqlite.Open(dsn) },
+        DSN:       func(c *config.DatabaseConfig) string { return c.Name }, // Name 当作文件路径
+    })
+}
+```
+
+诊断接口：`database.RegisteredDialects()` 返回当前已注册的驱动名（含别名），`database.LookupDialect(name)` 用于检查某个驱动是否已就绪。未注册的驱动会回退到 MySQL 以保持向后兼容。
 
 ### Repository 泛型 CRUD
 
@@ -421,21 +467,28 @@ match, needUpgrade, newHash, err := validation.CheckPasswordAndUpgrade(hash, pas
 // JWT 认证（必须登录）
 r.Use(middleware.AuthRequired())
 
-// 管理员权限
+// 自定义用户类型权限
+r.Use(middleware.RequireUserTypes("tenant_admin", "platform_admin"))
+
+// 自定义角色权限
+r.Use(middleware.RequireRoles("owner", "manager"))
+
+// 自定义复杂权限判断
+r.Use(middleware.RequireAuth(func(user middleware.AuthUser, c *gin.Context) bool {
+    return user.UserType == "merchant" && user.Role == "owner"
+}))
+
+// 默认快捷方法（super_admin/admin/staff 只是框架默认常量）
 r.Use(middleware.AdminRequired())
-
-// 超级管理员权限
 r.Use(middleware.SuperAdminRequired())
-
-// 员工权限
 r.Use(middleware.StaffRequired())
-
-// 任意用户（管理员或员工）
 r.Use(middleware.AnyUserRequired())
 
 // 获取用户信息
+user, ok := middleware.GetAuthUser(c)
 userID := middleware.GetUserID(c)
 username := middleware.GetUsername(c)
+role := middleware.GetRole(c)
 userType := middleware.GetUserType(c)
 ```
 
@@ -556,8 +609,9 @@ xlgo/
 ├── cron/
 │   └── cron.go         # 定时任务调度
 ├── database/
-│   ├── mysql.go        # MySQL 连接（支持读写分离）
-│   └── redis.go        # Redis 连接
+│   ├── manager.go     # 数据库管理器（主从、Picker、Init/Close/HealthCheck）
+│   ├── dialect.go     # GORM 方言注册表（mysql / postgres，可扩展）
+│   └── redis.go       # Redis 连接
 ├── handler/
 │   └── handler.go      # 基础处理器（类型安全参数获取）
 ├── jwt/
@@ -643,50 +697,185 @@ docker run -d -p 8080:8080 xlgo-app:latest
 
 ## 更新日志
 
-### v2.1.0 (2026-04-30)
+> 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
-- **分布式锁安全增强** - Lua 脚本 + UUID Token，只有持有者能释放锁
-- **JWT 黑名单优化** - 使用 JTI 替代完整 Token，大幅节省 Redis 内存
-- **HTTP Client 连接池** - Transport 初始化时创建，连接可复用
-- **优雅关闭机制** - 监听系统信号，等待请求处理完成
-- **Redis 分布式限流** - 滑动窗口算法，多实例共享限流状态
-- **Repository 扩展** - 分页查询、链式查询、批量操作、事务支持
-- **CORS 配置完善** - 支持配置文件、通配符域名
-- **日志中间件增强** - 可记录请求体、慢请求警告、敏感字段过滤
-- **新增测试** - cache、middleware 新增多项测试用例
+### v1.0.3 (2026-06-22)
 
-### v2.0.0 (2026-04-30)
+> 本版本定位为 **bug fix release**：收口 v1.0.2 引入的破坏性清理，并修复 4 个轻量 bug + 依赖复查。完整说明见 [CHANGELOG.md#unreleased](./CHANGELOG.md#unreleased)。
 
-- **新增工具函数库** - 111 个实用函数（随机数、字符串、时间、转换、文件、URL、验证、加密、HTTP 客户端、UUID）
-- **新增彩色控制台输出** - console 包支持 Debug/Info/Success/Warn/Error 五级彩色输出
-- **新增压缩解压** - compress 包支持 Gzip/Zip 压缩解压
-- **新增键名前缀管理** - cache.K() 自动添加站点前缀，解决多项目共用 Redis 冲突
-- **新增分布式锁** - cache.Lock/TryLock/WithLock 完整实现
-- **新增计数器** - cache.Incr/Decr/IncrBy 支持
-- **新增 RequestID 中间件** - 请求追踪支持
-- **新增 Recover 中间件** - Panic 恢复
-- **新增类型安全参数获取** - handler.QueryInt/PathInt/FormInt 等
-- **新增路由架构** - router 包支持模块化、版本化 API、中间件分组、RESTful CRUD
-- **新增 AppConfig** - 站点别名、环境判断
-- **CLI 工具重构** - 模块化结构，模板分离
-- **单元测试覆盖** - 17 个包有测试（68%覆盖）
+#### 🐛 Fixed — JWT JTI 生成忽略 `rand.Read` 错误
 
-### v1.1.0 (2026-04-29)
+`generateJTI()` 丢弃 `crypto/rand.Read` 的 error，失败时会基于全零字节生成 JTI，导致所有 token 的 JTI 相同、黑名单机制失效。改为 `(string, error)` 并在 `GenerateToken` / `GenerateTokenWithCustomExpiry` 传播错误。
 
-- 新增配置热更新支持
-- 新增数据库读写分离
-- 新增 CSRF 防护中间件
-- 新增 SSE 流式响应支持
-- 新增 WebSocket 支持
-- 新增定时任务调度器
-- 新增 CLI 脚手架工具
-- 新增测试工具包
-- 新增统一错误码体系
-- 新增密码加密工具
-- 新增请求验证器（支持自定义错误消息）
-- 实现 OSS 存储上传
-- 优化缓存 DeleteByPattern 使用 SCAN
-- 修复限流器 goroutine 泄漏问题
+#### 🐛 Fixed — `QueryBuilder.Page` 统计行数被残留 Limit 截断
+
+`Page()` 复制查询做 Count 时未清除残留 `Limit`/`Offset`，调用方先 `.Limit(n)` 再 `.Page(...)` 会让 Count 被包成子查询，返回 `total` 被截断为 ≤ n。countDB 改为 `.Limit(-1).Offset(-1)` 清除残留条件。
+
+#### 🐛 Fixed — OSS / 本地存储文件名冲突
+
+4 处上传路径仅用 `time.Now().UnixNano()` 命名，同纳秒并发上传会撞名覆盖。新增 `uniqueFilename(now, ext)`（`<unixNano>-<8字节crypto/rand hex>.<ext>`），4 处统一改用。
+
+#### 🐛 Fixed — 数据库重试策略对不可恢复错误无效
+
+`InitDB` 对认证失败（`Access denied`）、未知数据库（`Unknown database`）、非法 DSN、未注册驱动等配置类错误也退避重试 5 次，白白延迟 31 秒。新增 `isTransientDBError`，这类错误首次出现即返回；网络类错误仍正常重试。
+
+#### 📦 Dependencies — `go mod tidy` + 安全补丁升级
+
+- `go mod tidy` 补全 postgres 方言传递依赖（`jackc/pgx` 家族、`golang.org/x/sync`），`gorm.io/driver/postgres` 提升为直接依赖
+- 安全补丁升级（无 API 变更）：`golang.org/x/crypto` v0.49→v0.53、`golang-jwt/jwt/v5` v5.2.1→v5.3.1、`gorilla/websocket` v1.5.1→v1.5.3
+- 暂缓升级（留待 v1.0.4 / v1.1）：`gin` / `validator` / `gorm` / `aliyun-oss-go-sdk` v2→v3（major 破坏性）等跨版本升级
+
+#### ⚠️ Breaking — 清理 v1.0.2 兼容别名（database 包）
+
+```go
+// ❌ 移除
+database.InitMySQL(cfg)
+database.InitMySQLWithReplicas(cfg, replicas)
+(*Manager).InitMySQL / InitMySQLWithReplicas
+
+// ✅ 改用（v1.0.2 起就是正式 API，驱动由 cfg.Database.Driver 决定）
+database.InitDB(cfg)
+database.InitDBWithReplicas(cfg, replicas)
+```
+
+xlgo 仍是早期框架，趁此一次彻底清理 v1.0.2 临时保留的别名，避免长期累积技术债。
+
+#### 🗑️ Removed — 删除死代码 `database.DBResolver`
+
+`database.DBResolver.BeforeQuery` 从未被注册到 GORM callback chain，属于纯死代码。文档曾暗示的"自动读写分离"实际从未生效——读写分离一直依赖业务侧显式调用 `database.UseMaster(ctx)` / `database.UseReplica(ctx)`。
+
+需要 callback 级自动路由的用户请直接接入官方 [`gorm.io/plugin/dbresolver`](https://github.com/go-gorm/dbresolver)。
+
+#### 🔄 Changed — 文件重命名 `database/mysql.go → database/manager.go`
+
+文件内容已与 MySQL 解耦（v1.0.2 引入可插拔方言注册表后），继续叫 `mysql.go` 误导。**导入路径无变化**，公开 API 全部保留。
+
+#### ✨ Added — console 包显式 level 控制
+
+`console` 包新增显式级别屏蔽能力：
+
+```go
+console.SetLevel(console.LevelWarn)    // 只看 Warn / Error
+console.SetLevel(console.LevelSilent)  // 完全静默
+```
+
+**定位明确**：console 是**开发期彩色 stdout 工具**（跟 `fmt.Println` 同级），**不写文件、不感知环境**。业务可观测信息请使用 `logger`。框架不会自动根据 `app.env` 切换级别——选择权完全在调用方，避免"dev / prod 行为不一致"的隐式陷阱。
+
+完整对比表见 [GUIDE.md §3.3](./GUIDE.md#33-彩色控制台输出)。
+
+#### 🐛 Fixed — Logger 重复写入修复
+
+修复通用 `Logger` 把 `apiCore` 与 `dbCore` 都 Tee 进来导致**每条日志写三份**的 bug。
+
+- `Logger`（通用）→ `logs/app.log` + console
+- `APILog()`     → `logs/api.log` + console
+- `DBLog()`      → `logs/database.log` + console
+- 互不串扰，磁盘体积砍掉 2/3
+
+**新增**：`logger.Close()` 显式关闭文件句柄，`App.Shutdown` 已自动调用；`Init(nil)` 改为返回 error 而非 panic；生产默认级别从 `Warn` 调整为 `Info`。
+
+**升级注意**：日志目录会新增 `logs/app.log` 文件（之前通用日志被串写进了 `api.log`/`database.log`），运维采集脚本如有需要请补上。
+
+#### 🔒 Security — CORS 中间件修复
+
+修复 CORS 中间件多个安全与规范遵守问题：
+
+- **`Access-Control-Allow-Credentials` 永远是 `true`** — 旧实现 `if/else` 两个分支都设了 `"true"`，导致即使配置 `AllowCredentials=false` 也会发送凭证头
+- **`*` + `credentials: true` 的规范违规** — 同时发送会被浏览器拒绝；修复后此场景回显具体 Origin
+- **缺失 `Vary: Origin`** — 防止 CDN / 网关把 A 用户的 CORS 响应缓存给 B 用户
+- 非白名单 Origin 不再被回显，防反射型 CORS 漏洞
+
+**升级影响**：如果你之前依赖"默认允许凭证"的隐式行为，需要在配置里显式启用：
+
+```yaml
+cors:
+  allowed_origins: ["https://your-frontend.example"]
+  allow_credentials: true
+```
+
+#### ⚠️ Breaking — 错误码体系重构
+
+修复 `CodeSuccess` 与 `CodeInvalidParams` 撞码的生产级 bug（两者都等于 `1`，导致业务错误响应被前端误判为成功）。
+
+**数值变更**：
+
+| 常量 | 旧值 | 新值 |
+|---|---|---|
+| `response.CodeSuccess` | `1` | **`0`** |
+| `response.CodeFail` | `0` | **`1`** |
+
+**移除**：
+
+- `response.CodeInvalidParams`（与 `CodeSuccess` 撞码，且参数错误码应由业务自定义）
+- `response.ErrInvalidParams`
+
+**迁移指南**：
+
+```go
+// ❌ 旧代码（编译失败）
+response.FailWithError(c, response.ErrInvalidParams)
+
+// ✅ 推荐：业务侧自定义错误码
+var ErrInvalidParams = response.NewError(40001, "参数错误")
+response.FailWithError(c, ErrInvalidParams)
+
+// ✅ 或直接使用通用失败响应
+response.Fail(c, "用户名格式错误")
+```
+
+**前端**：`if (resp.code === 1)` → `if (resp.code === 0)`。
+
+新增 `_errorCodeUniquenessGuard` 编译期防撞码 map，任何后续 `Code*` 常量重复都会在 `go build` 阶段直接报错。
+
+详细迁移说明见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### v1.0.2 (2026-06-20)
+
+#### 数据库
+- **可插拔方言注册表** - 新增 `database.RegisterDialect` / `LookupDialect` / `RegisteredDialects`，应用可一次注册即让 `database.driver: <name>` 生效，DSN 构建器同步登记到 `config` 包；内置 `mysql` 与 `postgres`（含 `postgresql`、`pg` 别名），未注册驱动回退 MySQL
+- **多数据库驱动** - `database.driver` 支持 `mysql`（默认）与 `postgres`，新增 `database.InitDB` / `InitDBWithReplicas`（v1.0.3 起原 `InitMySQL*` 别名已移除）
+- **数据库管理器** - 引入实例化 `database.Manager` 持有主从连接,提供 `Master/Replica/FromContext/HealthCheck` 等方法
+- **从库选择策略** - 新增 `ReplicaPicker` 接口与 `RoundRobinPicker` / `RandomPicker` 实现，可通过 `SetReplicaPicker` 自定义
+- **私有上下文键** - `db_mode` 字符串键替换为私有 `dbModeContextKey{}` 类型，避免上下文键名冲突
+- **DSN 构建器注册表** - `config` 包新增 `RegisterDSNBuilder` / `LookupDSNBuilder` / `RegisteredDrivers`，`DatabaseConfig.DSN()` 改为查注册表，自定义 `CustomDSN` 优先
+
+#### App 启动流程
+- **轻量默认** - `xlgo.New()` 默认不再初始化 MySQL / Redis / Storage，也不注册 `/health` 与 `/swagger/*`；通过 Option 显式启用
+- **组件 Option** - 新增 `WithLogger / WithMySQL / WithRedis / WithStorage / WithWire / WithHealthRoutes / WithSwaggerRoutes / WithDefaultRoutes / WithAutoMigrate` 及对应 `WithoutXxx` 关闭项
+- **迁移控制** - 新增 `Migrator` 类型与 `WithMigrator / WithModels`，注册时自动开启 `WithAutoMigrate`，`WithoutAutoMigrate` 可显式关闭；不再强制调用空的 `database.AutoMigrate()`
+- **batteries-included** - 新增 `WithFullStack` / `NewFullStack` / `RunFullStack`，一键启用全部默认组件
+- **错误传播** - 框架初始化失败一律 `return error`，不再在框架内部直接 `Fatalf` 退出进程
+
+#### 权限中间件
+- **去业务化** - `super_admin/admin/staff` 调整为默认常量而非固定业务模型
+- **通用能力** - 新增 `AuthUser` 结构体、`GetAuthUser`、`RequireUserTypes / RequireRoles / RequireAuth`，旧的 `AdminRequired/SuperAdminRequired/StaffRequired/AnyUserRequired` 改为基于通用能力实现
+
+#### 配置管理
+- **实例化 Manager** - 新增 `config.Manager`，提供 `Load / LoadWithWatch / Reload / RegisterCallback / Get / GetViper / Set` 等方法，支持多实例与重复加载
+- **App 持有 Manager** - `WithConfigPath` 创建 App 私有 manager 并通过新增的 `config.SetDefaultManager` 推为全局默认，使 `config.Get / GetString` 等便捷函数仍然可用
+- **修复** - 修复 `WithConfigPath` 此前的空实现问题
+
+#### 健康检查与默认路由
+- **拆分注册** - `router` 包新增 `RegisterHealthRoute` / `RegisterSwaggerRoutes`，原 `RegisterDefaultRoutes` 改为组合调用
+- **检查项与状态** - `/health` 支持注册 `HealthCheck`，失败返回 HTTP 503 与 `{"status":"error", "checks":{...}}`
+- **App 集成** - 启用 MySQL / Redis 时自动追加对应健康检查项，可通过 `WithHealthCheck` 注册自定义检查
+
+#### 资源关闭
+- **Shutdown 修复** - 改为 `database.CloseAll()` 关闭主从连接，并使用 `errors.Join` 聚合限流器、日志、Redis 等组件的关闭错误
+- **Storage 可选化** - 未初始化 Storage 时返回 `ErrStorageNotInitialized`，不再 nil panic
+
+#### 文档与 CLI
+- **CLI 修复** - `xlgo version` 更新为 v1.0.2，脚手架模板改为依赖 `github.com/EthanCodeCraft/xlgo-core` 并在注释中提示 Swagger / MySQL / Redis / FullStack 的开启方式
+- **GUIDE 同步** - 1.3 最简示例、3.2 日志注释、8.4.7 默认路由、9.2 用户信息获取均更新为 v1.0.2 行为
+- **历史日志修正** - 修复此前 README 中错误的 v2.0.0 / v2.1.0 更新日志表述
+
+### v1.0.1 (2026-04-30)
+
+- 新增工具函数库、彩色控制台输出、压缩解压、RequestID、Recover 中间件
+- 新增缓存键名前缀、分布式锁、计数器、Redis 分布式限流
+- 增强 JWT 黑名单、Repository、CORS、日志中间件和优雅关闭能力
+- 新增路由架构，支持模块化、版本化 API、中间件分组和 RESTful CRUD
+- 完善配置热更新、数据库读写分离、CSRF、SSE、WebSocket、定时任务、CLI、测试工具和统一错误码
 
 ### v1.0.0 (2024-04)
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -254,6 +255,130 @@ func TestCORSOptions(t *testing.T) {
 	// OPTIONS 应返回 204
 	if w.Code != 204 {
 		t.Errorf("CORS OPTIONS status = %d, want 204", w.Code)
+	}
+}
+
+// CORS 规范要求：AllowCredentials=false 时不应发送 Access-Control-Allow-Credentials 头。
+// 历史 bug：旧实现在 if/else 两个分支都设了 "true"，相当于永远允许凭证。
+func TestCORSAllowCredentialsDefault(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.CORSWithConfig(&config.CORSConfig{
+		AllowedOrigins:   []string{"https://example.com"},
+		AllowCredentials: false,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "https://example.com")
+	r.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want empty when AllowCredentials=false", got)
+	}
+}
+
+// AllowCredentials=true 且 Origin 在白名单内：发送凭证头并回显具体 Origin。
+func TestCORSAllowCredentialsExplicitOrigin(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.CORSWithConfig(&config.CORSConfig{
+		AllowedOrigins:   []string{"https://example.com"},
+		AllowCredentials: true,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "https://example.com")
+	r.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want \"true\"", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want \"https://example.com\"", got)
+	}
+	if got := w.Header().Get("Vary"); got != "Origin" {
+		t.Errorf("Vary = %q, want \"Origin\"", got)
+	}
+}
+
+// CORS 规范：AllowCredentials=true 时禁止使用 "*"，必须回显具体 Origin。
+func TestCORSWildcardWithCredentials(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.CORSWithConfig(&config.CORSConfig{
+		AllowedOrigins:   []string{"*"},
+		AllowCredentials: true,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "https://anywhere.example")
+	r.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got == "*" {
+		t.Errorf("Access-Control-Allow-Origin must NOT be \"*\" when credentials are allowed, got %q", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://anywhere.example" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want echoed origin", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want \"true\"", got)
+	}
+}
+
+// AllowedOrigins=["*"] 且 AllowCredentials=false：保持 "*" 通配符语义。
+func TestCORSWildcardWithoutCredentials(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.CORSWithConfig(&config.CORSConfig{
+		AllowedOrigins:   []string{"*"},
+		AllowCredentials: false,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "https://anywhere.example")
+	r.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want \"*\"", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want empty (AllowCredentials=false)", got)
+	}
+}
+
+// Origin 不在白名单时不应回显，避免反射型 CORS 漏洞。
+func TestCORSOriginNotAllowed(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.CORSWithConfig(&config.CORSConfig{
+		AllowedOrigins:   []string{"https://allowed.example"},
+		AllowCredentials: true,
+	}))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "https://evil.example")
+	r.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want empty for non-whitelisted origin", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Access-Control-Allow-Credentials = %q, want empty for non-whitelisted origin", got)
 	}
 }
 

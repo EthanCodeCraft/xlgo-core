@@ -17,7 +17,25 @@ const (
 	ContextKeyRole = "role"
 	// ContextKeyUserType 用户类型上下文键
 	ContextKeyUserType = "user_type"
+
+	// DefaultUserTypeSuperAdmin 默认超级管理员用户类型
+	DefaultUserTypeSuperAdmin = "super_admin"
+	// DefaultUserTypeAdmin 默认管理员用户类型
+	DefaultUserTypeAdmin = "admin"
+	// DefaultUserTypeStaff 默认员工用户类型
+	DefaultUserTypeStaff = "staff"
 )
+
+// AuthUser 当前认证用户
+type AuthUser struct {
+	UserID   uint
+	Username string
+	Role     string
+	UserType string
+}
+
+// AuthChecker 自定义权限检查函数
+type AuthChecker func(user AuthUser, c *gin.Context) bool
 
 // AuthRequired JWT 认证中间件
 func AuthRequired() gin.HandlerFunc {
@@ -55,117 +73,132 @@ func AuthRequired() gin.HandlerFunc {
 	}
 }
 
-// AdminRequired 管理员权限中间件
-func AdminRequired() gin.HandlerFunc {
+// RequireAuth 自定义权限中间件
+func RequireAuth(checker AuthChecker, messages ...string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userType, exists := c.Get(ContextKeyUserType)
-		if !exists {
-			response.Unauthorized(c, "请先登录")
-			c.Abort()
-			return
-		}
-
-		// 安全的类型断言
-		ut, ok := userType.(string)
+		user, ok := GetAuthUser(c)
 		if !ok {
-			response.Unauthorized(c, "用户信息异常")
-			c.Abort()
+			abortAuthContext(c)
 			return
 		}
 
-		if ut != "super_admin" && ut != "admin" {
-			response.Fail(c, "无权限访问")
-			c.Abort()
+		if checker == nil || !checker(user, c) {
+			abortForbidden(c, messages...)
 			return
 		}
 
 		c.Next()
 	}
+}
+
+// RequireUserTypes 用户类型权限中间件
+func RequireUserTypes(userTypes ...string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(userTypes))
+	for _, userType := range userTypes {
+		allowed[userType] = struct{}{}
+	}
+
+	return RequireAuth(func(user AuthUser, c *gin.Context) bool {
+		_, ok := allowed[user.UserType]
+		return ok
+	})
+}
+
+// RequireRoles 角色权限中间件
+func RequireRoles(roles ...string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		allowed[role] = struct{}{}
+	}
+
+	return RequireAuth(func(user AuthUser, c *gin.Context) bool {
+		_, ok := allowed[user.Role]
+		return ok
+	})
+}
+
+// AdminRequired 管理员权限中间件
+func AdminRequired() gin.HandlerFunc {
+	return RequireUserTypes(DefaultUserTypeSuperAdmin, DefaultUserTypeAdmin)
 }
 
 // SuperAdminRequired 超级管理员权限中间件
 func SuperAdminRequired() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userType, exists := c.Get(ContextKeyUserType)
-		if !exists {
-			response.Unauthorized(c, "请先登录")
-			c.Abort()
-			return
-		}
-
-		// 安全的类型断言
-		ut, ok := userType.(string)
-		if !ok {
-			response.Unauthorized(c, "用户信息异常")
-			c.Abort()
-			return
-		}
-
-		if ut != "super_admin" {
-			response.Fail(c, "需要超级管理员权限")
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
+	return RequireUserTypes(DefaultUserTypeSuperAdmin)
 }
 
 // StaffRequired 员工权限中间件
 func StaffRequired() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userType, exists := c.Get(ContextKeyUserType)
-		if !exists {
-			response.Unauthorized(c, "请先登录")
-			c.Abort()
-			return
-		}
-
-		// 安全的类型断言
-		ut, ok := userType.(string)
-		if !ok {
-			response.Unauthorized(c, "用户信息异常")
-			c.Abort()
-			return
-		}
-
-		if ut != "staff" {
-			response.Fail(c, "无权限访问")
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
+	return RequireUserTypes(DefaultUserTypeStaff)
 }
 
-// AnyUserRequired 任意用户权限中间件（允许 admin/super_admin/staff）
+// AnyUserRequired 任意用户权限中间件（默认允许 admin/super_admin/staff）
 func AnyUserRequired() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userType, exists := c.Get(ContextKeyUserType)
-		if !exists {
-			response.Unauthorized(c, "请先登录")
-			c.Abort()
-			return
-		}
+	return RequireUserTypes(DefaultUserTypeSuperAdmin, DefaultUserTypeAdmin, DefaultUserTypeStaff)
+}
 
-		// 安全的类型断言
-		ut, ok := userType.(string)
-		if !ok {
-			response.Unauthorized(c, "用户信息异常")
-			c.Abort()
-			return
-		}
-
-		// 允许所有内部用户类型
-		if ut != "super_admin" && ut != "admin" && ut != "staff" {
-			response.Fail(c, "无权限访问")
-			c.Abort()
-			return
-		}
-
-		c.Next()
+func abortAuthContext(c *gin.Context) {
+	if _, exists := c.Get(ContextKeyUserID); !exists {
+		response.Unauthorized(c, "请先登录")
+	} else {
+		response.Unauthorized(c, "用户信息异常")
 	}
+	c.Abort()
+}
+
+func abortForbidden(c *gin.Context, messages ...string) {
+	if len(messages) > 0 && messages[0] != "" {
+		response.Fail(c, messages[0])
+	} else {
+		response.FailWithError(c, response.ErrForbidden)
+	}
+	c.Abort()
+}
+
+// GetAuthUser 从上下文获取认证用户
+func GetAuthUser(c *gin.Context) (AuthUser, bool) {
+	userID, exists := c.Get(ContextKeyUserID)
+	if !exists {
+		return AuthUser{}, false
+	}
+	id, ok := userID.(uint)
+	if !ok {
+		return AuthUser{}, false
+	}
+
+	username, exists := c.Get(ContextKeyUsername)
+	if !exists {
+		return AuthUser{}, false
+	}
+	name, ok := username.(string)
+	if !ok {
+		return AuthUser{}, false
+	}
+
+	role, exists := c.Get(ContextKeyRole)
+	if !exists {
+		return AuthUser{}, false
+	}
+	r, ok := role.(string)
+	if !ok {
+		return AuthUser{}, false
+	}
+
+	userType, exists := c.Get(ContextKeyUserType)
+	if !exists {
+		return AuthUser{}, false
+	}
+	ut, ok := userType.(string)
+	if !ok {
+		return AuthUser{}, false
+	}
+
+	return AuthUser{
+		UserID:   id,
+		Username: name,
+		Role:     r,
+		UserType: ut,
+	}, true
 }
 
 // GetUserID 从上下文获取用户ID
@@ -194,6 +227,20 @@ func GetUsername(c *gin.Context) string {
 		return ""
 	}
 	return name
+}
+
+// GetRole 从上下文获取角色
+func GetRole(c *gin.Context) string {
+	role, exists := c.Get(ContextKeyRole)
+	if !exists {
+		return ""
+	}
+	// 安全的类型断言
+	r, ok := role.(string)
+	if !ok {
+		return ""
+	}
+	return r
 }
 
 // GetUserType 从上下文获取用户类型

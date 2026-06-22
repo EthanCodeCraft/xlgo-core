@@ -42,7 +42,7 @@ type Config struct {
 // DefaultConfig 默认配置
 var DefaultConfig = Config{
 	ServiceName:    "xlgo-service",
-	ServiceVersion: "1.0.0",
+	ServiceVersion: "1.0.0", // 应用自身版本（非框架版本 xlgo.Version）；建议业务侧覆盖为实际应用版本
 	Environment:    "development",
 	ExporterType:   "otlp-http",
 	Endpoint:       "localhost:4318",
@@ -58,8 +58,6 @@ var tracerProvider *sdktrace.TracerProvider
 var tracer trace.Tracer
 
 // Init 初始化链路追踪
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: OpenTelemetry 是行业标准，支持多种导出器
 func Init(cfg Config) error {
 	if !cfg.Enabled {
 		// 设置 Noop Tracer
@@ -148,8 +146,6 @@ func Close(ctx context.Context) error {
 }
 
 // Middleware Gin 中间件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动为每个请求创建 Span，记录关键信息
 func Middleware(serviceName string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 从请求中提取 TraceContext
@@ -216,8 +212,6 @@ func GetTraceID(c *gin.Context) string {
 }
 
 // StartSpan 创建子 Span
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 用于记录业务逻辑中的关键操作
 func StartSpan(c *gin.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	ctx := GetContext(c)
 	return tracer.Start(ctx, name,
@@ -235,8 +229,6 @@ func StartSpanFromContext(ctx context.Context, name string, attrs ...attribute.K
 }
 
 // RecordError 记录错误
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动将错误信息关联到 Span
 func RecordError(c *gin.Context, err error) {
 	ctx := GetContext(c)
 	span := trace.SpanFromContext(ctx)

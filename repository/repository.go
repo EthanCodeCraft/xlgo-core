@@ -96,8 +96,6 @@ func (r *BaseRepo[T]) GetDB() *gorm.DB {
 // ===== 扩展查询功能 =====
 
 // FindOne 条件查询单条记录
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 灵活的条件查询，避免每次写原生 SQL
 func (r *BaseRepo[T]) FindOne(ctx context.Context, query string, args ...any) (*T, error) {
 	var model T
 	err := r.db.WithContext(ctx).Where(query, args...).First(&model).Error
@@ -150,8 +148,6 @@ type PageResult[T any] struct {
 }
 
 // FindPage 分页查询
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 最常用的分页查询封装
 func (r *BaseRepo[T]) FindPage(ctx context.Context, page, pageSize int) (*PageResult[T], error) {
 	var models []T
 	var total int64
@@ -406,7 +402,8 @@ func (qb *QueryBuilder[T]) Page(ctx context.Context, page, pageSize int) (*PageR
 	var total int64
 
 	// 复制 query 用于统计（避免影响原查询）
-	countDB := qb.db.Session(&gorm.Session{})
+	// 清除残留的 Limit/Offset，否则统计行数会被截断（GORM 中 Limit(-1)/Offset(-1) 表示移除该条件）
+	countDB := qb.db.Session(&gorm.Session{}).Limit(-1).Offset(-1)
 	if err := countDB.WithContext(ctx).Count(&total).Error; err != nil {
 		return nil, err
 	}

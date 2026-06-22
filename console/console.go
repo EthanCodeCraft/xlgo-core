@@ -6,11 +6,12 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Level 日志级别
-type Level int
+type Level int32
 
 const (
 	LevelDebug Level = iota
@@ -18,7 +19,21 @@ const (
 	LevelSuccess
 	LevelWarn
 	LevelError
+
+	// LevelSilent 完全静默：所有调用都不输出
+	LevelSilent Level = 127
 )
+
+// String 返回级别名称
+func (l Level) String() string {
+	if c, ok := colors[l]; ok {
+		return c.Name
+	}
+	if l == LevelSilent {
+		return "Silent"
+	}
+	return "Unknown"
+}
 
 // Color 颜色定义
 type Color struct {
@@ -34,14 +49,25 @@ var colors = map[Level]Color{
 	LevelError:   {Code: "1;31", Name: "Error"},   // 亮红色
 }
 
-// Console 控制台打印器
+// Console 控制台打印器。
+//
+// console 包定位：开发期彩色 stdout 工具，跟 fmt.Println 同级。
+// 不写文件、不感知运行环境、不做任何隐式 level 切换——
+// 所有 level 行为都由调用方显式控制（SetLevel / WithLevel）。
+//
+// 业务可观测信息（用户登录、订单状态变更等"上线后必须保留的事件"）
+// 请使用 logger 包；console 仅用于开发期肉眼调试。
 type Console struct {
-	output    io.Writer
-	isColor   bool
-	showTime  bool
-	showCall  bool
-	timeFmt   string
-	skipCall  int
+	output   io.Writer
+	isColor  bool
+	showTime bool
+	showCall bool
+	timeFmt  string
+	skipCall int
+
+	// level 通过 atomic 访问，支持运行期热切换且并发安全。
+	// 用 int32 存储 Level，0 = LevelDebug，与零值默认对齐。
+	level atomic.Int32
 }
 
 // Option 配置选项
@@ -68,11 +94,14 @@ func WithTime(show bool) Option {
 	}
 }
 
-// WithCaller 设置是否显示调用位置
-func WithCaller(show bool, skip int) Option {
+// WithCaller 设置是否显示调用位置。
+// skip 可选，默认 2（直接调用方）；自封装一层时传 3。
+func WithCaller(show bool, skip ...int) Option {
 	return func(c *Console) {
 		c.showCall = show
-		c.skipCall = skip
+		if len(skip) > 0 && skip[0] > 0 {
+			c.skipCall = skip[0]
+		}
 	}
 }
 
@@ -80,6 +109,17 @@ func WithCaller(show bool, skip int) Option {
 func WithTimeFormat(fmt string) Option {
 	return func(c *Console) {
 		c.timeFmt = fmt
+	}
+}
+
+// WithLevel 设置最低输出级别。低于该级别的调用会被静默丢弃。
+//
+// 例：WithLevel(LevelWarn) 只输出 Warn 与 Error；
+//
+//	WithLevel(LevelSilent) 完全静默，常用于压测或上线观察期临时关闭调试输出。
+func WithLevel(l Level) Option {
+	return func(c *Console) {
+		c.level.Store(int32(l))
 	}
 }
 
@@ -93,17 +133,53 @@ func New(opts ...Option) *Console {
 		timeFmt:  "15:04:05.000",
 		skipCall: 2,
 	}
+	// 默认 LevelDebug：开发期所有级别都打印。生产期请显式 SetLevel/WithLevel。
+	c.level.Store(int32(LevelDebug))
 	for _, opt := range opts {
 		opt(c)
 	}
 	return c
 }
 
+// SetLevel 运行期切换最低输出级别。并发安全。
+func (c *Console) SetLevel(l Level) {
+	c.level.Store(int32(l))
+}
+
+// Level 返回当前最低输出级别
+func (c *Console) Level() Level {
+	return Level(c.level.Load())
+}
+
 // Default 默认控制台
 var Default = New()
 
+// SetLevel 设置默认控制台的最低输出级别。并发安全。
+//
+// 典型用法（在 main 中根据 cfg 显式切换）：
+//
+//	if cfg.IsProduction() {
+//	    console.SetLevel(console.LevelWarn) // 生产期只看 Warn / Error
+//	}
+//
+// 框架不会自动根据环境模式切换，选择权完全在调用方。
+func SetLevel(l Level) {
+	Default.SetLevel(l)
+}
+
+// GetLevel 返回默认控制台当前最低输出级别。
+// （命名加 Get 前缀是因为 Level 已被类型占用，Go 不允许同名函数。）
+func GetLevel() Level {
+	return Default.Level()
+}
+
 // print 内部打印函数
 func (c *Console) print(level Level, s ...any) {
+	// 级别过滤：低于阈值或调用方显式 LevelSilent 时直接返回，零开销
+	if level < c.Level() {
+		return
+	}
+
 	var sb strings.Builder
 
 	// 时间

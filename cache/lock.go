@@ -58,8 +58,6 @@ end
 `
 
 // NewLock 创建分布式锁
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 UUID 作为 Token，保证锁的安全释放
 // 参数: key 锁名称，ttl 锁定时长
 // 返回: LockToken 用于后续解锁或续期
 func NewLock(ctx context.Context, key string, ttl time.Duration) (*LockToken, error) {
@@ -93,8 +91,6 @@ func Lock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 }
 
 // Unlock 安全释放锁
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用 Lua 脚本保证只有锁的持有者才能释放
 func Unlock(ctx context.Context, token *LockToken) error {
 	if database.RedisClient == nil {
 		return ErrRedisNotReady
@@ -126,8 +122,6 @@ func UnlockByKey(ctx context.Context, key string) error {
 }
 
 // ExtendLock 续期锁
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 长任务执行时防止锁过期被其他客户端抢占
 // 参数: token 锁令牌，ttl 新的过期时间
 func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error {
 	if database.RedisClient == nil {
@@ -153,8 +147,6 @@ func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error 
 }
 
 // TryLock 尝试获取锁，失败时等待重试
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 高并发场景常用，避免立即失败
 func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval time.Duration, maxRetry int) (*LockToken, error) {
 	for i := 0; i < maxRetry; i++ {
 		token, err := NewLock(ctx, key, ttl)
@@ -170,8 +162,6 @@ func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval t
 }
 
 // WithLock 使用分布式锁执行函数（自动管理锁）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 自动获取、续期、释放锁，避免忘记释放
 // 参数: key 锁名称，ttl 锁定时长，fn 业务函数
 // 注意: 如果任务执行时间超过 ttl，需要设置更长的 ttl 或使用 WithLockAutoExtend
 func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() error) error {
@@ -188,8 +178,6 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 }
 
 // WithLockAutoExtend 使用分布式锁执行函数（自动续期）
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 长任务执行时自动续期，防止锁过期
 // 参数: key 锁名称，initialTTL 初始锁定时长，extendInterval 续期间隔，fn 业务函数
 func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duration, extendInterval time.Duration, fn func() error) error {
 	token, err := NewLock(ctx, key, initialTTL)

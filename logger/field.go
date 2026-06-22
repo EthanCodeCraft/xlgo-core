@@ -30,6 +30,6 @@ var Field = struct {
 		}
 	},
 	Error: func(err error) zap.Field {
-			return zap.Error(err)
-		},
+		return zap.Error(err)
+	},
 }

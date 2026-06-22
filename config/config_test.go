@@ -90,6 +90,38 @@ func TestDatabaseConfigDSN(t *testing.T) {
 	}
 }
 
+func TestDatabaseConfigPostgresDSN(t *testing.T) {
+	db := config.DatabaseConfig{
+		Driver:   config.DriverPostgres,
+		Host:     "localhost",
+		Port:     5432,
+		User:     "postgres",
+		Password: "password",
+		Name:     "testdb",
+	}
+
+	dsn := db.DSN()
+	expected := "host=localhost port=5432 user=postgres password=password dbname=testdb sslmode=disable TimeZone=Asia/Shanghai"
+	if dsn != expected {
+		t.Errorf("Postgres DSN = %s, want %s", dsn, expected)
+	}
+
+	// 显式 MySQL DSN 不受 Driver 影响
+	if db.MySQLDSN() == "" {
+		t.Error("MySQLDSN should not be empty")
+	}
+}
+
+func TestDatabaseConfigCustomDSN(t *testing.T) {
+	db := config.DatabaseConfig{
+		Driver:    config.DriverPostgres,
+		CustomDSN: "custom-connection-string",
+	}
+	if db.DSN() != "custom-connection-string" {
+		t.Errorf("CustomDSN should take precedence, got %s", db.DSN())
+	}
+}
+
 func TestRedisConfigAddr(t *testing.T) {
 	redis := config.RedisConfig{
 		Host: "localhost",
@@ -214,6 +246,62 @@ jwt:
 func TestConfigGetString(_ *testing.T) {
 	// 已在 TestConfigLoad 中作为子测试完成
 	// 此函数保留为占位符，避免删除后影响其他测试引用
+}
+
+func TestConfigLoadReloadsDifferentFiles(t *testing.T) {
+	first, err := setupTempFile("first_config.yaml", "app:\n  name: first\nserver:\n  port: 1001\n")
+	if err != nil {
+		t.Fatalf("WriteFile first error: %v", err)
+	}
+	second, err := setupTempFile("second_config.yaml", "app:\n  name: second\nserver:\n  port: 1002\n")
+	if err != nil {
+		t.Fatalf("WriteFile second error: %v", err)
+	}
+	defer os.Remove(first)
+	defer os.Remove(second)
+
+	cfg, err := config.Load(first)
+	if err != nil {
+		t.Fatalf("Load first error: %v", err)
+	}
+	if cfg.App.Name != "first" || cfg.Server.Port != 1001 {
+		t.Fatalf("unexpected first config: %+v", cfg)
+	}
+
+	cfg, err = config.Load(second)
+	if err != nil {
+		t.Fatalf("Load second error: %v", err)
+	}
+	if cfg.App.Name != "second" || cfg.Server.Port != 1002 {
+		t.Fatalf("unexpected second config: %+v", cfg)
+	}
+}
+
+func TestConfigManagerIsolation(t *testing.T) {
+	first, err := setupTempFile("manager_first.yaml", "app:\n  name: manager_first\n")
+	if err != nil {
+		t.Fatalf("WriteFile first error: %v", err)
+	}
+	second, err := setupTempFile("manager_second.yaml", "app:\n  name: manager_second\n")
+	if err != nil {
+		t.Fatalf("WriteFile second error: %v", err)
+	}
+	defer os.Remove(first)
+	defer os.Remove(second)
+
+	m1 := config.NewManager(first)
+	m2 := config.NewManager(second)
+	cfg1, err := m1.Load()
+	if err != nil {
+		t.Fatalf("m1 Load error: %v", err)
+	}
+	cfg2, err := m2.Load()
+	if err != nil {
+		t.Fatalf("m2 Load error: %v", err)
+	}
+	if cfg1.App.Name != "manager_first" || cfg2.App.Name != "manager_second" {
+		t.Fatalf("managers should be isolated: %+v %+v", cfg1, cfg2)
+	}
 }
 
 func TestConfigSet(t *testing.T) {

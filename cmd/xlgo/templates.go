@@ -18,26 +18,15 @@ var templates = struct {
 	Main: `package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
-	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
+	"github.com/EthanCodeCraft/xlgo-core/middleware"
+	"github.com/EthanCodeCraft/xlgo-core/response"
+	"github.com/EthanCodeCraft/xlgo-core/router"
 	"github.com/gin-gonic/gin"
-	swaggerFiles "github.com/swaggo/files"
-	ginSwagger "github.com/swaggo/gin-swagger"
-
-	"{{.Module}}/config"
-	"{{.Module}}/database"
-	"{{.Module}}/handler"
-	"{{.Module}}/logger"
-	"{{.Module}}/middleware"
-	"{{.Module}}/storage"
-	"{{.Module}}/validation"
 )
 
 var configPath string
@@ -49,104 +38,28 @@ func init() {
 func main() {
 	flag.Parse()
 
-	// 加载配置
-	cfg, err := config.Load(configPath)
-	if err != nil {
-		fmt.Printf("加载配置失败: %v\n", err)
+	app := xlgo.New(
+		xlgo.WithConfigPath(configPath),
+		xlgo.WithLogger(),
+		xlgo.WithHealthRoutes(),
+		// 如需 Swagger 文档：xlgo.WithSwaggerRoutes() 或 xlgo.WithDefaultRoutes()
+		// 如需 MySQL/Redis/Storage：xlgo.WithMySQL() / xlgo.WithRedis() / xlgo.WithStorage()
+		// 一键启用全部默认组件：使用 xlgo.NewFullStack(...) 替代 xlgo.New(...)
+		xlgo.WithMiddlewares(middleware.Logger(), middleware.CORS()),
+		xlgo.WithModules(router.ModuleFunc(registerRoutes)),
+	)
+
+	if err := app.Run(); err != nil {
+		fmt.Printf("启动失败: %v\n", err)
 		os.Exit(1)
 	}
-
-	// 初始化日志
-	if err := logger.Init(cfg); err != nil {
-		fmt.Printf("初始化日志失败: %v\n", err)
-		os.Exit(1)
-	}
-	defer logger.Sync()
-
-	// 初始化数据库
-	if err := database.InitMySQL(cfg); err != nil {
-		logger.Fatalf("初始化 MySQL 失败: %v", err)
-	}
-	defer database.Close()
-
-	// 初始化 Redis
-	if err := database.InitRedis(cfg); err != nil {
-		logger.Fatalf("初始化 Redis 失败: %v", err)
-	}
-	defer database.CloseRedis()
-
-	// 初始化存储
-	if err := storage.Init(&cfg.Storage); err != nil {
-		logger.Fatalf("初始化存储失败: %v", err)
-	}
-
-	// 初始化验证器
-	validation.InitValidator()
-
-	// 设置 Gin 模式
-	if cfg.IsProduction() {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	// 创建路由
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(middleware.Logger())
-	r.Use(middleware.CORS())
-
-	// 静态文件服务
-	r.Static("/public", "./public")
-
-	// 注册路由
-	setupRoutes(r)
-
-	// 启动服务器
-	srv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.Server.Port),
-		Handler: r,
-	}
-
-	// 优雅关闭
-	go func() {
-		logger.Infof("服务器启动，监听端口 %d", cfg.Server.Port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Fatalf("服务器启动失败: %v", err)
-		}
-	}()
-
-	// 等待中断信号
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	logger.Info("正在关闭服务器...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := srv.Shutdown(ctx); err != nil {
-		logger.Fatalf("服务器强制关闭: %v", err)
-	}
-
-	logger.Info("服务器已关闭")
 }
 
-func setupRoutes(r *gin.Engine) {
-	// 初始化限速器
-	middleware.InitRateLimiters()
-
-	// Swagger 文档
-	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
-
-	// 健康检查
-	r.GET("/health", handler.HealthCheck)
-
-	// API 路由
+func registerRoutes(r *gin.RouterGroup) {
 	api := r.Group("/api/v1")
-	{
-		// 首页
-		api.GET("/", handler.Home)
-	}
+	api.GET("/", func(c *gin.Context) {
+		response.Success(c, gin.H{"message": "Welcome to {{.Name}}!"})
+	})
 }
 `,
 
@@ -165,6 +78,7 @@ server:
   mode: development
 
 database:
+  driver: mysql          # mysql（默认）或 postgres
   host: localhost
   port: 3306
   user: root
@@ -172,6 +86,7 @@ database:
   name: {{.NameLower}}
   max_idle_conns: 10
   max_open_conns: 100
+  # dsn: "自定义连接字符串，设置后优先于上面的字段"
 
 redis:
   host: localhost
@@ -198,24 +113,14 @@ log:
 `,
 
 	// GoMod go.mod 文件模板
+	// %s: module 名称；%s: xlgo 框架版本（来自 xlgo.Version，避免字面量散落）
 	GoMod: `module %s
 
 go 1.25
 
 require (
+	github.com/EthanCodeCraft/xlgo-core v%s
 	github.com/gin-gonic/gin v1.9.1
-	github.com/golang-jwt/jwt/v5 v5.2.0
-	github.com/google/uuid v1.6.0
-	github.com/redis/go-redis/v9 v9.5.1
-	github.com/spf13/viper v1.18.2
-	github.com/swaggo/files v1.0.1
-	github.com/swaggo/gin-swagger v1.6.0
-	github.com/swaggo/swag v1.16.3
-	go.uber.org/zap v1.27.0
-	golang.org/x/crypto v0.21.0
-	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-	gorm.io/driver/mysql v1.5.4
-	gorm.io/gorm v1.25.7
 )
 `,
 
@@ -281,9 +186,8 @@ config.local.yaml
 	Handler: `package handler
 
 import (
+	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/gin-gonic/gin"
-
-	"{{.Module}}/response"
 )
 
 // HealthCheck 健康检查
@@ -305,8 +209,8 @@ func Home(c *gin.Context) {
 	HandlerMake: `package handler
 
 import (
+	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/gin-gonic/gin"
-	"xlgo/response"
 )
 
 // %sHandler %s 处理器
@@ -388,19 +292,20 @@ func (h *%sHandler) Delete(c *gin.Context) {
 import (
 	"context"
 
-	"xlgo/database"
+	"github.com/EthanCodeCraft/xlgo-core/database"
+	xlrepo "github.com/EthanCodeCraft/xlgo-core/repository"
 	"xlgo/model"
 )
 
 // %sRepository %s 仓库
 type %sRepository struct {
-	*BaseRepo[model.%s]
+	*xlrepo.BaseRepo[model.%s]
 }
 
 // New%sRepository 创建 %s 仓库
 func New%sRepository() *%sRepository {
 	return &%sRepository{
-		BaseRepo: NewBaseRepo[model.%s](database.GetDB()),
+		BaseRepo: xlrepo.NewBaseRepo[model.%s](database.GetDB()),
 	}
 }
 
@@ -418,9 +323,11 @@ func (r *%sRepository) FindByName(ctx context.Context, name string) (*model.%s, 
 	// ModelMake make model 命令模板
 	ModelMake: `package model
 
+import xlmodel "github.com/EthanCodeCraft/xlgo-core/model"
+
 // %s %s 模型
 type %s struct {
-	BaseModel
+	xlmodel.BaseModel
 	Name        string ` + "`" + `gorm:"size:100;not null" json:"name"` + "`" + `
 	Description string ` + "`" + `gorm:"size:500" json:"description"` + "`" + `
 	Status      int    ` + "`" + `gorm:"default:1" json:"status"` + "`" + ` // 1: 启用, 0: 禁用

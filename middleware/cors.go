@@ -10,8 +10,9 @@ import (
 )
 
 // CORS 跨域中间件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 支持从配置文件读取 CORS 配置，生产环境更安全
+// 支持从配置文件读取 CORS 配置；遵循 W3C CORS 规范：
+// 当 AllowCredentials=true 时，Access-Control-Allow-Origin 必须回显为具体 Origin，
+// 不能使用 "*"（浏览器会拒绝携带凭证的响应）。
 func CORS() gin.HandlerFunc {
 	return CORSWithConfig(nil)
 }
@@ -30,15 +31,21 @@ func CORSWithConfig(corsCfg *config.CORSConfig) gin.HandlerFunc {
 			corsConfig = &cfg.CORS
 		}
 
+		// 是否允许携带凭证（影响 Origin 回显策略）
+		allowCredentials := corsConfig != nil && corsConfig.AllowCredentials
+
 		// 获取允许的域名列表
 		allowedOrigins := getAllowedOrigins(cfg, corsConfig)
 
-		// 检查是否在白名单中
+		// 匹配 Origin
+		// 注意：当 allowCredentials=true 且匹配到通配符时，
+		// 必须回显具体 Origin 而非 "*"，否则浏览器会拒绝响应。
 		allowedOrigin := ""
+		matchedWildcard := false
 		if origin != "" {
 			for _, ao := range allowedOrigins {
 				if ao == "*" {
-					allowedOrigin = "*"
+					matchedWildcard = true
 					break
 				}
 				// 支持通配符匹配（如 *.example.com）
@@ -56,20 +63,28 @@ func CORSWithConfig(corsCfg *config.CORSConfig) gin.HandlerFunc {
 			}
 		}
 
-		// 如果没有匹配到白名单
+		// 处理通配符 + 兜底策略
 		if allowedOrigin == "" {
-			// 开发环境允许所有来源
-			if cfg != nil && cfg.IsDevelopment() {
-				allowedOrigin = "*"
-			} else if len(allowedOrigins) == 1 && allowedOrigins[0] == "*" {
-				// 配置了通配符
-				allowedOrigin = "*"
+			if matchedWildcard {
+				if allowCredentials && origin != "" {
+					// AllowCredentials=true 时 spec 禁止 "*"，回显具体 Origin
+					allowedOrigin = origin
+				} else {
+					allowedOrigin = "*"
+				}
+			} else if cfg != nil && cfg.IsDevelopment() && origin != "" {
+				// 开发环境兜底：回显具体 Origin（兼容 credentials）
+				allowedOrigin = origin
 			}
 		}
 
 		// 设置 CORS 响应头
 		if allowedOrigin != "" {
 			c.Header("Access-Control-Allow-Origin", allowedOrigin)
+			// Origin 不是 "*" 时，下游缓存（CDN / 网关）必须按 Origin 区分缓存
+			if allowedOrigin != "*" {
+				c.Header("Vary", "Origin")
+			}
 		}
 
 		// 从配置获取允许的方法、请求头等
@@ -83,11 +98,10 @@ func CORSWithConfig(corsCfg *config.CORSConfig) gin.HandlerFunc {
 		c.Header("Access-Control-Expose-Headers", strings.Join(exposedHeaders, ", "))
 		c.Header("Access-Control-Max-Age", strconv.Itoa(maxAge))
 
-		// 是否允许携带凭证
-		if corsConfig != nil && corsConfig.AllowCredentials {
+		// 仅在显式启用且 Origin 不是 "*" 时才发 Allow-Credentials
+		// （CORS 规范：Allow-Origin: * 时禁止携带凭证）
+		if allowCredentials && allowedOrigin != "" && allowedOrigin != "*" {
 			c.Header("Access-Control-Allow-Credentials", "true")
-		} else {
-			c.Header("Access-Control-Allow-Credentials", "true") // 默认允许
 		}
 
 		// 处理预检请求
@@ -101,8 +115,7 @@ func CORSWithConfig(corsCfg *config.CORSConfig) gin.HandlerFunc {
 }
 
 // getAllowedOrigins 获取允许的域名列表
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 优先使用配置文件，其次使用环境变量，最后使用默认值
+// 优先使用配置文件，生产环境必须显式配置，开发环境提供 localhost 兜底。
 func getAllowedOrigins(cfg *config.Config, corsConfig *config.CORSConfig) []string {
 	// 优先使用 CORS 配置
 	if corsConfig != nil && len(corsConfig.AllowedOrigins) > 0 {

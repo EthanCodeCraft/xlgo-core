@@ -113,8 +113,6 @@ func Page(c *gin.Context, items any, total int64, page, pageSize int) {
 }
 
 // Download 文件下载响应
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 文件下载封装，自动设置响应头
 func Download(c *gin.Context, filename string, data []byte) {
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Content-Disposition", "attachment; filename="+filename)

@@ -1,6 +1,7 @@
 package storage_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,6 +23,26 @@ func init() {
 		},
 	}
 	logger.Init(cfg)
+}
+
+func TestStorageNotInitialized(t *testing.T) {
+	storage.SetStorage(nil)
+
+	if _, err := storage.UploadFromBytes([]byte("test"), "test.txt", "docs"); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("expected ErrStorageNotInitialized, got %v", err)
+	}
+	if err := storage.Delete("missing"); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("expected ErrStorageNotInitialized, got %v", err)
+	}
+	if _, err := storage.Get("missing"); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("expected ErrStorageNotInitialized, got %v", err)
+	}
+	if url := storage.GetURL("missing"); url != "" {
+		t.Fatalf("expected empty URL, got %q", url)
+	}
+	if storage.Exists("missing") {
+		t.Fatal("expected Exists false without storage")
+	}
 }
 
 func TestLocalStorage(t *testing.T) {

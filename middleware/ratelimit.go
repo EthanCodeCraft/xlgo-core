@@ -105,8 +105,6 @@ func (rl *RateLimiter) Stop() {
 // ===== Redis 分布式限流器 =====
 
 // RedisRateLimiter Redis 分布式限流器
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 多实例部署时限流共享，使用滑动窗口算法
 type RedisRateLimiter struct {
 	keyPrefix string        // 键名前缀
 	rate      int           // 每分钟允许的请求数
@@ -147,8 +145,6 @@ func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration) *Redi
 }
 
 // Allow 检查是否允许请求
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 使用滑动窗口算法，精确限流
 func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool, error) {
 	if database.RedisClient == nil {
 		// Redis 未启用，默认允许
@@ -306,8 +302,6 @@ func CustomRateLimit(rate int, window time.Duration) gin.HandlerFunc {
 // ===== Redis 分布式限流中间件 =====
 
 // RedisRateLimit Redis 分布式限流中间件
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 多实例部署时共享限流状态
 // 参数: keyPrefix 键名前缀（如 "login_limit"），rate 每分钟请求数
 func RedisRateLimit(keyPrefix string, rate int) gin.HandlerFunc {
 	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute)

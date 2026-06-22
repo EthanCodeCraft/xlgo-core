@@ -2,6 +2,8 @@ package storage
 
 import (
 	"bytes"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -25,6 +27,15 @@ type Storage interface {
 	Delete(path string) error
 	Get(path string) ([]byte, error)
 	Exists(path string) bool
+}
+
+// uniqueFilename 生成带随机后缀的唯一文件名，避免同一纳秒内并发上传导致文件名冲突。
+// 格式: <unixNano>-<8字节随机hex>.<ext>
+func uniqueFilename(now time.Time, ext string) string {
+	randBytes := make([]byte, 8)
+	// crypto/rand 失败极少见；退化为全零也能由纳秒时间戳保证基本唯一性
+	_, _ = rand.Read(randBytes)
+	return fmt.Sprintf("%d-%x%s", now.UnixNano(), randBytes, ext)
 }
 
 // LocalStorage 本地存储
@@ -57,7 +68,7 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 
 	// 生成唯一文件名
 	ext := filepath.Ext(file.Filename)
-	filename := fmt.Sprintf("%d%s", now.UnixNano(), ext)
+	filename := uniqueFilename(now, ext)
 	dst := filepath.Join(fullPath, filename)
 
 	// 打开源文件
@@ -107,7 +118,7 @@ func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (st
 	if ext == "" {
 		ext = ".bin"
 	}
-	uniqueFilename := fmt.Sprintf("%d%s", now.UnixNano(), ext)
+	uniqueFilename := uniqueFilename(now, ext)
 	dst := filepath.Join(fullPath, uniqueFilename)
 
 	// 创建目标文件
@@ -201,7 +212,7 @@ func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, 
 	now := time.Now()
 	datePath := fmt.Sprintf("%d/%02d/%02d", now.Year(), now.Month(), now.Day())
 	ext := filepath.Ext(file.Filename)
-	objectKey := fmt.Sprintf("%s/%d%s", filepath.Join(subdir, datePath), now.UnixNano(), ext)
+	objectKey := fmt.Sprintf("%s/%s", filepath.Join(subdir, datePath), uniqueFilename(now, ext))
 
 	// 打开源文件
 	src, err := file.Open()
@@ -228,7 +239,7 @@ func (s *OSSStorage) UploadFromBytes(data []byte, filename, subdir string) (stri
 	if ext == "" {
 		ext = ".bin"
 	}
-	objectKey := fmt.Sprintf("%s/%d%s", filepath.Join(subdir, datePath), now.UnixNano(), ext)
+	objectKey := fmt.Sprintf("%s/%s", filepath.Join(subdir, datePath), uniqueFilename(now, ext))
 
 	// 上传到 OSS
 	if err := s.bucket.PutObject(objectKey, bytes.NewReader(data)); err != nil {
@@ -285,6 +296,8 @@ func (s *OSSStorage) Exists(path string) bool {
 	return err == nil
 }
 
+var ErrStorageNotInitialized = errors.New("storage not initialized")
+
 // 全局存储实例
 var storage Storage
 
@@ -307,32 +320,60 @@ func Init(cfg *config.StorageConfig) error {
 	return nil
 }
 
+// GetStorage 获取全局存储实例
+func GetStorage() Storage {
+	return storage
+}
+
+// SetStorage 设置全局存储实例
+func SetStorage(s Storage) {
+	storage = s
+}
+
 // Upload 上传文件
 func Upload(file *multipart.FileHeader, subdir string) (string, error) {
+	if storage == nil {
+		return "", ErrStorageNotInitialized
+	}
 	return storage.Upload(file, subdir)
 }
 
 // UploadFromBytes 从字节数组上传文件
 func UploadFromBytes(data []byte, filename, subdir string) (string, error) {
+	if storage == nil {
+		return "", ErrStorageNotInitialized
+	}
 	return storage.UploadFromBytes(data, filename, subdir)
 }
 
 // GetURL 获取文件访问 URL
 func GetURL(path string) string {
+	if storage == nil {
+		return ""
+	}
 	return storage.GetURL(path)
 }
 
 // Delete 删除文件
 func Delete(path string) error {
+	if storage == nil {
+		return ErrStorageNotInitialized
+	}
 	return storage.Delete(path)
 }
 
 // Get 获取文件内容
 func Get(path string) ([]byte, error) {
+	if storage == nil {
+		return nil, ErrStorageNotInitialized
+	}
 	return storage.Get(path)
 }
 
 // Exists 检查文件是否存在
 func Exists(path string) bool {
+	if storage == nil {
+		return false
+	}
 	return storage.Exists(path)
 }

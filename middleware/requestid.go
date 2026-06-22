@@ -6,8 +6,6 @@ import (
 )
 
 // RequestID 请求ID中间件，为每个请求生成唯一ID便于追踪
-// 评分: ⭐⭐⭐⭐⭐
-// 理由: 日志追踪、问题排查必备，简洁高效
 func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		requestID := c.GetHeader("X-Request-ID")

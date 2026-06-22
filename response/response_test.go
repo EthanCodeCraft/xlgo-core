@@ -28,10 +28,10 @@ func TestSuccess(t *testing.T) {
 		t.Errorf("Success status = %d", w.Code)
 	}
 
-	// 验证响应体包含 code=1
+	// 验证响应体包含 code=0
 	body := w.Body.String()
-	if !contains(body, `"code":1`) {
-		t.Errorf("Success body should contain code:1, got %s", body)
+	if !contains(body, `"code":0`) {
+		t.Errorf("Success body should contain code:0, got %s", body)
 	}
 }
 
@@ -65,8 +65,8 @@ func TestFail(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if !contains(body, `"code":0`) {
-		t.Errorf("Fail body should contain code:0, got %s", body)
+	if !contains(body, `"code":1`) {
+		t.Errorf("Fail body should contain code:1, got %s", body)
 	}
 }
 
@@ -262,11 +262,11 @@ func TestRedirect(t *testing.T) {
 
 func TestErrorCodes(t *testing.T) {
 	// 测试错误码定义
-	if response.CodeSuccess != 1 {
-		t.Errorf("CodeSuccess = %d, want 1", response.CodeSuccess)
+	if response.CodeSuccess != 0 {
+		t.Errorf("CodeSuccess = %d, want 0", response.CodeSuccess)
 	}
-	if response.CodeFail != 0 {
-		t.Errorf("CodeFail = %d, want 0", response.CodeFail)
+	if response.CodeFail != 1 {
+		t.Errorf("CodeFail = %d, want 1", response.CodeFail)
 	}
 	if response.CodeUnauthorized == 0 {
 		t.Error("CodeUnauthorized should not be 0")
@@ -285,13 +285,13 @@ func TestErrorCodes(t *testing.T) {
 func TestResponseStructure(t *testing.T) {
 	// 测试 Response 结构体
 	resp := response.Response{
-		Code:      1,
+		Code:      0,
 		Msg:       "成功",
 		Data:      gin.H{"id": 1},
 		RequestID: "test-123",
 	}
 
-	if resp.Code != 1 {
+	if resp.Code != 0 {
 		t.Error("Response Code failed")
 	}
 	if resp.Msg != "成功" {
