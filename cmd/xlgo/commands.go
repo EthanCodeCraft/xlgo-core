@@ -19,17 +19,46 @@ func createProject(name string) {
 		return
 	}
 
-	// 创建目录结构
-	dirs := []string{
-		name,
-		name + "/config",
-		name + "/handler",
-		name + "/model",
-		name + "/repository",
-		name + "/service",
-		name + "/middleware",
-		name + "/public",
-		name + "/logs",
+	// 解析 --template 与 --module 参数（默认 template=api）
+	tmplName := "api"
+	module := name
+	args := os.Args[3:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--template", "-t":
+			if i+1 < len(args) {
+				tmplName = args[i+1]
+				i++
+			}
+		case "--module", "-m":
+			if i+1 < len(args) {
+				module = args[i+1]
+				i++
+			}
+		}
+	}
+
+	// 校验模板名
+	switch tmplName {
+	case "minimal", "api", "fullstack":
+		// ok
+	default:
+		fmt.Printf("未知模板: %s（可选: minimal / api / fullstack）\n", tmplName)
+		return
+	}
+
+	// minimal 模板目录结构最小化；api/fullstack 含完整分层目录
+	var dirs []string
+	dirs = append(dirs, name, name+"/public", name+"/logs")
+	if tmplName != "minimal" {
+		dirs = append(dirs,
+			name+"/config",
+			name+"/handler",
+			name+"/model",
+			name+"/repository",
+			name+"/service",
+			name+"/middleware",
+		)
 	}
 
 	for _, dir := range dirs {
@@ -37,12 +66,6 @@ func createProject(name string) {
 			fmt.Printf("创建目录失败: %s\n", err)
 			return
 		}
-	}
-
-	// 获取模块路径
-	module := name
-	if len(os.Args) > 3 && os.Args[3] == "--module" && len(os.Args) > 4 {
-		module = os.Args[4]
 	}
 
 	caser := cases.Title(language.English)
@@ -54,14 +77,28 @@ func createProject(name string) {
 		Year:      time.Now().Year(),
 	}
 
+	// 按模板选择 main.go 与 config.yaml
+	var mainTmpl, configTmpl string
+	switch tmplName {
+	case "minimal":
+		mainTmpl, configTmpl = templates.MainMinimal, templates.ConfigMinimal
+	case "fullstack":
+		mainTmpl, configTmpl = templates.MainFull, templates.ConfigFull
+	default: // api
+		mainTmpl, configTmpl = templates.Main, templates.Config
+	}
+
 	// 创建文件
 	files := map[string]string{
-		name + "/main.go":         templates.Main,
-		name + "/config.yaml":     templates.Config,
-		name + "/go.mod":          fmt.Sprintf(templates.GoMod, module, xlgo.Version),
-		name + "/Makefile":        templates.Makefile,
-		name + "/.gitignore":      templates.Gitignore,
-		name + "/handler/home.go": templates.Handler,
+		name + "/main.go":     mainTmpl,
+		name + "/config.yaml": configTmpl,
+		name + "/go.mod":      fmt.Sprintf(templates.GoMod, module, xlgo.Version),
+		name + "/Makefile":    templates.Makefile,
+		name + "/.gitignore":  templates.Gitignore,
+	}
+	// api/fullstack 模板带示例 handler
+	if tmplName != "minimal" {
+		files[name+"/handler/home.go"] = templates.Handler
 	}
 
 	for path, content := range files {
@@ -84,7 +121,7 @@ func createProject(name string) {
 		}
 	}
 
-	fmt.Printf("✓ 项目 %s 创建成功\n", name)
+	fmt.Printf("✓ 项目 %s 创建成功（模板: %s）\n", name, tmplName)
 	fmt.Println("\n下一步:")
 	fmt.Printf("  cd %s\n", name)
 	fmt.Println("  go mod tidy")

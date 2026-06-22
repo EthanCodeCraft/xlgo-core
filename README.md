@@ -94,6 +94,41 @@ go run main.go
 访问 http://localhost:8080/health 检查服务状态。
 
 > v1.0.2 起，`xlgo.New()` 默认是轻量应用，不会自动初始化 MySQL、Redis、Storage 或 Swagger。需要完整基础设施时请显式使用 `WithMySQL()`、`WithRedis()`、`WithStorage()`、`WithSwaggerRoutes()`，或直接使用 `xlgo.NewFullStack()`。
+>
+> `Without*` 系列 Option（如 `WithoutSwaggerRoutes`）主要用于 `NewFullStack` / `RunFullStack` 启用全部组件后排除个别项，例如 `xlgo.NewFullStack(xlgo.WithoutSwaggerRoutes())` 全组件但关闭 Swagger。`xlgo.New()` 本身已全关，无需再 `Without`。
+
+### 4. 模块路径与包名
+
+xlgo 的 **模块路径** 是 `github.com/EthanCodeCraft/xlgo-core`，**包名** 是 `xlgo`（二者不同是 Go 惯例，如 `github.com/gin-gonic/gin` → 包名 `gin`）。import 时用别名 `xlgo` 即可：
+
+```go
+package main
+
+import (
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
+	"github.com/EthanCodeCraft/xlgo-core/middleware"
+	"github.com/EthanCodeCraft/xlgo-core/response"
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	app := xlgo.New(
+		xlgo.WithConfigPath("./config.yaml"),
+		xlgo.WithLogger(),
+		xlgo.WithHealthRoutes(),
+	)
+	// 注册一个示例路由
+	app.GetRouter().GET("/", func(c *gin.Context) {
+		response.Success(c, gin.H{"message": "Hello xlgo!"})
+	})
+	// 启用 JWT 认证示例路由（需配合 WithMySQL/WithRedis 生成 token）
+	_ = middleware.RequireUserTypes("admin")
+
+	_ = app.Run()
+}
+```
+
+> 子包（`config` / `database` / `logger` / `middleware` ...）的包名与目录名一致，无需别名。
 
 ---
 

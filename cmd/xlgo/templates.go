@@ -2,8 +2,12 @@ package main
 
 // Templates 存放所有代码生成模板
 var templates = struct {
-	Main        string
-	Config      string
+	Main        string // api 模板：标准业务 API（mysql+redis+jwt+分层）
+	MainMinimal string // minimal 模板：轻量 HTTP，无外部依赖
+	MainFull    string // fullstack 模板：全组件
+	Config      string // api 模板配置
+	ConfigMinimal string
+	ConfigFull    string
 	GoMod       string
 	Makefile    string
 	Gitignore   string
@@ -87,6 +91,168 @@ database:
   max_idle_conns: 10
   max_open_conns: 100
   # dsn: "自定义连接字符串，设置后优先于上面的字段"
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+jwt:
+  secret: your_jwt_secret_key_here
+  expire: 86400
+
+storage:
+  driver: local
+  local:
+    path: ./public
+    base_url: http://localhost:8080/public
+
+log:
+  dir: ./logs
+  max_size: 100
+  max_backups: 30
+  max_age: 30
+  compress: true
+`,
+
+	// MainMinimal minimal 模板：轻量 HTTP 服务，不依赖 MySQL/Redis/Storage
+	MainMinimal: `package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
+	"github.com/EthanCodeCraft/xlgo-core/middleware"
+	"github.com/EthanCodeCraft/xlgo-core/response"
+	"github.com/EthanCodeCraft/xlgo-core/router"
+	"github.com/gin-gonic/gin"
+)
+
+var configPath string
+
+func init() {
+	flag.StringVar(&configPath, "config", "./config.yaml", "配置文件路径")
+}
+
+func main() {
+	flag.Parse()
+
+	app := xlgo.New(
+		xlgo.WithConfigPath(configPath),
+		xlgo.WithLogger(),
+		xlgo.WithHealthRoutes(),
+		xlgo.WithMiddlewares(middleware.Logger(), middleware.CORS()),
+		xlgo.WithModules(router.ModuleFunc(registerRoutes)),
+	)
+
+	if err := app.Run(); err != nil {
+		fmt.Printf("启动失败: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func registerRoutes(r *gin.RouterGroup) {
+	api := r.Group("/api/v1")
+	api.GET("/", func(c *gin.Context) {
+		response.Success(c, gin.H{"message": "Hello {{.Name}}!"})
+	})
+}
+`,
+
+	// ConfigMinimal minimal 模板配置：仅 app + server + log，无数据库/Redis
+	ConfigMinimal: `app:
+  name: "{{.Name}}"
+  site_name: "{{.NameLower}}"
+  version: "1.0.0"
+  env: "dev"
+  debug: true
+  base_url: "http://localhost:8080"
+
+server:
+  port: 8080
+  mode: development
+
+log:
+  dir: ./logs
+  max_size: 100
+  max_backups: 30
+  max_age: 30
+  compress: true
+`,
+
+	// MainFull fullstack 模板：全组件（FullStack），含 Swagger + Storage
+	MainFull: `package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
+	"github.com/EthanCodeCraft/xlgo-core/middleware"
+	"github.com/EthanCodeCraft/xlgo-core/response"
+	"github.com/EthanCodeCraft/xlgo-core/router"
+	"github.com/gin-gonic/gin"
+)
+
+var configPath string
+
+func init() {
+	flag.StringVar(&configPath, "config", "./config.yaml", "配置文件路径")
+}
+
+func main() {
+	flag.Parse()
+
+	// NewFullStack 一键启用全部组件：Logger/MySQL/Redis/Storage/Wire/Health/Swagger/AutoMigrate
+	// 如需排除个别组件，追加对应 Without* Option，例如 xlgo.WithoutSwaggerRoutes()
+	app := xlgo.NewFullStack(
+		xlgo.WithConfigPath(configPath),
+		xlgo.WithMiddlewares(middleware.Logger(), middleware.CORS()),
+		xlgo.WithModules(router.ModuleFunc(registerRoutes)),
+		// xlgo.WithModels(&User{}, &Order{}),  // 注册模型以启用自动迁移
+	)
+
+	if err := app.Run(); err != nil {
+		fmt.Printf("启动失败: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func registerRoutes(r *gin.RouterGroup) {
+	api := r.Group("/api/v1")
+	api.GET("/", func(c *gin.Context) {
+		response.Success(c, gin.H{"message": "Welcome to {{.Name}} (fullstack)!"})
+	})
+}
+`,
+
+	// ConfigFull fullstack 模板配置：全组件配置
+	ConfigFull: `app:
+  name: "{{.Name}}"
+  site_name: "{{.NameLower}}"
+  version: "1.0.0"
+  env: "dev"
+  debug: true
+  base_url: "http://localhost:8080"
+  token_expire: 86400
+
+server:
+  port: 8080
+  mode: development
+
+database:
+  driver: mysql          # mysql（默认）或 postgres
+  host: localhost
+  port: 3306
+  user: root
+  password: your_password
+  name: {{.NameLower}}
+  max_idle_conns: 10
+  max_open_conns: 100
 
 redis:
   host: localhost

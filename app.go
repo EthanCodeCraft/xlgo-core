@@ -123,7 +123,11 @@ func WithDefaultRoutes() Option {
 	}
 }
 
-// WithoutLogger 关闭日志
+// WithoutLogger 关闭日志。
+//
+// Without* 系列的定位：xlgo.New() 默认是轻量应用（组件全关），故 Without*
+// 主要用于 NewFullStack / RunFullStack 启用全部组件后，排除个别不需要的项。
+// 例如：xlgo.NewFullStack(xlgo.WithoutSwaggerRoutes()) 全组件但关 Swagger。
 func WithoutLogger() Option {
 	return func(a *App) { a.enableLogger = false }
 }

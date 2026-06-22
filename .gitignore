@@ -1,2 +1,9 @@
-report.md
+# Claude Code 协作指引（本地，不入库）
 CLAUDE.md
+
+# 临时发版辅助文件
+gitHub_release_*.md
+
+# 构建产物
+*.exe
+bin/

@@ -1,0 +1,8 @@
+app:
+  name: "xlgo-minimal-example"
+  env: "dev"
+  debug: true
+
+server:
+  port: 8081
+  mode: development
