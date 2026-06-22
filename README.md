@@ -734,6 +734,18 @@ docker run -d -p 8080:8080 xlgo-app:latest
 
 > 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.0.4 (2026-06-22)
+
+> 本版本定位为 **DX & Docs release**：开发体验与文档改进，无破坏性 API 变更。
+
+- **CLI 多模板** - `xlgo new --template minimal/api/fullstack`，支持轻量 HTTP / 标准业务 / 全组件三种脚手架
+- **examples/ 目录** - 新增 `examples/minimal`（无依赖可跑）与 `examples/full`（mysql+redis+jwt+user CRUD）可运行示例
+- **模块路径文档** - 明确说明 module path `xlgo-core` 与 package name `xlgo` 的关系，补完整 import 示例（保留 `-core`，xlgo 多产品系列）
+- **Without* 定位** - 文档化 `Without*` Option 主要用于 `NewFullStack` 后排除单项
+- **文档结构** - 规划文档归档到 `docs/plans/`，新增 `docs/README.md` 索引
+
+升级：`go get github.com/EthanCodeCraft/xlgo-core@v1.0.4`（无破坏性变更）
+
 ### v1.0.3 (2026-06-22)
 
 > 本版本定位为 **bug fix release**：收口 v1.0.2 引入的破坏性清理，并修复 4 个轻量 bug + 依赖复查。完整说明见 [CHANGELOG.md#unreleased](./CHANGELOG.md#unreleased)。
