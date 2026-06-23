@@ -62,6 +62,13 @@ type Manager struct {
 	replicas []*gorm.DB
 	picker   ReplicaPicker
 	mu       sync.Mutex
+
+	// #21 健康自愈
+	healthy          atomic.Bool       // 主库是否健康
+	replicaHealthy   []atomic.Bool     // 每个从库的健康标记，索引与 replicas 对齐
+	probeFailures    int               // 主库连续探活失败次数
+	probeMu          sync.Mutex        // 保护 probeFailures
+	replicaHealthSet bool              // replicaHealthy 是否已按 replicas 长度初始化
 }
 
 // NewManager 创建数据库管理器
@@ -96,19 +103,142 @@ func (m *Manager) Replicas() []*gorm.DB {
 	return m.replicas
 }
 
-// Replica 按策略选择一个从库；无从库时返回主库
+// Replica 按策略选择一个从库；无从库时返回主库。
+// #21：启用探活后，自动过滤不健康的从库；全不健康时回退到全部从库（仍可服务）。
 func (m *Manager) Replica() *gorm.DB {
 	if len(m.replicas) == 0 {
 		return m.master
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	pool := m.replicas
+	// 启用探活且至少有一个健康标记时，仅从健康从库中选取
+	if m.replicaHealthSet {
+		var healthy []*gorm.DB
+		for i, r := range m.replicas {
+			if i < len(m.replicaHealthy) && m.replicaHealthy[i].Load() {
+				healthy = append(healthy, r)
+			}
+		}
+		if len(healthy) > 0 {
+			pool = healthy
+		}
+		// healthy 为空时回退到全部 replicas，避免读流量完全中断
+	}
+
 	if m.picker != nil {
-		if db := m.picker.Pick(m.replicas); db != nil {
+		if db := m.picker.Pick(pool); db != nil {
 			return db
 		}
 	}
-	return m.replicas[0]
+	return pool[0]
+}
+
+// IsHealthy 返回主库当前健康状态（#21）。供 readiness/health 探针联动。
+func (m *Manager) IsHealthy() bool {
+	return m.healthy.Load()
+}
+
+// initReplicaHealth 按 replicas 数量初始化健康标记（全部为健康）。
+func (m *Manager) initReplicaHealth() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.replicaHealthSet {
+		return
+	}
+	m.replicaHealthy = make([]atomic.Bool, len(m.replicas))
+	for i := range m.replicaHealthy {
+		m.replicaHealthy[i].Store(true)
+	}
+	m.replicaHealthSet = true
+}
+
+// StartProbing 启动主库与从库的健康探活后台循环（#21）。
+// 阻塞调用方，应通过 App.Go 在独立 goroutine 运行；ctx 取消时退出。
+// 周期 ping 主库，连续失败达阈值后标记不健康（IsHealthy=false）；
+// 同时 ping 各从库，失败则从读流量剔除，恢复后自动重新纳入。
+func (m *Manager) StartProbing(ctx context.Context) {
+	m.initReplicaHealth()
+
+	interval := 30 * time.Second
+	if m.cfg != nil && m.cfg.Database.HealthCheckInterval > 0 {
+		interval = m.cfg.Database.HealthCheckInterval
+	}
+	threshold := 3
+	if m.cfg != nil && m.cfg.Database.HealthCheckFailureThreshold > 0 {
+		threshold = m.cfg.Database.HealthCheckFailureThreshold
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.probeOnce(ctx, threshold)
+		}
+	}
+}
+
+// probeOnce 执行一轮主库+从库探活并更新健康标记。
+func (m *Manager) probeOnce(ctx context.Context, threshold int) {
+	// 主库
+	if err := m.HealthCheck(ctx); err != nil {
+		m.probeMu.Lock()
+		m.probeFailures++
+		if m.probeFailures >= threshold {
+			if m.healthy.Load() {
+				logger.Warnf("数据库主库连续探活失败 %d 次，标记为不健康: %v", m.probeFailures, err)
+			}
+			m.healthy.Store(false)
+		}
+		m.probeMu.Unlock()
+	} else {
+		m.probeMu.Lock()
+		if m.probeFailures >= threshold && !m.healthy.Load() {
+			logger.Info("数据库主库探活恢复，重新标记为健康")
+		}
+		m.probeFailures = 0
+		m.probeMu.Unlock()
+		m.healthy.Store(true)
+	}
+
+	// 从库
+	m.mu.Lock()
+	replicas := make([]*gorm.DB, len(m.replicas))
+	copy(replicas, m.replicas)
+	healthSet := m.replicaHealthSet
+	m.mu.Unlock()
+	if !healthSet {
+		return
+	}
+	for i, r := range replicas {
+		if r == nil {
+			continue
+		}
+		sqlDB, err := r.DB()
+		if err != nil {
+			if i < len(m.replicaHealthy) {
+				m.replicaHealthy[i].Store(false)
+			}
+			continue
+		}
+		if err := sqlDB.PingContext(ctx); err != nil {
+			if i < len(m.replicaHealthy) && m.replicaHealthy[i].Load() {
+				logger.Warnf("数据库从库 #%d 探活失败，暂时剔除读流量: %v", i, err)
+			}
+			if i < len(m.replicaHealthy) {
+				m.replicaHealthy[i].Store(false)
+			}
+		} else {
+			if i < len(m.replicaHealthy) {
+				m.replicaHealthy[i].Store(true)
+			}
+		}
+	}
 }
 
 // FromContext 根据上下文选择数据库
@@ -222,6 +352,10 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 				sqlDB.SetMaxIdleConns(cfg.Database.MaxIdleConns)
 				sqlDB.SetMaxOpenConns(cfg.Database.MaxOpenConns)
 				sqlDB.SetConnMaxLifetime(time.Hour)
+				if cfg.Database.ConnMaxIdleTime > 0 {
+					sqlDB.SetConnMaxIdleTime(cfg.Database.ConnMaxIdleTime)
+				}
+				m.healthy.Store(true) // 主库连通即标记健康（#21）
 
 				if err := sqlDB.Ping(); err == nil {
 					logger.Info("数据库主库连接成功",
@@ -470,4 +604,17 @@ func HealthCheck() map[string]bool {
 	}
 
 	return result
+}
+
+// IsDBHealthy 返回主库探活健康状态（#21）。
+// 与 HealthCheck()（实时 ping）不同，这是后台探活维护的缓存标记，
+// 供 readiness 探针快速判断是否接流量，避免每次探针都同步 ping。
+func IsDBHealthy() bool {
+	return DefaultManager.IsHealthy()
+}
+
+// StartDBProbing 启动主库/从库探活后台循环（#21）。
+// 阻塞，应通过 App.Go 在独立 goroutine 运行；ctx 取消时退出。
+func StartDBProbing(ctx context.Context) {
+	DefaultManager.StartProbing(ctx)
 }

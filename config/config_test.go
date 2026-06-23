@@ -162,8 +162,8 @@ redis:
   db: 0
 
 jwt:
-  secret: "test-secret"
-  expire: 3600
+  secret: "test-secret-12345678901234567890123456789012"
+  expire: "1h"
 `
 	tmpFile, err := setupTempFile("test_config.yaml", content)
 	if err != nil {

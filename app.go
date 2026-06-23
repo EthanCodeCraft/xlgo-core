@@ -7,16 +7,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/cache"
 	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/database"
 	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"github.com/EthanCodeCraft/xlgo-core/middleware"
+	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/EthanCodeCraft/xlgo-core/router"
 	"github.com/EthanCodeCraft/xlgo-core/storage"
-	"github.com/EthanCodeCraft/xlgo-core/wire"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -24,13 +27,28 @@ import (
 
 // Version 框架版本号。发版时只改这一处，避免版本字面量散落各处。
 // CLI（xlgo version）、脚手架生成的 go.mod 等均引用此常量。
-const Version = "1.0.4"
+const Version = "1.1.0"
 
 // HealthCheckFunc 健康检查函数
 type HealthCheckFunc func(context.Context) error
 
 // Migrator 数据库迁移函数
 type Migrator func(*gorm.DB) error
+
+// Hook 生命周期钩子。各回调在 App 生命周期的对应阶段被调用：
+//   - OnInit:  Init() 内组件初始化完成后、路由注册前
+//   - OnStart: StartServer() 监听端口前
+//   - OnReady: 端口就绪后（已开始接受连接）
+//   - OnStop:  Shutdown() 开头，关 HTTP 之前
+//
+// OnInit/OnStart/OnStop 返回 error 会中断流程并向上返回。
+type Hook struct {
+	Name    string
+	OnInit  func(*App) error
+	OnStart func(*App) error
+	OnReady func(*App)
+	OnStop  func(*App) error
+}
 
 type staticRoute struct {
 	relativePath string
@@ -50,15 +68,27 @@ type App struct {
 	enableMySQL        bool
 	enableRedis        bool
 	enableStorage      bool
-	enableWire         bool
 	enableHealth       bool
 	enableSwagger      bool
 	enableAutoMigrate  bool
+	enableLiveness     bool
+	enableReadiness    bool
+	enableMetrics      bool
+	metricsPath        string
 
 	staticRoutes []staticRoute
 	migrators    []Migrator
 	healthChecks []router.HealthCheck
+	hooks        []Hook
 	initialized  bool
+
+	// 请求级超时（#19），<=0 表示不启用
+	requestTimeout time.Duration
+
+	// in-flight goroutine 管理（#22）
+	rootCtx context.Context    // 根 ctx，App.Go 启动的 goroutine 共享
+	cancel  context.CancelFunc // Shutdown 时 cancel，通知后台任务退出
+	wg      sync.WaitGroup     // 跟踪 App.Go 启动的 goroutine
 }
 
 // Option 应用选项
@@ -100,11 +130,6 @@ func WithStorage() Option {
 	return func(a *App) { a.enableStorage = true }
 }
 
-// WithWire 启用服务容器
-func WithWire() Option {
-	return func(a *App) { a.enableWire = true }
-}
-
 // WithHealthRoutes 启用健康检查路由
 func WithHealthRoutes() Option {
 	return func(a *App) { a.enableHealth = true }
@@ -120,6 +145,29 @@ func WithDefaultRoutes() Option {
 	return func(a *App) {
 		a.enableHealth = true
 		a.enableSwagger = true
+	}
+}
+
+// WithLivenessRoute 启用存活性探针路由 GET /livez（#17）。
+// 永不依赖外部，始终 200，供 K8s livenessProbe。
+func WithLivenessRoute() Option {
+	return func(a *App) { a.enableLiveness = true }
+}
+
+// WithReadinessRoute 启用就绪性探针路由 GET /readyz（#17）。
+// 复用 healthChecks 检查依赖，失败返回 503，供 K8s readinessProbe。
+func WithReadinessRoute() Option {
+	return func(a *App) { a.enableReadiness = true }
+}
+
+// WithMetricsRoute 启用 Prometheus 指标端点与采集中间件（#18）。
+// path 默认 /metrics，传入可自定义。
+func WithMetricsRoute(path ...string) Option {
+	return func(a *App) {
+		a.enableMetrics = true
+		if len(path) > 0 && path[0] != "" {
+			a.metricsPath = path[0]
+		}
 	}
 }
 
@@ -147,10 +195,13 @@ func WithoutStorage() Option {
 	return func(a *App) { a.enableStorage = false }
 }
 
-// WithoutWire 关闭服务容器
+// WithoutWire 已移除（wire 包在 v1.1.0 删除）。保留空函数仅为编译兼容，
+// 调用无副作用。后续版本将删除。
 func WithoutWire() Option {
-	return func(a *App) { a.enableWire = false }
+	return func(a *App) {}
 }
+
+
 
 // WithAutoMigrate 启用数据库迁移（需配合 WithMigrator/WithModels 注册迁移逻辑）
 func WithAutoMigrate() Option {
@@ -209,6 +260,20 @@ func WithMigrator(m Migrator) Option {
 	}
 }
 
+// WithHook 注册生命周期钩子（#12）。可多次调用注册多个，按注册顺序触发。
+// 详见 Hook 类型注释。
+func WithHook(h Hook) Option {
+	return func(a *App) {
+		a.hooks = append(a.hooks, h)
+	}
+}
+
+// WithRequestTimeout 设置请求级超时（#19）。下游 GORM/Redis 走
+// c.Request.Context() 即可级联取消。d <= 0 不启用。
+func WithRequestTimeout(d time.Duration) Option {
+	return func(a *App) { a.requestTimeout = d }
+}
+
 // WithModels 注册 GORM 自动迁移模型（自动启用 AutoMigrate）
 func WithModels(models ...any) Option {
 	return WithMigrator(func(db *gorm.DB) error {
@@ -248,10 +313,13 @@ func WithFullStack() Option {
 		a.enableMySQL = true
 		a.enableRedis = true
 		a.enableStorage = true
-		a.enableWire = true
 		a.enableHealth = true
 		a.enableSwagger = true
 		a.enableAutoMigrate = true
+		// 生产就绪路由（#17/#18）
+		a.enableLiveness = true
+		a.enableReadiness = true
+		a.enableMetrics = true
 		a.staticRoutes = append(a.staticRoutes, staticRoute{relativePath: "/public", root: "./public"})
 	}
 }
@@ -261,6 +329,8 @@ func New(opts ...Option) *App {
 	app := &App{}
 	app.router = gin.New()
 	app.registry = router.NewRegistry(app.router)
+	// rootCtx 生命周期与 App 一致，不依赖 Init，使 App.Go 在 Init 前也可用（#22）
+	app.rootCtx, app.cancel = context.WithCancel(context.Background())
 
 	for _, opt := range opts {
 		opt(app)
@@ -304,7 +374,11 @@ func (a *App) Init() error {
 		if err := database.InitDB(cfg); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
 		}
-		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "mysql", Check: func(context.Context) error {
+		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "mysql", Check: func(ctx context.Context) error {
+			// 优先读探活缓存标记（#21），避免每次探针都同步 ping
+			if !database.IsDBHealthy() {
+				return errors.New("mysql master unhealthy (probe)")
+			}
 			status := database.HealthCheck()
 			if !status["master"] {
 				return errors.New("mysql master unavailable")
@@ -326,8 +400,9 @@ func (a *App) Init() error {
 		}
 	}
 
-	if a.enableWire {
-		wire.InitServices()
+	if a.enableRedis {
+		// Redis 就绪后初始化缓存（cache 依赖 Redis 客户端）
+		cache.Init()
 	}
 
 	if a.enableAutoMigrate && len(a.migrators) > 0 {
@@ -345,8 +420,13 @@ func (a *App) Init() error {
 		}
 	}
 
-	a.router.Use(gin.Recovery())
+	// 全局中间件链：RequestID 必须最先装入，保证后续 Recovery/日志/响应都能拿到 request_id（#24）
+	a.router.Use(middleware.RequestID())
 	a.router.Use(middleware.Recover())
+	// 请求级超时（#19），配置后装入，下游走 c.Request.Context() 级联取消
+	if a.requestTimeout > 0 {
+		a.router.Use(middleware.Timeout(a.requestTimeout))
+	}
 
 	for _, staticRoute := range a.staticRoutes {
 		a.router.Static(staticRoute.relativePath, staticRoute.root)
@@ -358,9 +438,49 @@ func (a *App) Init() error {
 	if a.enableHealth {
 		router.RegisterHealthRoute(a.router, a.healthChecks...)
 	}
+	if a.enableLiveness {
+		router.RegisterLivenessRoute(a.router)
+	}
+	if a.enableReadiness {
+		router.RegisterReadinessRoute(a.router, a.healthChecks...)
+	}
+	if a.enableMetrics {
+		if a.metricsPath != "" {
+			router.RegisterMetricsRoute(a.router, a.metricsPath)
+		} else {
+			router.RegisterMetricsRoute(a.router)
+		}
+	}
 
 	a.registry.Apply()
+
+	// 响应模式：默认 business（全 200 + 业务码），可配置 rest（按错误码映射 HTTP status）（#15）
+	if mode := strings.TrimSpace(strings.ToLower(a.config.Server.ResponseMode)); mode != "" {
+		switch mode {
+		case "rest":
+			response.SetMode(response.ModeREST)
+		case "business":
+			response.SetMode(response.ModeBusiness)
+		}
+	}
+
+	// in-flight goroutine 根 ctx 在 New() 时已初始化（#22）
+
+	// 启动主库/从库探活后台循环（#21），ctx 在 Shutdown 时取消
+	if a.enableMySQL {
+		a.Go(database.StartDBProbing)
+	}
+
 	a.initialized = true
+
+	// OnInit hooks：组件初始化完成后触发（#12）
+	for _, h := range a.hooks {
+		if h.OnInit != nil {
+			if err := h.OnInit(a); err != nil {
+				return fmt.Errorf("OnInit hook %q 失败: %w", h.Name, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -403,25 +523,58 @@ func (a *App) StartServer() error {
 	if a.config == nil {
 		return config.ErrConfigNotLoaded
 	}
-	port := a.config.Server.Port
+	srvCfg := a.config.Server
 
 	a.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      a.router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Handler:        a.router,
+		ReadTimeout:    srvCfg.EffectiveReadTimeout(),
+		WriteTimeout:   srvCfg.EffectiveWriteTimeout(),
+		IdleTimeout:    srvCfg.EffectiveIdleTimeout(),
+		MaxHeaderBytes: srvCfg.EffectiveMaxHeaderBytes(),
+	}
+
+	useUnix := strings.TrimSpace(srvCfg.UnixSocket) != ""
+	if useUnix {
+		a.server.Addr = srvCfg.UnixSocket
+	} else {
+		a.server.Addr = fmt.Sprintf(":%d", srvCfg.Port)
+	}
+
+	// OnStart hooks：监听端口前
+	for _, h := range a.hooks {
+		if h.OnStart != nil {
+			if err := h.OnStart(a); err != nil {
+				return fmt.Errorf("OnStart hook %q 失败: %w", h.Name, err)
+			}
+		}
 	}
 
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Infof("服务器启动，监听端口 %d", port)
-		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if useUnix {
+			logger.Infof("服务器启动，监听 unix socket %s", srvCfg.UnixSocket)
+		} else {
+			logger.Infof("服务器启动，监听端口 %d", srvCfg.Port)
+		}
+		var err error
+		if srvCfg.TLS.Enabled {
+			err = a.server.ListenAndServeTLS(srvCfg.TLS.CertFile, srvCfg.TLS.KeyFile)
+		} else {
+			err = a.server.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 			return
 		}
 		serverErr <- nil
 	}()
+
+	// OnReady hooks：端口就绪后
+	for _, h := range a.hooks {
+		if h.OnReady != nil {
+			h.OnReady(a)
+		}
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -441,10 +594,29 @@ func (a *App) StartServer() error {
 
 // Shutdown 优雅关闭应用
 func (a *App) Shutdown() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownTimeout := 30 * time.Second
+	if a.config != nil {
+		shutdownTimeout = a.config.Server.EffectiveShutdownTimeout()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	var errs []error
+
+	// OnStop hooks：关 HTTP 之前触发（#12）
+	for _, h := range a.hooks {
+		if h.OnStop != nil {
+			if err := h.OnStop(a); err != nil {
+				errs = append(errs, fmt.Errorf("OnStop hook %q 失败: %w", h.Name, err))
+			}
+		}
+	}
+
+	// 取消根 ctx，通知 App.Go 启动的后台 goroutine 退出（#22）
+	if a.cancel != nil {
+		a.cancel()
+	}
+
 	if a.server != nil {
 		logger.Info("关闭 HTTP 服务器...")
 		if err := a.server.Shutdown(ctx); err != nil {
@@ -454,6 +626,18 @@ func (a *App) Shutdown() error {
 				errs = append(errs, closeErr)
 			}
 		}
+	}
+
+	// 等待业务 in-flight goroutine 退出（#22），受 shutdownTimeout 约束
+	waitDone := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		logger.Warnf("等待后台 goroutine 退出超时")
 	}
 
 	logger.Info("停止限流器...")
@@ -476,6 +660,24 @@ func (a *App) Shutdown() error {
 	return errors.Join(errs...)
 }
 
+// Go 启动一个受 App 生命周期管理的后台 goroutine（#22）。
+// fn 收到的 ctx 在 Shutdown 时被 cancel，fn 应在 ctx.Done() 时及时退出。
+// Shutdown 会等待所有 App.Go 启动的 goroutine 退出（带 ShutdownTimeout 超时）。
+func (a *App) Go(fn func(ctx context.Context)) {
+	if fn == nil {
+		return
+	}
+	ctx := a.rootCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		fn(ctx)
+	}()
+}
+
 // GetRegistry 获取路由注册中心（用于动态注册）
 func (a *App) GetRegistry() *router.Registry {
 	return a.registry
@@ -489,49 +691,4 @@ func (a *App) GetRouter() *gin.Engine {
 // GetServer 获取 HTTP Server（用于高级自定义）
 func (a *App) GetServer() *http.Server {
 	return a.server
-}
-
-// StartServerWithPort 使用指定端口启动服务器（简化版本）
-// 注意: 此函数会阻塞，需要自行处理信号
-func StartServerWithPort(r *gin.Engine, port int) error {
-	server := &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-	}
-
-	logger.Infof("服务器启动，监听端口 %d", port)
-	return server.ListenAndServe()
-}
-
-// GracefulShutdown 优雅关闭辅助函数
-func GracefulShutdown(server *http.Server, timeout time.Duration, cleanupFuncs ...func()) error {
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(quit)
-
-	<-quit
-	logger.Info("收到关闭信号，开始优雅关闭...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	var errs []error
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Warnf("服务器关闭超时: %v", err)
-		errs = append(errs, err)
-		if closeErr := server.Close(); closeErr != nil {
-			errs = append(errs, closeErr)
-		}
-	}
-
-	for _, cleanup := range cleanupFuncs {
-		if cleanup != nil {
-			cleanup()
-		}
-	}
-
-	logger.Info("应用已优雅关闭")
-	return errors.Join(errs...)
 }

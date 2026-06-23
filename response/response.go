@@ -50,56 +50,32 @@ func SuccessWithMsg(c *gin.Context, msg string, data any) {
 
 // Fail 失败响应
 func Fail(c *gin.Context, msg string) {
-	c.JSON(http.StatusOK, Response{
-		Code:      CodeFail,
-		Msg:       msg,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, CodeFail, msg, nil)
 }
 
 // FailWithCode 失败响应（自定义错误码）
 func FailWithCode(c *gin.Context, code int, msg string) {
-	c.JSON(http.StatusOK, Response{
-		Code:      code,
-		Msg:       msg,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, code, msg, nil)
 }
 
 // Unauthorized 未授权响应
 func Unauthorized(c *gin.Context, msg string) {
-	c.JSON(http.StatusOK, Response{
-		Code:      CodeUnauthorized,
-		Msg:       msg,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, CodeUnauthorized, msg, nil)
 }
 
 // NotFound 资源不存在响应
 func NotFound(c *gin.Context, msg string) {
-	c.JSON(http.StatusOK, Response{
-		Code:      CodeNotFound,
-		Msg:       msg,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, CodeNotFound, msg, nil)
 }
 
 // ServerError 服务器错误响应
 func ServerError(c *gin.Context, msg string) {
-	c.JSON(http.StatusOK, Response{
-		Code:      CodeServerError,
-		Msg:       msg,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, CodeServerError, msg, nil)
 }
 
 // RateLimit 请求过于频繁响应
 func RateLimit(c *gin.Context) {
-	c.JSON(http.StatusOK, Response{
-		Code:      CodeRateLimit,
-		Msg:       "请求过于频繁，请稍后再试",
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, CodeRateLimit, "请求过于频繁，请稍后再试", nil)
 }
 
 // Page 分页响应

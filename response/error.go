@@ -185,19 +185,10 @@ var _ = map[int]string{
 
 // FailWithError 使用预定义错误响应
 func FailWithError(c *gin.Context, err *Error) {
-	c.JSON(200, Response{
-		Code:      err.Code,
-		Msg:       err.Message,
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, err.Code, err.Message, nil)
 }
 
 // FailWithDetail 使用预定义错误并添加详细信息
 func FailWithDetail(c *gin.Context, err *Error, detail string) {
-	c.JSON(200, Response{
-		Code:      err.Code,
-		Msg:       err.Message,
-		Data:      gin.H{"detail": detail},
-		RequestID: getRequestID(c),
-	})
+	writeResp(c, err.Code, err.Message, gin.H{"detail": detail})
 }

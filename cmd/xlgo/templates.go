@@ -75,11 +75,15 @@ func registerRoutes(r *gin.RouterGroup) {
   env: "dev"                    # dev/test/prod
   debug: true
   base_url: "http://localhost:8080"
-  token_expire: 86400           # Token过期时间(秒)
 
 server:
   port: 8080
-  mode: development
+  mode: development             # development 或 production
+  read_timeout: 15s             # 读超时
+  write_timeout: 30s            # 写超时
+  idle_timeout: 60s             # 空闲超时
+  shutdown_timeout: 30s         # 优雅关闭超时
+  response_mode: business       # business(默认,全200+业务码) 或 rest(按错误码映射HTTP status)
 
 database:
   driver: mysql          # mysql（默认）或 postgres
@@ -99,8 +103,11 @@ redis:
   db: 0
 
 jwt:
-  secret: your_jwt_secret_key_here
-  expire: 86400
+  secret: your_jwt_secret_key_change_me_to_32_bytes_at_least
+  expire: "24h"            # time.Duration，支持 "24h"/"30m" 等
+  refresh_expire: "168h"   # 刷新 token 过期时间
+  issuer: xlgo
+  algorithm: HS256         # HS256(默认)/HS384/HS512
 
 storage:
   driver: local
@@ -238,11 +245,15 @@ func registerRoutes(r *gin.RouterGroup) {
   env: "dev"
   debug: true
   base_url: "http://localhost:8080"
-  token_expire: 86400
 
 server:
   port: 8080
   mode: development
+  read_timeout: 15s
+  write_timeout: 30s
+  idle_timeout: 60s
+  shutdown_timeout: 30s
+  response_mode: business
 
 database:
   driver: mysql          # mysql（默认）或 postgres
@@ -261,8 +272,11 @@ redis:
   db: 0
 
 jwt:
-  secret: your_jwt_secret_key_here
-  expire: 86400
+  secret: your_jwt_secret_key_change_me_to_32_bytes_at_least
+  expire: "24h"            # time.Duration，支持 "24h"/"30m" 等
+  refresh_expire: "168h"   # 刷新 token 过期时间
+  issuer: xlgo
+  algorithm: HS256         # HS256(默认)/HS384/HS512
 
 storage:
   driver: local

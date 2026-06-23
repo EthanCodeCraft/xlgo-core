@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/logger"
@@ -35,7 +36,7 @@ type redisCache struct {
 // NewRedisCache 创建 Redis 缓存实例
 func NewRedisCache() CacheService {
 	return &redisCache{
-		client: database.RedisClient,
+		client: database.GetRedis(),
 	}
 }
 
@@ -146,18 +147,58 @@ func (c *redisCache) Exists(ctx context.Context, key string) bool {
 	return c.client.Exists(ctx, key).Val() > 0
 }
 
-// 全局缓存实例
-var globalCache CacheService
+// CacheManager 缓存管理器（#10）。照 database.Manager 模式：
+// 实例化 + DefaultCache 全局默认 + 包级 facade 代理，支持测试注入 mock 实现。
+type CacheManager struct {
+	mu  sync.Mutex
+	svc CacheService
+}
+
+// DefaultCache 默认缓存管理器，包级 facade 代理到它。
+var DefaultCache = NewCacheManager()
+
+// NewCacheManager 创建缓存管理器实例。
+func NewCacheManager() *CacheManager { return &CacheManager{} }
+
+// SetDefaultCacheManager 提升指定 CacheManager 为全局默认。
+func SetDefaultCacheManager(m *CacheManager) {
+	if m != nil {
+		DefaultCache = m
+	}
+}
+
+// Init 初始化缓存服务（基于 DefaultRedis 的客户端）。
+func (m *CacheManager) Init() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.svc = NewRedisCache()
+}
+
+// Set 设置缓存服务实现（用于注入 mock 或自定义实现）。
+func (m *CacheManager) Set(svc CacheService) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.svc = svc
+}
+
+// Get 返回缓存服务（未初始化时延迟初始化）。
+func (m *CacheManager) Get() CacheService {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.svc == nil {
+		m.svc = NewRedisCache()
+	}
+	return m.svc
+}
+
+// --- 包级 facade（代理到 DefaultCache，兼容存量） ---
 
 // Init 初始化全局缓存实例
 func Init() {
-	globalCache = NewRedisCache()
+	DefaultCache.Init()
 }
 
 // GetCache 获取全局缓存实例
 func GetCache() CacheService {
-	if globalCache == nil {
-		Init()
-	}
-	return globalCache
+	return DefaultCache.Get()
 }

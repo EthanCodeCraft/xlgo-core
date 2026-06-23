@@ -734,6 +734,25 @@ docker run -d -p 8080:8080 xlgo-app:latest
 
 > 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.1.0 (2026-06-23)
+
+> 本版本定位为 **HA & Manager 化 release**：高可用与生产就绪改进 + 组件 Manager 化。含少量破坏性变更，升级前请阅读 [CHANGELOG 升级说明](./CHANGELOG.md#升级说明)。
+
+- **组件 Manager 化** - storage/cache/redis/jwt/logger 五组件新增 `XxxManager` + `SetDefaultXxxManager`，包级 facade 保留兼容，支持多实例与测试注入
+- **Lifecycle Hooks** - `WithHook(Hook{OnInit/OnStart/OnReady/OnStop})` 生命周期钩子
+- **App.Go** - 受管理的后台 goroutine，Shutdown 时 cancel + 等待退出
+- **Server 配置化** - `server` 新增 timeout/TLS/unix_socket/response_mode 等字段
+- **JWTConfig time.Duration** - `jwt.expire` 用 `"24h"`，新增 issuer/algorithm
+- **Config Validate** - 启动期校验配置（端口/密钥/必填字段），错误前置
+- **response REST 模式** - `SetMode(ModeREST)` 按错误码映射 HTTP status
+- **livez/readyz** - K8s 友好的存活性/就绪性探针
+- **Prometheus metrics** - `/metrics` + `middleware.Metrics()` 采集请求指标
+- **请求级 Timeout** - `middleware.Timeout(d)` 级联取消下游
+- **依赖健康自愈** - 主库探活 + replica 健康剔除，`/readyz` 联动 503
+- **RequestID 默认装入** - 每个响应/panic 日志都带 request_id
+
+升级：`go get github.com/EthanCodeCraft/xlgo-core@v1.1.0`（⚠️ 含破坏性变更，见升级说明）
+
 ### v1.0.4 (2026-06-22)
 
 > 本版本定位为 **DX & Docs release**：开发体验与文档改进，无破坏性 API 变更。

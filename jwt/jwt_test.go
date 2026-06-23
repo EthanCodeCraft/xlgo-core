@@ -12,8 +12,8 @@ func setupTestConfig() {
 	// 设置测试配置
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
-			Secret: "test-secret-key-12345",
-			Expire: 3600, // 1小时
+			Secret: "test-secret-key-1234567890123456789012", // ≥32 字节
+			Expire: time.Hour,                                 // 1小时
 		},
 	}
 	config.Set(cfg)

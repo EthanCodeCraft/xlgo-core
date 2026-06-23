@@ -16,35 +16,65 @@ type HealthCheck struct {
 	Disabled bool
 }
 
-// RegisterHealthRoute 注册健康检查路由
+// runHealthChecks 执行所有检查项，返回总体状态、HTTP code 与逐项结果。
+// 无检查项时视为健康（用于 /livez 与无依赖场景）。
+func runHealthChecks(ctx context.Context, checks []HealthCheck) (string, int, map[string]string) {
+	if len(checks) == 0 {
+		return "ok", http.StatusOK, nil
+	}
+	status := "ok"
+	code := http.StatusOK
+	result := make(map[string]string, len(checks))
+	for _, check := range checks {
+		if check.Name == "" {
+			continue
+		}
+		if check.Disabled || check.Check == nil {
+			result[check.Name] = "disabled"
+			continue
+		}
+		if err := check.Check(ctx); err != nil {
+			result[check.Name] = "error"
+			status = "error"
+			code = http.StatusServiceUnavailable
+			continue
+		}
+		result[check.Name] = "ok"
+	}
+	return status, code, result
+}
+
+// RegisterHealthRoute 注册健康检查路由（兼容端点，等价于 readiness）。
 func RegisterHealthRoute(r *gin.Engine, checks ...HealthCheck) {
 	r.GET("/health", func(c *gin.Context) {
-		if len(checks) == 0 {
-			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		status, code, result := runHealthChecks(c.Request.Context(), checks)
+		if result == nil {
+			c.JSON(http.StatusOK, gin.H{"status": status})
 			return
 		}
+		c.JSON(code, gin.H{"status": status, "checks": result})
+	})
+}
 
-		status := "ok"
-		code := http.StatusOK
-		result := make(map[string]string, len(checks))
-		ctx := c.Request.Context()
-		for _, check := range checks {
-			if check.Name == "" {
-				continue
-			}
-			if check.Disabled || check.Check == nil {
-				result[check.Name] = "disabled"
-				continue
-			}
-			if err := check.Check(ctx); err != nil {
-				result[check.Name] = "error"
-				status = "error"
-				code = http.StatusServiceUnavailable
-				continue
-			}
-			result[check.Name] = "ok"
+// RegisterLivenessRoute 注册存活性探针（#17）。
+// GET /livez 永不依赖外部，仅表示进程存活，始终返回 200。
+// 供 K8s livenessProbe 使用：失败由进程崩溃体现，而非端点返回 503。
+func RegisterLivenessRoute(r *gin.Engine) {
+	r.GET("/livez", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+}
+
+// RegisterReadinessRoute 注册就绪性探针（#17）。
+// GET /readyz 复用 HealthCheck 检查依赖（mysql/redis...），任一失败返回 503。
+// 供 K8s readinessProbe 使用：未就绪时不接流量。
+func RegisterReadinessRoute(r *gin.Engine, checks ...HealthCheck) {
+	r.GET("/readyz", func(c *gin.Context) {
+		status, code, result := runHealthChecks(c.Request.Context(), checks)
+		if result == nil {
+			c.JSON(http.StatusOK, gin.H{"status": status})
+			return
 		}
-
 		c.JSON(code, gin.H{"status": status, "checks": result})
 	})
 }

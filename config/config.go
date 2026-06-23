@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 )
 
@@ -35,13 +37,12 @@ type Config struct {
 //   - 站点追踪: Request-ID 带站点标识
 //   - 分布式锁: lock:{site_name}:order:123
 type AppConfig struct {
-	Name        string `mapstructure:"name"`         // 应用名称，如 "用户管理系统"
-	SiteName    string `mapstructure:"site_name"`    // 站点别名，如 "site_a"、"user_api"
-	Version     string `mapstructure:"version"`      // 应用版本
-	Env         string `mapstructure:"env"`          // 运行环境: dev/test/prod
-	Debug       bool   `mapstructure:"debug"`        // 是否开启调试模式
-	BaseURL     string `mapstructure:"base_url"`     // 应用基础URL
-	TokenExpire int    `mapstructure:"token_expire"` // Token过期时间(秒)
+	Name     string `mapstructure:"name"`      // 应用名称，如 "用户管理系统"
+	SiteName string `mapstructure:"site_name"` // 站点别名，如 "site_a"、"user_api"
+	Version  string `mapstructure:"version"`   // 应用版本
+	Env      string `mapstructure:"env"`       // 运行环境: dev/test/prod
+	Debug    bool   `mapstructure:"debug"`     // 是否开启调试模式
+	BaseURL  string `mapstructure:"base_url"`  // 应用基础URL
 }
 
 // GetSiteName 获取站点别名，如果未设置则返回空字符串
@@ -81,10 +82,74 @@ func (c *AppConfig) IsProd() bool {
 	return c.Env == "prod" || c.Env == "production"
 }
 
+// TLSConfig HTTPS/TLS 配置
+type TLSConfig struct {
+	Enabled  bool   `mapstructure:"enabled"`
+	CertFile string `mapstructure:"cert_file"`
+	KeyFile  string `mapstructure:"key_file"`
+}
+
 // ServerConfig 服务配置
 type ServerConfig struct {
-	Port int    `mapstructure:"port"`
-	Mode string `mapstructure:"mode"` // development 或 production
+	Port            int           `mapstructure:"port"`
+	Mode            string        `mapstructure:"mode"`             // development 或 production
+	ReadTimeout     time.Duration `mapstructure:"read_timeout"`     // 读超时，如 "15s"
+	WriteTimeout    time.Duration `mapstructure:"write_timeout"`    // 写超时，如 "30s"
+	IdleTimeout     time.Duration `mapstructure:"idle_timeout"`     // 空闲超时，如 "60s"
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"` // 优雅关闭超时，如 "30s"
+	MaxHeaderBytes  int           `mapstructure:"max_header_bytes"` // 最大请求头字节数
+	TLS             TLSConfig     `mapstructure:"tls"`
+	UnixSocket      string        `mapstructure:"unix_socket"` // 非空时优先于 Port，监听 unix socket
+	ResponseMode    string        `mapstructure:"response_mode"` // business(默认) 或 rest，见 response.SetMode
+}
+
+// 默认值常量（ServerConfig 字段为零值时回退使用）
+const (
+	defaultReadTimeout     = 15 * time.Second
+	defaultWriteTimeout    = 30 * time.Second
+	defaultIdleTimeout     = 60 * time.Second
+	defaultShutdownTimeout = 30 * time.Second
+	defaultMaxHeaderBytes  = 1 << 20 // 1MB
+)
+
+// EffectiveReadTimeout 返回生效的读超时（零值回退默认）
+func (c ServerConfig) EffectiveReadTimeout() time.Duration {
+	if c.ReadTimeout > 0 {
+		return c.ReadTimeout
+	}
+	return defaultReadTimeout
+}
+
+// EffectiveWriteTimeout 返回生效的写超时（零值回退默认）
+func (c ServerConfig) EffectiveWriteTimeout() time.Duration {
+	if c.WriteTimeout > 0 {
+		return c.WriteTimeout
+	}
+	return defaultWriteTimeout
+}
+
+// EffectiveIdleTimeout 返回生效的空闲超时（零值回退默认）
+func (c ServerConfig) EffectiveIdleTimeout() time.Duration {
+	if c.IdleTimeout > 0 {
+		return c.IdleTimeout
+	}
+	return defaultIdleTimeout
+}
+
+// EffectiveShutdownTimeout 返回生效的关闭超时（零值回退默认）
+func (c ServerConfig) EffectiveShutdownTimeout() time.Duration {
+	if c.ShutdownTimeout > 0 {
+		return c.ShutdownTimeout
+	}
+	return defaultShutdownTimeout
+}
+
+// EffectiveMaxHeaderBytes 返回生效的最大请求头字节数（零值回退默认）
+func (c ServerConfig) EffectiveMaxHeaderBytes() int {
+	if c.MaxHeaderBytes > 0 {
+		return c.MaxHeaderBytes
+	}
+	return defaultMaxHeaderBytes
 }
 
 // 数据库驱动常量
@@ -165,6 +230,12 @@ type DatabaseConfig struct {
 	MaxIdleConns int `mapstructure:"max_idle_conns"`
 	// MaxOpenConns 最大打开连接数
 	MaxOpenConns int `mapstructure:"max_open_conns"`
+	// ConnMaxIdleTime 连接最大空闲时间，如 "5m"（#21）。0 表示用驱动默认
+	ConnMaxIdleTime time.Duration `mapstructure:"conn_max_idle_time"`
+	// HealthCheckInterval 主库探活间隔，如 "30s"（#21）。0 表示用默认 30s
+	HealthCheckInterval time.Duration `mapstructure:"health_check_interval"`
+	// HealthCheckFailureThreshold 连续探活失败多少次标记不健康（#21）。0 表示用默认 3
+	HealthCheckFailureThreshold int `mapstructure:"health_check_failure_threshold"`
 }
 
 // DSN 根据驱动返回连接字符串。设置了 CustomDSN 时优先返回 CustomDSN；
@@ -208,8 +279,11 @@ func (c *RedisConfig) Addr() string {
 
 // JWTConfig JWT 配置
 type JWTConfig struct {
-	Secret string `mapstructure:"secret"`
-	Expire int    `mapstructure:"expire"` // 过期时间（秒）
+	Secret        string        `mapstructure:"secret"`
+	Expire        time.Duration `mapstructure:"expire"`         // 过期时间，如 "24h"（time.Duration）
+	RefreshExpire time.Duration `mapstructure:"refresh_expire"` // 刷新 token 过期时间，如 "168h"
+	Issuer        string        `mapstructure:"issuer"`         // 签发者
+	Algorithm     string        `mapstructure:"algorithm"`      // 签名算法：HS256(默认)/RS256
 }
 
 // SMSConfig 短信配置
@@ -336,6 +410,12 @@ func newViper(configPath string) *viper.Viper {
 	return v
 }
 
+// unmarshalConfig 将 viper 解析到 Config，启用 string→time.Duration decode hook，
+// 使 ServerConfig/JWTConfig 的 Duration 字段可写 "24h"/"15s" 等字符串。
+func unmarshalConfig(v *viper.Viper, cfg *Config) error {
+	return v.Unmarshal(cfg, viper.DecodeHook(mapstructure.StringToTimeDurationHookFunc()))
+}
+
 // Load 加载配置文件
 func (m *Manager) Load() (*Config, error) {
 	if m == nil || m.path == "" {
@@ -348,8 +428,11 @@ func (m *Manager) Load() (*Config, error) {
 	}
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
+	if err := unmarshalConfig(v, &cfg); err != nil {
 		return nil, fmt.Errorf("解析配置文件失败: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
 	}
 
 	m.mu.Lock()
@@ -401,7 +484,7 @@ func (m *Manager) StartWatcher() error {
 	v.WatchConfig()
 	v.OnConfigChange(func(e fsnotify.Event) {
 		var newCfg Config
-		if err := v.Unmarshal(&newCfg); err != nil {
+		if err := unmarshalConfig(v, &newCfg); err != nil {
 			return
 		}
 
@@ -473,7 +556,7 @@ func (m *Manager) Reload() error {
 	}
 
 	var newCfg Config
-	if err := v.Unmarshal(&newCfg); err != nil {
+	if err := unmarshalConfig(v, &newCfg); err != nil {
 		return fmt.Errorf("解析配置文件失败: %w", err)
 	}
 

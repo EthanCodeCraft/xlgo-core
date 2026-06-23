@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -298,82 +299,139 @@ func (s *OSSStorage) Exists(path string) bool {
 
 var ErrStorageNotInitialized = errors.New("storage not initialized")
 
-// 全局存储实例
+// 全局存储实例（兼容 facade，由 Manager.Init 同步维护）
 var storage Storage
 
+// StorageManager 存储管理器（#10）。照 database.Manager 模式：
+// 实例化 + DefaultStorage 全局默认 + 包级 facade 代理，支持多实例与测试注入。
+type StorageManager struct {
+	mu      sync.Mutex
+	cfg     *config.StorageConfig
+	current Storage
+}
+
+// DefaultStorage 默认存储管理器，包级 facade 代理到它。
+var DefaultStorage = NewStorageManager()
+
+// NewStorageManager 创建存储管理器实例。
+func NewStorageManager() *StorageManager { return &StorageManager{} }
+
+// SetDefaultStorageManager 提升指定 StorageManager 为全局默认。
+func SetDefaultStorageManager(m *StorageManager) {
+	if m != nil {
+		DefaultStorage = m
+	}
+}
+
 // Init 初始化存储
-func Init(cfg *config.StorageConfig) error {
+func (m *StorageManager) Init(cfg *config.StorageConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var s Storage
 	switch cfg.Driver {
 	case "local":
-		storage = NewLocalStorage(&cfg.Local)
+		s = NewLocalStorage(&cfg.Local)
 		logger.Info("使用本地存储", zap.String("path", cfg.Local.Path))
 	case "oss":
 		ossStorage, err := NewOSSStorage(&cfg.OSS)
 		if err != nil {
 			return err
 		}
-		storage = ossStorage
+		s = ossStorage
 		logger.Info("使用 OSS 存储", zap.String("bucket", cfg.OSS.Bucket))
 	default:
 		return fmt.Errorf("不支持的存储驱动: %s", cfg.Driver)
 	}
+
+	m.cfg = cfg
+	m.current = s
+	storage = s // 同步兼容 facade
 	return nil
+}
+
+// Get 返回当前存储实例。
+func (m *StorageManager) Get() Storage {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.current
+}
+
+// Set 设置存储实例（用于注入 mock 或自定义实现）。
+func (m *StorageManager) Set(s Storage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.current = s
+	storage = s
+}
+
+// --- 包级 facade（代理到 DefaultStorage，兼容存量） ---
+
+// Init 初始化存储
+func Init(cfg *config.StorageConfig) error {
+	return DefaultStorage.Init(cfg)
 }
 
 // GetStorage 获取全局存储实例
 func GetStorage() Storage {
-	return storage
+	return DefaultStorage.Get()
 }
 
 // SetStorage 设置全局存储实例
 func SetStorage(s Storage) {
-	storage = s
+	DefaultStorage.Set(s)
 }
 
 // Upload 上传文件
 func Upload(file *multipart.FileHeader, subdir string) (string, error) {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return "", ErrStorageNotInitialized
 	}
-	return storage.Upload(file, subdir)
+	return s.Upload(file, subdir)
 }
 
 // UploadFromBytes 从字节数组上传文件
 func UploadFromBytes(data []byte, filename, subdir string) (string, error) {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return "", ErrStorageNotInitialized
 	}
-	return storage.UploadFromBytes(data, filename, subdir)
+	return s.UploadFromBytes(data, filename, subdir)
 }
 
 // GetURL 获取文件访问 URL
 func GetURL(path string) string {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return ""
 	}
-	return storage.GetURL(path)
+	return s.GetURL(path)
 }
 
 // Delete 删除文件
 func Delete(path string) error {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return ErrStorageNotInitialized
 	}
-	return storage.Delete(path)
+	return s.Delete(path)
 }
 
 // Get 获取文件内容
 func Get(path string) ([]byte, error) {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return nil, ErrStorageNotInitialized
 	}
-	return storage.Get(path)
+	return s.Get(path)
 }
 
 // Exists 检查文件是否存在
 func Exists(path string) bool {
-	if storage == nil {
+	s := GetStorage()
+	if s == nil {
 		return false
 	}
-	return storage.Exists(path)
+	return s.Exists(path)
 }
