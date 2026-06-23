@@ -309,7 +309,7 @@ func (m *Manager) Close() error {
 // HealthCheck 健康检查，主库不可达时返回错误
 func (m *Manager) HealthCheck(ctx context.Context) error {
 	if m.master == nil {
-		return errors.New("database master not initialized")
+		return errors.New("数据库主库未初始化")
 	}
 	sqlDB, err := m.master.DB()
 	if err != nil {

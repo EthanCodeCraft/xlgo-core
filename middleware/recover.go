@@ -20,7 +20,7 @@ func Recover() gin.HandlerFunc {
 				requestID := GetRequestID(c)
 
 				// 记录错误日志
-				logger.Error("Panic recovered",
+				logger.Error("panic 已恢复",
 					zap.String("request_id", requestID),
 					zap.String("error", fmt.Sprintf("%v", err)),
 					zap.String("path", c.Request.URL.Path),
@@ -45,7 +45,7 @@ func RecoverWithDetail() gin.HandlerFunc {
 			if err := recover(); err != nil {
 				requestID := GetRequestID(c)
 
-				logger.Error("Panic recovered",
+				logger.Error("panic 已恢复",
 					zap.String("request_id", requestID),
 					zap.String("error", fmt.Sprintf("%v", err)),
 					zap.String("path", c.Request.URL.Path),
@@ -54,7 +54,7 @@ func RecoverWithDetail() gin.HandlerFunc {
 				)
 
 				// 开发环境返回详细错误
-				response.FailWithCode(c, response.CodeServerError, fmt.Sprintf("Panic: %v", err))
+				response.FailWithCode(c, response.CodeServerError, fmt.Sprintf("服务器内部错误: %v", err))
 				c.AbortWithStatus(http.StatusInternalServerError)
 			}
 		}()

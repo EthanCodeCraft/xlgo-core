@@ -4,6 +4,7 @@ app:
   debug: true
 
 server:
+  host: ""                    # 绑定地址，空=监听所有接口；127.0.0.1=仅本机
   port: 8082
   mode: development
   read_timeout: 15s

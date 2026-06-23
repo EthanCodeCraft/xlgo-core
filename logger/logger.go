@@ -61,7 +61,7 @@ func SetDefaultLogManager(m *LogManager) {
 // 三份，磁盘占用翻倍且分流形同虚设。新实现通用 Logger 只走独立的 app.log。
 func (m *LogManager) Init(cfg *config.Config) error {
 	if cfg == nil {
-		return errors.New("logger: config is nil")
+		return errors.New("logger: 配置为空")
 	}
 
 	// 确保日志目录存在

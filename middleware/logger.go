@@ -124,13 +124,13 @@ func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
 		if latency > cfg.SlowRequestThreshold {
 			// 慢请求警告
 			fields = append(fields, zap.Bool("slow_request", true))
-			logger.APILog().Warn("Slow API Request", fields...)
+			logger.APILog().Warn("慢请求", fields...)
 		} else if status >= 500 {
-			logger.APILog().Error("API Request Error", fields...)
+			logger.APILog().Error("请求错误", fields...)
 		} else if status >= 400 {
-			logger.APILog().Warn("API Request Client Error", fields...)
+			logger.APILog().Warn("客户端请求错误", fields...)
 		} else {
-			logger.APILog().Info("API Request", fields...)
+			logger.APILog().Info("API 请求", fields...)
 		}
 	}
 }
@@ -232,7 +232,7 @@ func LoggerMinimal() gin.HandlerFunc {
 		start := time.Now()
 		c.Next()
 
-		logger.APILog().Info("Request",
+		logger.APILog().Info("请求",
 			zap.Int("status", c.Writer.Status()),
 			zap.String("method", c.Request.Method),
 			zap.String("path", path),

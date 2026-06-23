@@ -77,6 +77,7 @@ func registerRoutes(r *gin.RouterGroup) {
   base_url: "http://localhost:8080"
 
 server:
+  host: ""                     # 绑定地址，空=监听所有接口；127.0.0.1=仅本机；内网IP=绑定指定网卡
   port: 8080
   mode: development             # development 或 production
   read_timeout: 15s             # 读超时
@@ -247,6 +248,7 @@ func registerRoutes(r *gin.RouterGroup) {
   base_url: "http://localhost:8080"
 
 server:
+  host: ""                     # 绑定地址，空=监听所有接口；127.0.0.1=仅本机
   port: 8080
   mode: development
   read_timeout: 15s

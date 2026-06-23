@@ -18,7 +18,7 @@ var (
 	httpRequestsTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "http_requests_total",
-			Help: "Total number of HTTP requests.",
+			Help: "HTTP 请求总数。",
 		},
 		[]string{"method", "route", "status"},
 	)
@@ -26,7 +26,7 @@ var (
 	httpRequestDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "http_request_duration_seconds",
-			Help:    "HTTP request latency in seconds.",
+			Help:    "HTTP 请求耗时（秒）。",
 			Buckets: prometheus.DefBuckets,
 		},
 		[]string{"method", "route"},
@@ -35,7 +35,7 @@ var (
 	httpRequestsInFlight = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "http_requests_in_flight",
-			Help: "Current number of in-flight HTTP requests.",
+			Help: "正在处理的 HTTP 请求数。",
 		},
 	)
 )

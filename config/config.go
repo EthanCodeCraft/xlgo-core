@@ -91,6 +91,7 @@ type TLSConfig struct {
 
 // ServerConfig 服务配置
 type ServerConfig struct {
+	Host            string        `mapstructure:"host"`              // 绑定地址，空=监听所有接口(0.0.0.0)；"127.0.0.1"=仅本机；内网IP=绑定指定网卡
 	Port            int           `mapstructure:"port"`
 	Mode            string        `mapstructure:"mode"`             // development 或 production
 	ReadTimeout     time.Duration `mapstructure:"read_timeout"`     // 读超时，如 "15s"

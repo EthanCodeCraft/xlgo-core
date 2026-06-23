@@ -377,11 +377,11 @@ func (a *App) Init() error {
 		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "mysql", Check: func(ctx context.Context) error {
 			// 优先读探活缓存标记（#21），避免每次探针都同步 ping
 			if !database.IsDBHealthy() {
-				return errors.New("mysql master unhealthy (probe)")
+				return errors.New("mysql 主库探活不健康")
 			}
 			status := database.HealthCheck()
 			if !status["master"] {
-				return errors.New("mysql master unavailable")
+				return errors.New("mysql 主库不可用")
 			}
 			return nil
 		}})
@@ -537,7 +537,9 @@ func (a *App) StartServer() error {
 	if useUnix {
 		a.server.Addr = srvCfg.UnixSocket
 	} else {
-		a.server.Addr = fmt.Sprintf(":%d", srvCfg.Port)
+		// Host 为空时监听所有接口（":port"）；设值时绑定指定地址（"host:port"），
+		// 用于仅本机（127.0.0.1）或绑定内网网卡的场景
+		a.server.Addr = fmt.Sprintf("%s:%d", srvCfg.Host, srvCfg.Port)
 	}
 
 	// OnStart hooks：监听端口前
@@ -553,8 +555,10 @@ func (a *App) StartServer() error {
 	go func() {
 		if useUnix {
 			logger.Infof("服务器启动，监听 unix socket %s", srvCfg.UnixSocket)
+		} else if srvCfg.Host != "" {
+			logger.Infof("服务器启动，监听 %s:%d", srvCfg.Host, srvCfg.Port)
 		} else {
-			logger.Infof("服务器启动，监听端口 %d", srvCfg.Port)
+			logger.Infof("服务器启动，监听端口 %d（所有接口）", srvCfg.Port)
 		}
 		var err error
 		if srvCfg.TLS.Enabled {
