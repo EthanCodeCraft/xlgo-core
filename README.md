@@ -819,6 +819,16 @@ docker run -d -p 8080:8080 xlgo-app:latest
 
 > 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
 
+### v1.1.1 (2026-06-23)
+
+> v1.1.0 的补丁发布：补 `ServerConfig.Host` 绑定地址、面向用户文案统一中文、修正 README 过时/错误描述（含会致启动失败的配置示例）。
+
+- **ServerConfig.Host** - `server.host` 控制监听地址，空=所有接口（兼容），`127.0.0.1`=仅本机，内网 IP=绑定指定网卡
+- **文案统一中文** - recover/logger/metrics 等面向用户文案统一中文（保留协议字段名、Prometheus metric Name、MySQL 错误串匹配等英文）
+- **README 修正** - 删 wire 段、修配置示例（secret≥32 字节 + expire 改 Duration）、补 v1.1.0 新文件、重写首段介绍
+
+升级：`go get github.com/EthanCodeCraft/xlgo-core@v1.1.1`（无破坏性变更）
+
 ### v1.1.0 (2026-06-23)
 
 > 本版本定位为 **HA & Manager 化 release**：高可用与生产就绪改进 + 组件 Manager 化。含少量破坏性变更，升级前请阅读 [CHANGELOG 升级说明](./CHANGELOG.md#升级说明)。
