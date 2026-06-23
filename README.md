@@ -6,22 +6,85 @@
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
 </p>
 
-xlgo 是一个基于 Go + Gin 的轻量级 Web 开发框架，提供了完整的后端开发基础设施，包括配置管理、数据库访问、缓存、认证、日志、文件存储等常用功能。
+> 基于 Go + Gin 的后端开发框架。**组件全部 Manager 化**——既能像脚本一样用包级函数简单调用，又能像正经框架一样注入实例、跑多套、塞 mock 做单测。
+
+## 为什么是 xlgo
+
+多数 Gin 脚手架把数据库、Redis、缓存、JWT、日志做成**包级全局单例**：写小项目顺手，但一旦要做单元测试、同进程跑多套实例、或替换实现，就动弹不得。xlgo 把这些组件全部抽象成 `XxxManager`，同时保留包级便捷函数做 facade——**简单用法零成本，复杂场景不封顶**：
+
+```go
+// 简单用法：包级函数，跟单例脚手架一样直接
+database.InitDB(cfg)
+db := database.GetDB()
+
+// 同一份代码，也能注入实例 / 跑多套 / 塞 mock
+myDB := database.NewManager(cfg)
+myDB.Open(ctx)                       // 独立实例，不受全局影响
+database.SetDefaultManager(myDB)     // 或提升为全局默认
+mockCache := &fakeCacheSvc{}
+cache.SetDefaultCacheManager(&cache.CacheManager{}) // 测试注入
+```
+
+### 区别于一般 Gin 脚手架的几点
+
+- **组件可注入** — database / redis / cache / jwt / storage / logger 均为 `Manager` + 全局 facade 双轨，支持多实例与 mock 注入，而非写死的包级单例
+- **生产就绪内置** — `/livez` `/readyz`、Prometheus `/metrics`、主库探活自愈、请求级超时、优雅关闭（等待 in-flight goroutine）开箱即用，不用自己搭
+- **框架内零 Fatal** — 错误一律返回由调用方处理，框架代码不 `panic` 杀进程
+- **默认轻量、按需启用** — `New()` 什么都不开，`NewFullStack()` 一键全开，中间任意组合；`Without*` 精细排除
+- **可插拔数据库方言** — GORM 方言注册表，内置 MySQL / PostgreSQL，可扩展 SQLite / ClickHouse 等
+
+### 30 秒上手
+
+```go
+package main
+
+import (
+	xlgo "github.com/EthanCodeCraft/xlgo-core"
+	"github.com/EthanCodeCraft/xlgo-core/response"
+	"github.com/gin-gonic/gin"
+)
+
+func main() {
+	app := xlgo.New(
+		xlgo.WithConfigPath("./config.yaml"),
+		xlgo.WithLogger(),
+		xlgo.WithHealthRoutes(),
+	)
+	app.GetRouter().GET("/", func(c *gin.Context) {
+		response.Success(c, gin.H{"hello": "xlgo"})
+	})
+	_ = app.Run()
+}
+```
 
 ## 框架特性
 
-- **配置管理** - 支持 YAML 配置文件，环境变量覆盖，配置热更新
-- **数据库** - 基于 GORM 的可插拔方言注册表，内置 MySQL / PostgreSQL，可注册任意 GORM 驱动；支持自动迁移、重试、连接池、读写分离
-- **缓存** - Redis 缓存，支持分布式缓存、键前缀、TTL，SCAN 优化
-- **认证** - JWT 认证，支持 Token 黑名单、刷新机制
-- **日志** - 分级日志（API、数据库），日志轮转
-- **中间件** - CORS、限流、日志、认证、CSRF 防护
-- **文件存储** - 本地存储 + 阿里云 OSS 支持
-- **实时通信** - SSE 流式响应 + WebSocket 支持
-- **定时任务** - 内置任务调度器
-- **验证器** - 请求参数验证，支持自定义错误消息
-- **错误处理** - 统一错误码体系
-- **CLI 工具** - 脚手架工具，快速创建项目和代码
+**架构与可注入性**
+- **组件 Manager 化** - database / redis / cache / jwt / storage / logger 均为 `XxxManager` + 全局 facade 双轨，支持多实例与测试注入 mock
+- **可插拔数据库方言** - GORM 方言注册表，内置 MySQL / PostgreSQL，可注册 SQLite / ClickHouse 等任意驱动
+- **读写分离** - 主库 + 多副本，`ReplicaPicker` 策略可插拔（轮询 / 随机 / 自定义），context 路由强制主库
+- **Lifecycle Hooks** - `OnInit / OnStart / OnReady / OnStop` 生命周期钩子，可插拔启动/关闭逻辑
+
+**生产就绪**
+- **健康探针** - `/livez`（存活）+ `/readyz`（就绪）+ `/health`（兼容），K8s probe 友好
+- **Prometheus 指标** - `/metrics` 端点 + 请求计数 / 耗时 / 在飞数采集中间件
+- **依赖健康自愈** - 主库后台探活，连续失败标记不健康联动 503；从库失败临时剔除、恢复自动纳入
+- **请求级超时** - `middleware.Timeout` 级联取消下游 GORM/Redis
+- **优雅关闭** - `App.Go` 管理后台 goroutine，Shutdown 时 cancel + 等待退出（带超时）
+- **配置校验** - 启动期 `Validate` 拦截非法配置（端口/密钥/必填字段），错误前置
+
+**基础功能**
+- **配置管理** - YAML + 环境变量覆盖 + 热更新，`time.Duration` 字符串解析（`"24h"`）
+- **缓存** - Redis 缓存，键前缀、TTL、SCAN 优化、分布式锁
+- **认证** - JWT 认证，Token 黑名单、刷新机制，HMAC 算法可选
+- **日志** - 分级日志（通用 / API / DB 三分流），lumberjack 轮转
+- **中间件** - CORS、限流（内存 + Redis 版）、请求日志、认证、CSRF、RequestID、Recover
+- **文件存储** - 本地 + 阿里云 OSS
+- **实时通信** - SSE 流式响应 + WebSocket
+- **定时任务** - 内置调度器（interval / daily / weekly / cron）
+- **验证器** - 请求参数验证，自定义错误消息
+- **响应模式** - `ModeBusiness`（业务码，默认）/ `ModeREST`（按错误码映射 HTTP status）一键切换
+- **CLI 工具** - 脚手架 + 代码生成（handler/repository/model/service）
 
 ## 快速开始
 
@@ -47,8 +110,14 @@ go mod tidy
 
 ```yaml
 server:
+  host: ""                 # 绑定地址，空=监听所有接口；127.0.0.1=仅本机
   port: 8080
   mode: development
+  read_timeout: 15s
+  write_timeout: 30s
+  idle_timeout: 60s
+  shutdown_timeout: 30s
+  response_mode: business  # business(默认,全200+业务码) 或 rest(按错误码映射HTTP status)
 
 database:
   driver: mysql          # mysql（默认）或 postgres
@@ -68,8 +137,11 @@ redis:
   db: 0
 
 jwt:
-  secret: your_jwt_secret_key
-  expire: 86400
+  secret: your_jwt_secret_key_at_least_32_bytes  # ≥32 字节，否则启动期被 Validate 拦截
+  expire: "24h"            # time.Duration，支持 "24h"/"30m" 等
+  refresh_expire: "168h"   # 刷新 token 过期时间
+  issuer: xlgo
+  algorithm: HS256         # HS256(默认)/HS384/HS512
 
 storage:
   driver: local
@@ -574,6 +646,16 @@ response.Unauthorized(c, "请先登录")
 response.NotFound(c, "资源不存在")
 response.ServerError(c, "服务器错误")
 response.RateLimit(c)
+
+// 显式指定 HTTP status（不受 Mode 影响）
+response.Custom(c, http.StatusBadRequest, response.CodeFail, "参数错误", nil)
+```
+
+**响应模式**（v1.1.0）：默认 `ModeBusiness`，所有响应 HTTP 200 + 业务码（兼容存量）。切换 `ModeREST` 后，失败响应按错误码映射对应 HTTP status（401/404/429/500...），body 仍带业务码，便于 APM / Prometheus / 网关按 status 区分异常：
+
+```go
+response.SetMode(response.ModeREST)            // 代码切换
+// 或在 config.yaml 配置：server.response_mode: rest
 ```
 
 ---
@@ -638,15 +720,16 @@ xlgo/
 ├── compress/
 │   └── compress.go     # Gzip/Zip 压缩解压
 ├── config/
-│   └── config.go       # 配置管理（支持热更新）
+│   ├── config.go       # 配置管理（支持热更新、time.Duration 解析）
+│   └── validate.go     # 配置校验（启动期拦截非法配置）
 ├── console/
 │   └── console.go      # 彩色控制台输出
 ├── cron/
 │   └── cron.go         # 定时任务调度
 ├── database/
-│   ├── manager.go     # 数据库管理器（主从、Picker、Init/Close/HealthCheck）
+│   ├── manager.go     # 数据库管理器（主从、Picker、探活自愈、Init/Close/HealthCheck）
 │   ├── dialect.go     # GORM 方言注册表（mysql / postgres，可扩展）
-│   └── redis.go       # Redis 连接
+│   └── redis.go       # Redis 连接管理器（RedisManager）
 ├── handler/
 │   └── handler.go      # 基础处理器（类型安全参数获取）
 ├── jwt/
@@ -659,18 +742,22 @@ xlgo/
 │   ├── cors.go         # CORS 跨域中间件
 │   ├── csrf.go         # CSRF 防护中间件
 │   ├── logger.go       # 请求日志中间件
+│   ├── metrics.go      # Prometheus 指标中间件
 │   ├── ratelimit.go    # 限流中间件
 │   ├── requestid.go    # 请求ID中间件
-│   └── recover.go      # Panic恢复中间件
+│   ├── recover.go      # Panic恢复中间件
+│   └── timeout.go      # 请求级超时中间件
 ├── model/
 │   └── base.go         # 基础模型
 ├── repository/
 │   └── repository.go   # 基础仓库（泛型CRUD）
 ├── response/
 │   ├── response.go     # 统一响应格式
+│   ├── mode.go         # 响应模式开关（business / REST）
 │   └── error.go        # 统一错误码
 ├── router/
-│   └── router.go       # 路由注册中心（模块化/版本化）
+│   ├── router.go       # 路由注册中心（模块化/版本化、livez/readyz/health）
+│   └── metrics.go      # Prometheus /metrics 端点
 ├── sse/
 │   └── sse.go          # SSE 流式响应
 ├── storage/
@@ -694,8 +781,6 @@ xlgo/
 │   ├── validator.go    # 请求验证器
 │   ├── password.go     # 密码强度验证
 │   └── hash.go         # 密码加密
-├── wire/
-│   └── wire.go         # 依赖注入
 └── ws/
     └── ws.go           # WebSocket 支持
 ```
@@ -907,7 +992,7 @@ response.Fail(c, "用户名格式错误")
 
 #### App 启动流程
 - **轻量默认** - `xlgo.New()` 默认不再初始化 MySQL / Redis / Storage，也不注册 `/health` 与 `/swagger/*`；通过 Option 显式启用
-- **组件 Option** - 新增 `WithLogger / WithMySQL / WithRedis / WithStorage / WithWire / WithHealthRoutes / WithSwaggerRoutes / WithDefaultRoutes / WithAutoMigrate` 及对应 `WithoutXxx` 关闭项
+- **组件 Option** - 新增 `WithLogger / WithMySQL / WithRedis / WithStorage / WithHealthRoutes / WithSwaggerRoutes / WithDefaultRoutes / WithAutoMigrate` 及对应 `WithoutXxx` 关闭项（注：`WithWire` 曾在此版本新增，已于 v1.1.0 随 wire 包删除而移除）
 - **迁移控制** - 新增 `Migrator` 类型与 `WithMigrator / WithModels`，注册时自动开启 `WithAutoMigrate`，`WithoutAutoMigrate` 可显式关闭；不再强制调用空的 `database.AutoMigrate()`
 - **batteries-included** - 新增 `WithFullStack` / `NewFullStack` / `RunFullStack`，一键启用全部默认组件
 - **错误传播** - 框架初始化失败一律 `return error`，不再在框架内部直接 `Fatalf` 退出进程
