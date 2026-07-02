@@ -45,11 +45,11 @@ var (
 func Metrics() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		httpRequestsInFlight.Inc()
+		defer httpRequestsInFlight.Dec() // M2 修复：defer 保证 panic 时也递减，不依赖 Recover 中间件顺序
 		start := time.Now()
 
 		c.Next()
 
-		httpRequestsInFlight.Dec()
 		elapsed := time.Since(start).Seconds()
 		status := strconv.Itoa(c.Writer.Status())
 		route := c.FullPath()

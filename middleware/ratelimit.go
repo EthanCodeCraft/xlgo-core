@@ -140,7 +140,7 @@ func (rl *RateLimiter) Stop() {
 
 // H4c: Redis 限流器故障相关错误。
 var (
-	// ErrRedisRateLimiterUnavailable Redis 未启用（database.RedisClient == nil）。
+	// ErrRedisRateLimiterUnavailable Redis 未启用（database.GetRedis() == nil）。
 	// fail-closed 限流器在此情况下拒绝请求；fail-open 限流器放行。
 	ErrRedisRateLimiterUnavailable = errors.New("redis rate limiter: redis client unavailable")
 	// ErrRedisRateLimiterUnexpectedResult Redis 返回非预期的结果类型（非 int64）。
@@ -216,10 +216,10 @@ func (rl *RedisRateLimiter) SetFailClosed(failClosed bool) {
 //     fail-open 返 (true, err) 放行（兼容旧行为）。中间件层据此 allowed 值决定放行/拒绝，
 //     不再无条件 fail-open——登录防爆破等安全场景用 fail-closed 限流器即可在 Redis 故障时拒绝。
 //
-// Redis 未启用（database.RedisClient == nil）时：fail-closed 返 (false, ErrRedisRateLimiterUnavailable)，
+// Redis 未启用（database.GetRedis() == nil）时：fail-closed 返 (false, ErrRedisRateLimiterUnavailable)，
 // fail-open 返 (true, nil)（兼容旧行为）。安全场景必须确保 Redis 已启用。
 func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool, error) {
-	if database.RedisClient == nil {
+	if database.GetRedis() == nil {
 		if rl.failClosed {
 			return false, ErrRedisRateLimiterUnavailable
 		}
@@ -230,7 +230,7 @@ func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool,
 	now := float64(time.Now().UnixMilli())
 	windowMs := float64(rl.window.Milliseconds())
 
-	result, err := database.RedisClient.Eval(ctx, slidingWindowLua, []string{key}, now, windowMs, rl.rate).Result()
+	result, err := database.GetRedis().Eval(ctx, slidingWindowLua, []string{key}, now, windowMs, rl.rate).Result()
 	if err != nil {
 		if rl.failClosed {
 			return false, err
@@ -251,7 +251,7 @@ func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool,
 
 // GetCount 获取当前窗口内的请求数
 func (rl *RedisRateLimiter) GetCount(ctx context.Context, identifier string) (int64, error) {
-	if database.RedisClient == nil {
+	if database.GetRedis() == nil {
 		return 0, nil
 	}
 
@@ -260,18 +260,18 @@ func (rl *RedisRateLimiter) GetCount(ctx context.Context, identifier string) (in
 	windowStart := now - rl.window.Milliseconds()
 
 	// 移除旧记录并获取当前计数
-	database.RedisClient.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart))
-	return database.RedisClient.ZCard(ctx, key).Result()
+	database.GetRedis().ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart))
+	return database.GetRedis().ZCard(ctx, key).Result()
 }
 
 // Reset 重置限流计数
 func (rl *RedisRateLimiter) Reset(ctx context.Context, identifier string) error {
-	if database.RedisClient == nil {
+	if database.GetRedis() == nil {
 		return nil
 	}
 
 	key := rl.keyPrefix + ":" + identifier
-	return database.RedisClient.Del(ctx, key).Err()
+	return database.GetRedis().Del(ctx, key).Err()
 }
 
 // ===== 全局限速器 =====

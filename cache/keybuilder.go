@@ -9,9 +9,10 @@ import (
 	"github.com/EthanCodeCraft/xlgo-core/config"
 )
 
-// KeyBuilder 缓存键名构建器
+// KeyBuilder 缓存键名构建器（CK2 修复：mu 保护并发访问）。
 // 使用场景: 多个小项目共用一台 Redis 服务器，每个项目设置不同前缀
 type KeyBuilder struct {
+	mu         sync.Mutex
 	prefix     string // 项目/站点前缀，如 "site_a"
 	_separator string // 分隔符，默认 ":"
 	_cacheType string // 缓存类型标识，如 "cache"
@@ -57,10 +58,12 @@ func NewKeyBuilder(opts ...KeyBuilderOption) *KeyBuilder {
 	return kb
 }
 
-// Build 构建完整键名
+// Build 构建完整键名（CK2 修复：mu 读保护）。
 // 格式: {cacheType}{separator}{prefix}{separator}{key}
 // 示例: kb.Build("user:1") -> "cache_site_a_user:1"
 func (kb *KeyBuilder) Build(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{}
 	if kb._cacheType != "" {
 		parts = append(parts, kb._cacheType)
@@ -72,9 +75,11 @@ func (kb *KeyBuilder) Build(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildTemp 构建临时缓存键名（带过期时间）
+// BuildTemp 构建临时缓存键名（CK2 修复：mu 读保护）。
 // 格式: "temp{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildTemp(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{"temp"}
 	if kb.prefix != "" {
 		parts = append(parts, kb.prefix)
@@ -83,9 +88,11 @@ func (kb *KeyBuilder) BuildTemp(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildPerm 构建永久缓存键名（不带过期时间）
+// BuildPerm 构建永久缓存键名（CK2 修复：mu 读保护）。
 // 格式: "perm{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildPerm(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{"perm"}
 	if kb.prefix != "" {
 		parts = append(parts, kb.prefix)
@@ -94,9 +101,11 @@ func (kb *KeyBuilder) BuildPerm(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildLock 构建分布式锁键名
+// BuildLock 构建分布式锁键名（CK2 修复：mu 读保护）。
 // 格式: "lock{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildLock(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{"lock"}
 	if kb.prefix != "" {
 		parts = append(parts, kb.prefix)
@@ -105,9 +114,11 @@ func (kb *KeyBuilder) BuildLock(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildCounter 构建计数器键名
+// BuildCounter 构建计数器键名（CK2 修复：mu 读保护）。
 // 格式: "counter{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildCounter(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{"counter"}
 	if kb.prefix != "" {
 		parts = append(parts, kb.prefix)
@@ -116,9 +127,11 @@ func (kb *KeyBuilder) BuildCounter(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildSession 构建会话键名
+// BuildSession 构建会话键名（CK2 修复：mu 读保护）。
 // 格式: "session{separator}{prefix}{separator}{key}"
 func (kb *KeyBuilder) BuildSession(key string) string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	parts := []string{"session"}
 	if kb.prefix != "" {
 		parts = append(parts, kb.prefix)
@@ -127,22 +140,23 @@ func (kb *KeyBuilder) BuildSession(key string) string {
 	return strings.Join(parts, kb._separator)
 }
 
-// BuildPattern 构建匹配模式（用于 SCAN/Keys）
+// BuildPattern 构建匹配模式（用于 SCAN/Keys）（CK2 修复：mu 读保护）。
 // 示例: kb.BuildPattern("user:*") -> "cache_site_a_user:*"
 func (kb *KeyBuilder) BuildPattern(pattern string) string {
 	return kb.Build(pattern)
 }
 
-// GetPrefix 获取当前前缀
+// GetPrefix 获取当前前缀（CK2 修复：mu 读保护）。
 func (kb *KeyBuilder) GetPrefix() string {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	return kb.prefix
 }
 
-// SetPrefix 动态设置前缀。
-//
-// 注意（M13）：KeyBuilder 实例非并发安全——并发 Build 与 SetPrefix 会竞争 prefix。
-// 全局构建器主要在启动期配置，运行期改前缀请自行加锁或重建实例。
+// SetPrefix 动态设置前缀（CK2 修复：mu 写保护，并发安全）。
 func (kb *KeyBuilder) SetPrefix(prefix string) *KeyBuilder {
+	kb.mu.Lock()
+	defer kb.mu.Unlock()
 	kb.prefix = prefix
 	return kb
 }

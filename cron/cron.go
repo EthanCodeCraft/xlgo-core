@@ -8,17 +8,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/EthanCodeCraft/xlgo-core/logger"
+	"go.uber.org/zap"
 )
 
 // Task 定时任务
 type Task struct {
-	Name     string        // 任务名称
-	Schedule Schedule      // 调度规则
-	Handler  TaskHandler   // 任务处理函数
-	Enabled  bool          // 是否启用
-	LastRun  time.Time     // 上次运行时间
-	NextRun  time.Time     // 下次运行时间
-	RunCount int           // 运行次数
+	Name      string      // 任务名称
+	Schedule  Schedule    // 调度规则
+	Handler   TaskHandler // 任务处理函数
+	Enabled   bool        // 是否启用
+	LastRun   time.Time   // 上次运行时间
+	NextRun   time.Time   // 下次运行时间
+	RunCount  int         // 运行次数
+	LastError error       // CR3 修复：最近一次执行错误
 
 	// running 防止长任务跨 tick 重叠执行（C12b）。
 	// 用指针以便 GetTask/ListTasks 返回 Task 拷贝时不触发 atomic.Bool 值类型的
@@ -247,8 +251,13 @@ func (s *Scheduler) checkAndRun() {
 			s.mu.Lock()
 			t.LastRun = time.Now()
 			t.RunCount++
+			t.LastError = err // CR3 修复：记录错误不再静默丢弃
 			s.mu.Unlock()
-			_ = err
+			if err != nil {
+				logger.Error("cron task failed",
+					zap.String("task", t.Name),
+					zap.Error(err))
+			}
 		}(task)
 	}
 	s.mu.Unlock()
@@ -320,8 +329,9 @@ func Weekly(day time.Weekday, hour, minute int) *WeeklySchedule {
 // FullCronSchedule 完整 Cron 表达式调度
 // 格式: "分钟 小时 日 月 星期" (5字段)
 // 示例: "0 12 * * *" 每天12点
-//       "0 0 1 * *" 每月1号凌晨
-//       "0 9-17 * * 1-5" 周一到周五 9点到17点每小时
+//
+//	"0 0 1 * *" 每月1号凌晨
+//	"0 9-17 * * 1-5" 周一到周五 9点到17点每小时
 type FullCronSchedule struct {
 	Minute  string // 分钟: 0-59, "*", "*/n", "a-b", "a,b,c"
 	Hour    string // 小时: 0-23, "*", "*/n", "a-b", "a,b,c"

@@ -41,12 +41,13 @@ type Migrator func(*gorm.DB) error
 //   - OnReady: 端口就绪后（已开始接受连接）
 //   - OnStop:  Shutdown() 开头，关 HTTP 之前
 //
-// OnInit/OnStart/OnStop 返回 error 会中断流程并向上返回。
+// OnInit/OnStart/OnReady/OnStop 返回 error 会中断流程并向上返回。
+// A2 修复：OnReady 改为返回 error，失败时触发 shutdown。
 type Hook struct {
 	Name    string
 	OnInit  func(*App) error
 	OnStart func(*App) error
-	OnReady func(*App)
+	OnReady func(*App) error
 	OnStop  func(*App) error
 }
 
@@ -80,7 +81,10 @@ type App struct {
 	migrators    []Migrator
 	healthChecks []router.HealthCheck
 	hooks        []Hook
-	initialized  bool
+
+	// 初始化同步守卫（A1 修复：sync.Once 替代裸 bool，防止并发 Init 竞态）
+	initOnce sync.Once
+	initErr  error
 
 	// 请求级超时（#19），<=0 表示不启用
 	requestTimeout time.Duration
@@ -102,11 +106,12 @@ func WithConfigPath(path string) Option {
 	}
 }
 
-// WithConfig 设置配置对象
+// WithConfig 设置配置对象。
+// A3 修复：不再调用 config.Set(cfg)，配置仅保留在 App 实例内，不污染全局状态。
+// 依赖 config.Get() 获取注入配置的下游代码请改用 WithConfigPath。
 func WithConfig(cfg *config.Config) Option {
 	return func(a *App) {
 		a.config = cfg
-		config.Set(cfg)
 	}
 }
 
@@ -350,12 +355,15 @@ func RunFullStack(opts ...Option) error {
 	return NewFullStack(opts...).Run()
 }
 
-// Init 初始化应用，不启动 HTTP 监听
+// Init 初始化应用，不启动 HTTP 监听（A1 修复：sync.Once 保证单次执行，并发安全）。
+// 多次调用返回首次执行的结果。
 func (a *App) Init() error {
-	if a.initialized {
-		return nil
-	}
+	a.initOnce.Do(func() { a.initErr = a.doInit() })
+	return a.initErr
+}
 
+// doInit 执行实际初始化流程。仅在 sync.Once 中调用，不可直接调用。
+func (a *App) doInit() error {
 	cfg, err := a.resolveConfig()
 	if err != nil {
 		return err
@@ -474,8 +482,6 @@ func (a *App) Init() error {
 		a.Go(database.StartDBProbing)
 	}
 
-	a.initialized = true
-
 	// OnInit hooks：组件初始化完成后触发（#12）
 	for _, h := range a.hooks {
 		if h.OnInit != nil {
@@ -576,10 +582,14 @@ func (a *App) StartServer() error {
 		serverErr <- nil
 	}()
 
-	// OnReady hooks：端口就绪后
+	// OnReady hooks：端口就绪后（A2 修复：失败时触发 shutdown）
 	for _, h := range a.hooks {
 		if h.OnReady != nil {
-			h.OnReady(a)
+			if err := h.OnReady(a); err != nil {
+				logger.Errorf("OnReady hook %q 失败: %v", h.Name, err)
+				serverErr <- fmt.Errorf("OnReady hook %q 失败: %w", h.Name, err)
+				return fmt.Errorf("OnReady hook %q 失败: %w", h.Name, err)
+			}
 		}
 	}
 

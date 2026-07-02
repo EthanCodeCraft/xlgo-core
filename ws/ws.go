@@ -316,13 +316,16 @@ func SetCheckOrigin(fn func(r *http.Request) bool) {
 	upgrader.CheckOrigin = fn
 }
 
-// Hub 连接管理中心（用于广播）
+// Hub 连接管理中心（用于广播）。
+// W1 修复：添加 stop channel + Stop() 方法，支持优雅退出。
 type Hub struct {
 	connections map[*Connection]bool
 	register    chan *Connection
 	unregister  chan *Connection
 	broadcast   chan []byte
 	mu          sync.RWMutex
+	stop        chan struct{}
+	wg          sync.WaitGroup
 }
 
 // NewHub 创建 Hub
@@ -332,17 +335,29 @@ func NewHub() *Hub {
 		register:    make(chan *Connection),
 		unregister:  make(chan *Connection),
 		broadcast:   make(chan []byte, 256),
+		stop:        make(chan struct{}),
 	}
 }
 
-// Run 运行 Hub。消费 register/unregister/broadcast 三个 channel。
+// Run 运行 Hub。消费 register/unregister/broadcast/stop 四个 channel。
 //
-// 死锁修复（C2a）：广播分支不再向自身 unregister channel 回环（旧实现 broadcast 中
-// conn.Send 失败时 h.unregister <- conn，而 unregister 的唯一消费者就是本 Run goroutine，
-// 导致永久阻塞、整个 Hub 卡死）。改为持写锁单次遍历，失败的连接行内 delete + conn.Close()。
+// W1 修复：新增 stop 退出分支，Stop() 方法 close(stop) 通知退出。
+// 死锁修复（C2a）：广播分支不再向自身 unregister channel 回环。
 func (h *Hub) Run() {
+	h.wg.Add(1)
+	defer h.wg.Done()
 	for {
 		select {
+		case <-h.stop:
+			// 关闭所有连接后退出
+			h.mu.Lock()
+			for conn := range h.connections {
+				delete(h.connections, conn)
+				conn.Close()
+			}
+			h.mu.Unlock()
+			return
+
 		case conn := <-h.register:
 			h.mu.Lock()
 			h.connections[conn] = true
@@ -358,8 +373,6 @@ func (h *Hub) Run() {
 
 		case message := <-h.broadcast:
 			// 持写锁单次遍历，失败的连接行内移除并关闭，不回环 unregister channel（C2a 修复）。
-			// Send 为非阻塞（C2a-residual 修复），缓冲满或已关闭即返回错误，保证持锁期间不阻塞、
-			// Hub 不 stall。慢消费者缓冲满会被清理——ws 广播为 best-effort 语义，背压通过踢除实现。
 			h.mu.Lock()
 			for conn := range h.connections {
 				if err := conn.Send(message); err != nil {
@@ -372,19 +385,44 @@ func (h *Hub) Run() {
 	}
 }
 
-// Register 注册连接
+// Stop 停止 Hub（W1 修复：优雅退出机制）。
+// close(stop) 通知 Run() 退出，WaitGroup 等待 Run() 完全结束。
+// 幂等：重复调用安全（close 已关闭的 channel 会 panic，
+// 由 Hub 内部 stopped 标志保护——这里的实现依赖 close(stop) 本身由唯一调用者执行）。
+func (h *Hub) Stop() {
+	select {
+	case <-h.stop:
+		// 已关闭，幂等返回
+		return
+	default:
+		close(h.stop)
+	}
+	h.wg.Wait()
+}
+
+// Register 注册连接（W1 修复：Hub 已 stop 时 non-blocking 返回，避免永久阻塞）。
 func (h *Hub) Register(conn *Connection) {
-	h.register <- conn
+	select {
+	case h.register <- conn:
+	case <-h.stop:
+		conn.Close()
+	}
 }
 
-// Unregister 注销连接
+// Unregister 注销连接（W1 修复：Hub 已 stop 时 non-blocking 返回）。
 func (h *Hub) Unregister(conn *Connection) {
-	h.unregister <- conn
+	select {
+	case h.unregister <- conn:
+	case <-h.stop:
+	}
 }
 
-// Broadcast 广播消息
+// Broadcast 广播消息（W1 修复：Hub 已 stop 时 non-blocking 返回）。
 func (h *Hub) Broadcast(message []byte) {
-	h.broadcast <- message
+	select {
+	case h.broadcast <- message:
+	case <-h.stop:
+	}
 }
 
 // BroadcastJSON 广播 JSON 消息

@@ -1188,9 +1188,8 @@ func TestLoginRedisRateLimit(t *testing.T) {
 	// H4c: LoginRedisRateLimit 改 fail-closed——无 Redis 时拒绝（503），
 	// 防爆破场景下 Redis 故障不能静默放行（原 fail-open 致限流失效）。
 	// 测试环境无 Redis，故预期 503。
-	prev := database.RedisClient
-	database.RedisClient = nil
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	r := setupTestRouter()
 	r.Use(middleware.LoginRedisRateLimit())
@@ -1265,23 +1264,21 @@ func TestRedisRateLimiterReset(t *testing.T) {
 
 // ===== H4c 回归：RedisRateLimiter fail-open/fail-closed + 裸断言 =====
 
-// setupMiddlewareMiniRedis 启动 miniredis 并接到 database.RedisClient，返回 mr 与清理。
+// setupMiddlewareMiniRedis 启动 miniredis 并注入 database 内部 redisClient，返回 mr 与清理。
 func setupMiddlewareMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	old := database.RedisClient
-	database.RedisClient = client
-	t.Cleanup(func() { database.RedisClient = old })
+	old := database.SetTestRedisClient(client)
+	t.Cleanup(func() { database.SetTestRedisClient(old) })
 	return mr
 }
 
 // 回归 H4c-1a：无 Redis 时 fail-open 放行（兼容旧行为）。
 func TestRedisRateLimiterFailOpenNoRedis(t *testing.T) {
-	prev := database.RedisClient
-	database.RedisClient = nil
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	limiter := middleware.NewRedisRateLimiter("test", 10, time.Minute)
 	allowed, err := limiter.Allow(context.Background(), "1.2.3.4")
@@ -1296,9 +1293,8 @@ func TestRedisRateLimiterFailOpenNoRedis(t *testing.T) {
 // 回归 H4c-1b：无 Redis 时 fail-closed 拒绝 + 返 ErrRedisRateLimiterUnavailable。
 // 修复前无此选项；fail-closed 是 H4c 新增的安全语义。
 func TestRedisRateLimiterFailClosedNoRedis(t *testing.T) {
-	prev := database.RedisClient
-	database.RedisClient = nil
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	limiter := middleware.NewRedisRateLimiterFailClosed("test", 10, time.Minute)
 	allowed, err := limiter.Allow(context.Background(), "1.2.3.4")
@@ -1356,9 +1352,8 @@ func TestRedisRateLimiterFailClosedOnRedisError(t *testing.T) {
 
 // 回归 H4c-1d：fail-closed 中间件在 Redis 故障时返 503（区别于真实超限的 429）。
 func TestRedisRateLimitFailClosedMiddlewareReturns503(t *testing.T) {
-	prev := database.RedisClient
-	database.RedisClient = nil // 无 Redis
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	r := setupTestRouter()
 	r.Use(middleware.RedisRateLimitFailClosed("login_limit", 10))
@@ -1381,9 +1376,8 @@ func TestRedisRateLimitFailClosedMiddlewareReturns503(t *testing.T) {
 
 // 回归 H4c-1e：fail-open 中间件在 Redis 故障时放行（兼容旧行为）。
 func TestRedisRateLimitFailOpenMiddlewareAllowsOnError(t *testing.T) {
-	prev := database.RedisClient
-	database.RedisClient = nil
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	r := setupTestRouter()
 	r.Use(middleware.RedisRateLimit("api_limit", 100))
@@ -1434,7 +1428,7 @@ func TestRedisRateLimiterCommaOkAssertion(t *testing.T) {
 	ctx := context.Background()
 
 	// miniredis 执行返回字符串的脚本——模拟 Redis 返回非 int64 结果。
-	res, err := database.RedisClient.Eval(ctx, `return 'not-an-int'`, nil).Result()
+	res, err := database.GetRedis().Eval(ctx, `return 'not-an-int'`, nil).Result()
 	if err != nil {
 		t.Fatalf("eval err = %v", err)
 	}
@@ -1461,9 +1455,8 @@ func TestRedisRateLimiterCommaOkAssertion(t *testing.T) {
 
 // 回归 H4c-2：SetFailClosed 切换策略——fail-open 限流器切 fail-closed 后无 Redis 拒绝。
 func TestRedisRateLimiterSetFailClosed(t *testing.T) {
-	prev := database.RedisClient
-	database.RedisClient = nil
-	defer func() { database.RedisClient = prev }()
+	prev := database.SetTestRedisClient(nil)
+	defer func() { database.SetTestRedisClient(prev) }()
 
 	limiter := middleware.NewRedisRateLimiter("test", 10, time.Minute)
 	// 初始 fail-open：放行。

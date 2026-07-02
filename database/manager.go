@@ -49,7 +49,10 @@ func (p *RoundRobinPicker) Pick(replicas []*gorm.DB) *gorm.DB {
 	return replicas[int(n-1)%len(replicas)]
 }
 
-// RandomPicker 随机选择从库
+// RandomPicker 随机选择从库。
+//
+// D2 注释：rand.Intn 自 Go 1.20 起（go.dev/issue/54899）内部使用 per-goroutine
+// 随机源，并发安全无需额外同步。本模块 go.mod 声明 go 1.25.0，满足此要求。
 type RandomPicker struct{}
 
 // Pick 随机选择一个从库
@@ -69,11 +72,11 @@ type Manager struct {
 	mu       sync.Mutex
 
 	// #21 健康自愈
-	healthy          atomic.Bool       // 主库是否健康
-	replicaHealthy   []atomic.Bool     // 每个从库的健康标记，索引与 replicas 对齐
-	probeFailures    int               // 主库连续探活失败次数
-	probeMu          sync.Mutex        // 保护 probeFailures
-	replicaHealthSet bool              // replicaHealthy 是否已按 replicas 长度初始化
+	healthy          atomic.Bool   // 主库是否健康
+	replicaHealthy   []atomic.Bool // 每个从库的健康标记，索引与 replicas 对齐
+	probeFailures    int           // 主库连续探活失败次数
+	probeMu          sync.Mutex    // 保护 probeFailures
+	replicaHealthSet bool          // replicaHealthy 是否已按 replicas 长度初始化
 }
 
 // NewManager 创建数据库管理器
@@ -434,18 +437,24 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 
 // isTransientDBError 判断数据库连接错误是否值得重试。
 // 认证失败、未知数据库、非法 DSN/驱动等属于配置类错误，重试无意义，直接返回更友好。
+// D5 修复：覆盖 MySQL 和 PostgreSQL 常见非瞬态错误。
 func isTransientDBError(err error) bool {
 	if err == nil {
 		return true
 	}
 	msg := err.Error()
 	nonTransient := []string{
-		"Access denied",         // MySQL 认证失败（用户名/密码错误）
-		"authentication plugin", // MySQL 认证插件不支持
-		"Unknown database",      // MySQL 目标库不存在
+		// MySQL
+		"Access denied",         // 认证失败（用户名/密码错误）
+		"authentication plugin", // 认证插件不支持
+		"Unknown database",      // 目标库不存在
 		"invalid DSN",           // DSN 语法错误
 		"unknown driver",        // 驱动未注册
 		"unsupported driver",    // 驱动不支持
+		// PostgreSQL（D5 修复）
+		"password authentication failed", // pg 密码错误
+		"database", "does not exist",     // pg 目标库不存在（消息含"database ... does not exist"）
+		"no pg_hba.conf entry", // pg_hba.conf 拒绝
 	}
 	for _, sub := range nonTransient {
 		if strings.Contains(msg, sub) {

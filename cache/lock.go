@@ -82,14 +82,15 @@ end
 // 参数: key 锁名称，ttl 锁定时长
 // 返回: LockToken 用于后续解锁或续期
 func NewLock(ctx context.Context, key string, ttl time.Duration) (*LockToken, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return nil, ErrRedisNotReady
 	}
 
 	token := utils.UUID()
 	ttlMs := int64(ttl / time.Millisecond)
 
-	result, err := database.RedisClient.Eval(ctx, lockScript, []string{key}, token, ttlMs).Result()
+	result, err := rdb.Eval(ctx, lockScript, []string{key}, token, ttlMs).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +118,8 @@ func Lock(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 
 // Unlock 安全释放锁
 func Unlock(ctx context.Context, token *LockToken) error {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return ErrRedisNotReady
 	}
 
@@ -125,7 +127,7 @@ func Unlock(ctx context.Context, token *LockToken) error {
 		return ErrLockNotHeld
 	}
 
-	result, err := database.RedisClient.Eval(ctx, unlockScript, []string{token.Key}, token.Token).Result()
+	result, err := rdb.Eval(ctx, unlockScript, []string{token.Key}, token.Token).Result()
 	if err != nil {
 		return err
 	}
@@ -144,16 +146,18 @@ func Unlock(ctx context.Context, token *LockToken) error {
 // UnlockByKey 按键名释放锁（不安全，仅用于旧代码兼容）
 // 注意: 此函数不检查 Token，任何客户端都能释放锁
 func UnlockByKey(ctx context.Context, key string) error {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return nil
 	}
-	return database.RedisClient.Del(ctx, key).Err()
+	return rdb.Del(ctx, key).Err()
 }
 
 // ExtendLock 续期锁
 // 参数: token 锁令牌，ttl 新的过期时间
 func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return ErrRedisNotReady
 	}
 
@@ -163,7 +167,7 @@ func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error 
 
 	ttlMs := int64(ttl / time.Millisecond)
 
-	result, err := database.RedisClient.Eval(ctx, extendScript, []string{token.Key}, token.Token, ttlMs).Result()
+	result, err := rdb.Eval(ctx, extendScript, []string{token.Key}, token.Token, ttlMs).Result()
 	if err != nil {
 		return err
 	}
@@ -281,83 +285,93 @@ func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duratio
 
 // IsLocked 检查锁是否被占用（不获取锁）
 func IsLocked(ctx context.Context, key string) (bool, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return false, nil
 	}
-	return database.RedisClient.Exists(ctx, key).Val() > 0, nil
+	return rdb.Exists(ctx, key).Val() > 0, nil
 }
 
 // GetLockTTL 获取锁的剩余过期时间
 func GetLockTTL(ctx context.Context, key string) (time.Duration, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
-	return database.RedisClient.TTL(ctx, key).Result()
+	return rdb.TTL(ctx, key).Result()
 }
 
 // ForceUnlock 强制释放锁（危险操作，仅用于管理场景）
 // 注意: 此函数不检查 Token，强制删除锁
 func ForceUnlock(ctx context.Context, key string) error {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return nil
 	}
-	return database.RedisClient.Del(ctx, key).Err()
+	return rdb.Del(ctx, key).Err()
 }
 
 // ===== 计数器操作 =====
 
 // Incr 自增计数器
 func Incr(ctx context.Context, key string) (int64, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
-	return database.RedisClient.Incr(ctx, key).Result()
+	return rdb.Incr(ctx, key).Result()
 }
 
 // IncrBy 指定增量自增
 func IncrBy(ctx context.Context, key string, value int64) (int64, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
-	return database.RedisClient.IncrBy(ctx, key, value).Result()
+	return rdb.IncrBy(ctx, key, value).Result()
 }
 
 // Decr 自减计数器
 func Decr(ctx context.Context, key string) (int64, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
-	return database.RedisClient.Decr(ctx, key).Result()
+	return rdb.Decr(ctx, key).Result()
 }
 
 // GetTTL 获取键的剩余过期时间
 func GetTTL(ctx context.Context, key string) (time.Duration, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
-	return database.RedisClient.TTL(ctx, key).Result()
+	return rdb.TTL(ctx, key).Result()
 }
 
 // SetExpire 设置键的过期时间
 func SetExpire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return false, nil
 	}
-	return database.RedisClient.Expire(ctx, key, ttl).Result()
+	return rdb.Expire(ctx, key, ttl).Result()
 }
 
 // GetRaw 获取原始字符串值（不反序列化）
 func GetRaw(ctx context.Context, key string) (string, error) {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return "", nil
 	}
-	return database.RedisClient.Get(ctx, key).Result()
+	return rdb.Get(ctx, key).Result()
 }
 
 // SetRaw 设置原始值（不序列化）
 func SetRaw(ctx context.Context, key string, value string, ttl time.Duration) error {
-	if database.RedisClient == nil {
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return nil
 	}
-	return database.RedisClient.Set(ctx, key, value, ttl).Err()
+	return rdb.Set(ctx, key, value, ttl).Err()
 }

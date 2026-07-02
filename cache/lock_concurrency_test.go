@@ -14,16 +14,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// setupMiniRedis 启动一个 miniredis 实例并把它接到 database.RedisClient，返回清理函数。
+// setupMiniRedis 启动一个 miniredis 实例并把它注入 database 内部，返回清理函数。
 func setupMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { _ = client.Close() })
-	// 保存旧值，测试结束恢复，避免污染其他测试。
-	old := database.RedisClient
-	database.RedisClient = client
-	t.Cleanup(func() { database.RedisClient = old })
+	// 通过 SetTestRedisClient 注入 miniredis 客户端到 database 包的内部 redisClient
+	database.SetTestRedisClient(client)
+	t.Cleanup(func() { database.SetTestRedisClient(nil) })
 	return mr
 }
 

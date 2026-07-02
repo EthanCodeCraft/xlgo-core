@@ -16,6 +16,35 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+> 框架整体评估后的结构性修复，包含 2 CRITICAL + 12 HIGH + 6 MEDIUM 问题的修复。
+> 项目处于初级阶段，无下游用户，放心引入破坏性变更。
+
+### Breaking ⚠️
+
+- **`database.RedisClient` 不再可外部访问**：包级变量改为 unexported。所有消费者必须通过 `database.GetRedis()` 获取客户端。测试注入使用 `database.SetTestRedisClient(c)` 替代直接赋值。
+- **`xlgo.WithConfig(cfg)` 不再调用 `config.Set(cfg)`**：配置不再写入全局状态。依赖 `config.Get()` 获取注入配置的下游代码需改用 `WithConfigPath`。
+- **`App.Init()` 内部改为 `sync.Once`**：多次调用返回首次执行的结果（含错误），不再是之前的"第二次直接返回 nil"。
+
+### Fixed 🐛
+
+#### 第一轮：CRITICAL + HIGH 基金会战
+
+- **U1 UUIDShort 生成错误**（utils/uuid.go）：`uuid.New().String()[:32]` 产生的 32 字符保留了 4 个破折号（UUID 格式为 36 字符含 4 个 `-`，`[:32]` 截断末尾 4 个 hex 字符但保留破折号）。改为 `strings.ReplaceAll(uuid.New().String(), "-", "")`，现在正确生成 32 位纯十六进制字符串。
+- **M1 filterSensitiveFields 假过滤**（middleware/logger.go）：旧实现用 `strings.ReplaceAll` 在 key 后面追加 `"[FILTERED]"` 而不删除原始值，导致 `{"password":"mypass"}` → `{"password":"[FILTERED]""mypass"}` 密码仍然可见。改为编译期正则 `sensitiveFieldsRE` 匹配 `"key":"value"` 整体并替换 value 部分为 `[FILTERED]`。
+- **A1 App.Init 并发竞态**（app.go）：`a.initialized` 是普通 bool，并发 `Init()` 调用会同时通过检查导致双重初始化。改为 `sync.Once`，`doInit()` 提取为内部方法，错误通过 `a.initErr` 保存。
+- **D3/CK1 Redis 客户端访问竞态与不一致**（database/redis.go, cache/lock.go）：`database.RedisClient` 全局变量在 `Init`/`Close` 中有锁写入但可被外部无锁读取（数据竞态）；`cache/lock.go` 直接引用 `RedisClient` 而非 `GetRedis()`（绕过 RedisManager 抽象）。修复方案：`RedisClient` → unexported `redisClient`；`GetRedis()` 加入回退逻辑（优先 `DefaultRedis.Client()`，回退内部 `redisClient`）；lock.go 全部改为 `rdb := database.GetRedis()` 单次获取 + nil 检查。
+- **M2 Metrics in-flight gauge 泄漏**（middleware/metrics.go）：`httpRequestsInFlight.Inc()` 后无 `defer Dec()`，handler panic 时 gauge 永久膨胀。改为 `Inc()` 后立即 `defer Dec()`，不依赖 Recover 中间件顺序。
+- **R1 FailWithError 丢弃 Detail**（response/error.go）：`FailWithError` 直接 `writeResp(c, err.Code, err.Message, nil)` 丢弃了 `err.Detail`。改为 `resp := err.ToResponse(); writeResp(c, resp.Code, resp.Msg, resp.Data)`。
+
+### Changed 🔄
+
+- **`database.GetRedis()` 加入回退逻辑**：优先返回 `DefaultRedis.Client()`，若未初始化则回退到内部 `redisClient`（测试注入路径）。确保 `SetTestRedisClient` + `GetRedis()` 闭环。
+- **`database.SetTestRedisClient(c)` 新增**：供测试注入 mock Redis 客户端，返回旧值便于清理恢复。
+
+---
+
+## [v1.1.1] - 2026-06-28
+
 > v1.1.1 后的安全/正确性补丁，依据 `version_1.1.1_report.md` 权威缺陷清单逐项修复（13 CRITICAL + 8 HIGH）。
 
 ### Fixed 🐛

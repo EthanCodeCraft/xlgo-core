@@ -704,15 +704,25 @@ func (m *Manager) reload() error {
 	return nil
 }
 
-// Load 加载配置文件
+// Load 加载配置文件（C3.5 修复：替换前停止旧 Manager 的 watcher，防止 goroutine 泄漏）。
 func Load(configPath string) (*Config, error) {
+	if old := defaultManager.Load(); old != nil {
+		old.StopWatcher()
+	}
 	m := NewManager(configPath)
+	cfg, err := m.Load()
+	if err != nil {
+		return nil, err
+	}
 	defaultManager.Store(m)
-	return m.Load()
+	return cfg, nil
 }
 
-// LoadWithWatch 加载配置文件并启用热更新
+// LoadWithWatch 加载配置文件并启用热更新（C3.5 修复：替换前停止旧 watcher）。
 func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
+	if old := defaultManager.Load(); old != nil {
+		old.StopWatcher()
+	}
 	m := NewManager(configPath)
 	defaultManager.Store(m)
 	return m.LoadWithWatch(onChange)

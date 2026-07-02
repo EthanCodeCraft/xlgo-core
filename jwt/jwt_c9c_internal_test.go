@@ -116,20 +116,20 @@ func TestC9cCurrentManagerReflectsSwap(t *testing.T) {
 	}
 }
 
-// TestC9cDefaultJWTAliasConsistent 验证 DefaultJWT 兼容别名与 defaultManager 真实存储一致。
+// TestC9cDefaultJWTAliasConsistent 验证 GetDefaultJWT 与 defaultManager 真实存储一致。
 func TestC9cDefaultJWTAliasConsistent(t *testing.T) {
 	t.Cleanup(func() { SetDefaultJWTManager(NewJWTManager()) })
 
-	// init 后 DefaultJWT 与 currentManager 应指向同一实例
-	if DefaultJWT != currentManager() {
-		t.Fatal("DefaultJWT alias should equal currentManager after init")
+	// init 后 GetDefaultJWT 与 currentManager 应指向同一实例
+	if GetDefaultJWT() != currentManager() {
+		t.Fatal("GetDefaultJWT should equal currentManager after init")
 	}
 
 	// SetDefaultJWTManager 后同步
 	m := NewJWTManagerWithRedis(nil)
 	SetDefaultJWTManager(m)
-	if DefaultJWT != m {
-		t.Fatal("DefaultJWT alias should sync after SetDefaultJWTManager")
+	if GetDefaultJWT() != m {
+		t.Fatal("GetDefaultJWT should sync after SetDefaultJWTManager")
 	}
 	if currentManager() != m {
 		t.Fatal("currentManager should reflect SetDefaultJWTManager")

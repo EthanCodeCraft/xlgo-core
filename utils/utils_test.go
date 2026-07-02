@@ -495,6 +495,28 @@ func TestUUIDShort(t *testing.T) {
 	if len(uuid) != 32 {
 		t.Errorf("UUIDShort length = %d", len(uuid))
 	}
+	// U1 回归：确保无破折号
+	if uuid[8] == '-' || uuid[12] == '-' || uuid[16] == '-' || uuid[20] == '-' {
+		t.Errorf("UUIDShort contains dashes at unexpected positions: %s", uuid)
+	}
+}
+
+func TestUUIDShort_NoDashes(t *testing.T) {
+	// U1 回归：100 次生成全部不含破折号，长度精确 32
+	for range 100 {
+		s := utils.UUIDShort()
+		if len(s) != 32 {
+			t.Fatalf("UUIDShort length = %d, want 32", len(s))
+		}
+		for j, c := range s {
+			if c == '-' {
+				t.Fatalf("UUIDShort contains dash at position %d: %s", j, s)
+			}
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				t.Fatalf("UUIDShort non-hex char at position %d: %c in %s", j, c, s)
+			}
+		}
+	}
 }
 
 func TestUUIDValid(t *testing.T) {

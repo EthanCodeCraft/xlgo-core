@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -205,28 +206,16 @@ func shouldSkipPath(path string, cfg LoggerConfig) bool {
 }
 
 // filterSensitiveFields 过滤敏感字段（密码、token等）
+// sensitiveFieldsRE M1 修复：编译期正则，匹配 "key":"value" 整体并将 value 替换为 [FILTERED]。
+// 支持 JSON 字符串中标准转义（\" \\ \/ \b \f \n \r \t \uXXXX）。
+var sensitiveFieldsRE = regexp.MustCompile(
+	`"(password|passwd|pwd|token|access_token|refresh_token|secret|api_key|apikey|credit_card|card_number)"\s*:\s*"((?:[^"\\]|\\.)*)"`,
+)
+
+// filterSensitiveFields M1 修复后实现：将敏感字段的值替换为 [FILTERED]，完整移除原始值。
+// 对非 JSON 输入原样返回。
 func filterSensitiveFields(body []byte) string {
-	bodyStr := string(body)
-
-	// 过滤常见敏感字段（简单字符串替换）
-	sensitiveFields := []string{
-		"password", "passwd", "pwd",
-		"token", "access_token", "refresh_token",
-		"secret", "api_key", "apikey",
-		"credit_card", "card_number",
-	}
-
-	for _, field := range sensitiveFields {
-		// 检查是否包含敏感字段
-		keyPattern := `"` + field + `":`
-		if strings.Contains(bodyStr, keyPattern) {
-			// 简单替换：将值替换为 [FILTERED]
-			// 注意：这是一个简化的实现，复杂的 JSON 可能需要更精确的处理
-			bodyStr = strings.ReplaceAll(bodyStr, keyPattern, keyPattern+"\"[FILTERED]\"")
-		}
-	}
-
-	return bodyStr
+	return sensitiveFieldsRE.ReplaceAllString(string(body), `"$1":"[FILTERED]"`)
 }
 
 // LoggerForAPI API 专用日志中间件（更详细）

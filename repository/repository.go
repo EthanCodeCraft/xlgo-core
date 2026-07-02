@@ -44,7 +44,11 @@ func NewBaseRepo[T any](db *gorm.DB) *BaseRepo[T] {
 }
 
 // readConn 返回读连接：外层 ctx 事务 > 本 repo 事务 > 读写分离路由 > r.db 回退。
+// RP1 修复：r.db 为 nil 时 panic 并给出明确消息。
 func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
+	if r.db == nil {
+		panic("repository.BaseRepo: db is nil. Use NewBaseRepo with a valid *gorm.DB")
+	}
 	if tx := database.TxFromContext(ctx); tx != nil {
 		return tx.WithContext(ctx)
 	}
@@ -59,7 +63,11 @@ func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
 
 // writeConn 返回写连接：外层 ctx 事务 > 本 repo 事务 > 主库 > r.db 回退。
 // 写操作始终走主库，不路由到只读从库。
+// RP1 修复：r.db 为 nil 时 panic 并给出明确消息。
 func (r *BaseRepo[T]) writeConn(ctx context.Context) *gorm.DB {
+	if r.db == nil {
+		panic("repository.BaseRepo: db is nil. Use NewBaseRepo with a valid *gorm.DB")
+	}
 	if tx := database.TxFromContext(ctx); tx != nil {
 		return tx.WithContext(ctx)
 	}
@@ -340,20 +348,26 @@ func (r *BaseRepo[T]) ExistsWhere(ctx context.Context, query string, args ...any
 
 // ===== 软删除操作 =====
 
+// SoftDeleteColumn 返回软删除列名（RP2 修复：可被子类覆盖以适配自定义列名）。
+// 默认 "deleted_at"，与 GORM gorm.DeletedAt 的默认列名一致。
+func (r *BaseRepo[T]) SoftDeleteColumn() string {
+	return "deleted_at"
+}
+
 // Restore 恢复软删除记录
 func (r *BaseRepo[T]) Restore(ctx context.Context, id uint) error {
-	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id = ?", id).Update("deleted_at", nil).Error
+	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id = ?", id).Update(r.SoftDeleteColumn(), nil).Error
 }
 
 // RestoreBatch 批量恢复软删除记录
 func (r *BaseRepo[T]) RestoreBatch(ctx context.Context, ids []uint) error {
-	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id IN ?", ids).Update("deleted_at", nil).Error
+	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id IN ?", ids).Update(r.SoftDeleteColumn(), nil).Error
 }
 
 // FindDeleted 查询已软删除的记录
 func (r *BaseRepo[T]) FindDeleted(ctx context.Context) ([]T, error) {
 	var models []T
-	err := r.readConn(ctx).Unscoped().Where("deleted_at IS NOT NULL").Find(&models).Error
+	err := r.readConn(ctx).Unscoped().Where(r.SoftDeleteColumn() + " IS NOT NULL").Find(&models).Error
 	return models, err
 }
 

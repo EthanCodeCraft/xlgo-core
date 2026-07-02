@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"strings"
+
 	"github.com/google/uuid"
 )
 
@@ -9,9 +11,9 @@ func UUID() string {
 	return uuid.New().String()
 }
 
-// UUIDShort 生成短 UUID（无横线）
+// UUIDShort 生成短 UUID（无横线，32 个十六进制字符）
 func UUIDShort() string {
-	return uuid.New().String()[:32]
+	return strings.ReplaceAll(uuid.New().String(), "-", "")
 }
 
 // UUIDParse 解析 UUID 字符串

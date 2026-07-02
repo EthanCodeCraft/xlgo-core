@@ -191,9 +191,10 @@ var _ = map[int]string{
 	CodeBusinessRuleError: "CodeBusinessRuleError",
 }
 
-// FailWithError 使用预定义错误响应
+// FailWithError 使用预定义错误响应（M7 修复：通过 ToResponse 保留 Detail）。
 func FailWithError(c *gin.Context, err *Error) {
-	writeResp(c, err.Code, err.Message, nil)
+	resp := err.ToResponse()
+	writeResp(c, resp.Code, resp.Msg, resp.Data)
 }
 
 // FailWithDetail 使用预定义错误并添加详细信息

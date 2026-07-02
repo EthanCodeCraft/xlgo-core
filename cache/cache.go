@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/logger"
@@ -164,16 +165,25 @@ type CacheManager struct {
 	svc CacheService
 }
 
-// DefaultCache 默认缓存管理器，包级 facade 代理到它。
-var DefaultCache = NewCacheManager()
+// defaultCachePtr 全局默认缓存管理器（CK3 修复：atomic.Pointer 替代裸指针）。
+var defaultCachePtr atomic.Pointer[CacheManager]
+
+func init() {
+	defaultCachePtr.Store(NewCacheManager())
+}
 
 // NewCacheManager 创建缓存管理器实例。
 func NewCacheManager() *CacheManager { return &CacheManager{} }
 
-// SetDefaultCacheManager 提升指定 CacheManager 为全局默认。
+// GetDefaultCache 返回全局默认缓存管理器（并发安全，CK3 修复）。
+func GetDefaultCache() *CacheManager {
+	return defaultCachePtr.Load()
+}
+
+// SetDefaultCacheManager 提升指定 CacheManager 为全局默认（atomic 置换，并发安全）。
 func SetDefaultCacheManager(m *CacheManager) {
 	if m != nil {
-		DefaultCache = m
+		defaultCachePtr.Store(m)
 	}
 }
 
@@ -201,14 +211,14 @@ func (m *CacheManager) Get() CacheService {
 	return m.svc
 }
 
-// --- 包级 facade（代理到 DefaultCache，兼容存量） ---
+// --- 包级 facade（代理到 GetDefaultCache()，CK3 修复） ---
 
 // Init 初始化全局缓存实例
 func Init() {
-	DefaultCache.Init()
+	GetDefaultCache().Init()
 }
 
 // GetCache 获取全局缓存实例
 func GetCache() CacheService {
-	return DefaultCache.Get()
+	return GetDefaultCache().Get()
 }

@@ -118,19 +118,10 @@ type Manager struct {
 }
 
 // defaultManager 是全局默认 JWT 管理器的真实存储，经 atomic 读写（C9c）。
-// 历史上 DefaultJWT/tokenBlacklist 为裸包级指针，SetDefaultJWTManager 写与
-// 请求 goroutine（ParseToken/RefreshToken/InvalidateToken/IsTokenRevoked）读存在数据竞争。
 var defaultManager atomic.Pointer[Manager]
 
-// DefaultJWT 默认 JWT 管理器的兼容导出别名，指向 defaultManager 当前实例。
-// 直接读此变量非并发安全（SetDefaultJWTManager 裸写维护），仅供启动期或兼容存量代码；
-// 并发安全的访问请使用包级函数（ParseToken/RefreshToken/...）或 SetDefaultJWTManager。
-var DefaultJWT *Manager
-
 func init() {
-	m := NewJWTManager()
-	defaultManager.Store(m)
-	DefaultJWT = m
+	defaultManager.Store(NewJWTManager())
 }
 
 // currentManager 返回全局默认 JWT 管理器（atomic 读取，C9c）。
@@ -142,6 +133,12 @@ func currentManager() *Manager {
 	m := NewJWTManager()
 	defaultManager.Store(m)
 	return m
+}
+
+// GetDefaultJWT 返回全局默认 JWT 管理器（并发安全，C9c/J1 修复）。
+// 替代已删除的 DefaultJWT 包级变量。
+func GetDefaultJWT() *Manager {
+	return currentManager()
 }
 
 // currentBlacklist 返回全局默认 Manager 持有的黑名单（atomic 读取 Manager 后经 Blacklist()，C9c）。
@@ -159,15 +156,12 @@ func NewJWTManagerWithRedis(client *redis.Client) *Manager {
 	return &Manager{blacklist: NewTokenBlacklist(client)}
 }
 
-// SetDefaultJWTManager 提升指定 Manager 为全局默认。
-// 经 atomic.Pointer 原子置换真实存储（C9c），并同步维护 DefaultJWT 兼容别名。
-// 典型在启动期调用；并发请求期调用也安全（包级函数经 atomic 读取不会观察到撕裂值）。
+// SetDefaultJWTManager 提升指定 Manager 为全局默认（atomic 置换，并发安全，J1 修复）。
 func SetDefaultJWTManager(m *Manager) {
 	if m == nil {
 		return
 	}
 	defaultManager.Store(m)
-	DefaultJWT = m // 兼容别名同步（直接读 DefaultJWT 非并发安全，见其注释）
 }
 
 // Blacklist 返回 Manager 持有的黑名单实例。
