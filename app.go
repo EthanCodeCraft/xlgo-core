@@ -445,6 +445,9 @@ func (a *App) Init() error {
 		router.RegisterReadinessRoute(a.router, a.healthChecks...)
 	}
 	if a.enableMetrics {
+		// 采集中间件交给注册中心，Apply 时作为首个全局中间件装入（H8c），
+		// 覆盖所有经注册中心注册的业务路由，不依赖调用顺序。
+		a.registry.SetMetricsMiddleware(middleware.Metrics())
 		if a.metricsPath != "" {
 			router.RegisterMetricsRoute(a.router, a.metricsPath)
 		} else {

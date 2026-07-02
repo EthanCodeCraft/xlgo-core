@@ -93,8 +93,16 @@ func (e *Error) WithDetail(detail string) *Error {
 	return e
 }
 
-// ToResponse 转换为响应结构
+// ToResponse 转换为响应结构。
+// 把 Detail 放入 data.detail（若非空），保留链路细节（M7：原实现丢 Detail）。
 func (e *Error) ToResponse() Response {
+	if e.Detail != "" {
+		return Response{
+			Code: e.Code,
+			Msg:  e.Message,
+			Data: gin.H{"detail": e.Detail},
+		}
+	}
 	return Response{
 		Code: e.Code,
 		Msg:  e.Message,

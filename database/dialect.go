@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
+	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -101,7 +102,11 @@ func dialectorForDSN(driver, dsn string) gorm.Dialector {
 	if f, ok := LookupDialect(driver); ok {
 		return f(dsn)
 	}
-	// 未注册时回退到 MySQL，与 config.DSN() 的回退保持一致
+	// 未注册时回退到 MySQL，与 config.DSN() 的回退保持一致。
+	// 拼写错误的驱动名（如 "mysq"/"postgrs"）会静默回退 MySQL，导致连接错误难排查（M10），
+	// 故在此告警一次，提示用户驱动名未注册。
+	logger.Warnf("database: 驱动 %q 未注册，回退到 MySQL（已注册: %s）；若是拼写错误请在配置中修正 driver",
+		normalizeDriver(driver), strings.Join(RegisteredDialects(), ", "))
 	return mysql.Open(dsn)
 }
 

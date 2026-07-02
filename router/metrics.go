@@ -1,16 +1,16 @@
 package router
 
 import (
-	"github.com/EthanCodeCraft/xlgo-core/middleware"
-
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// RegisterMetricsRoute 注册 Prometheus 指标暴露端点与采集中间件（#18）。
+// RegisterMetricsRoute 注册 Prometheus 指标暴露端点（#18，H8c 修正）。
 //
-// 默认路径 /metrics。传入 path 可自定义。同时把 Metrics() 中间件挂到该组，
-// 这样只有业务路由被统计，/metrics 自身与 /health 等基础路由不计入。
+// 默认路径 /metrics。传入 path 可自定义。本函数仅注册暴露端点，不再用 r.Use
+// 挂采集中间件——采集中间件改由 Registry.SetMetricsMiddleware 在 Apply 内作为
+// 首个全局中间件装入，使所有经注册中心注册的业务路由都被采集，且不依赖本函数
+// 相对其他路由注册的调用顺序。/metrics 端点自身与 /health 等基础路由不经采集中间件。
 //
 // 用法：
 //
@@ -21,7 +21,6 @@ func RegisterMetricsRoute(r *gin.Engine, path ...string) {
 	if len(path) > 0 && path[0] != "" {
 		p = path[0]
 	}
-	// 指标采集中间件挂在根引擎，统计所有业务请求
-	r.Use(middleware.Metrics())
-	r.GET(p, gin.WrapH(promhttp.Handler()))
+	// 幂等注册（H8d 收尾）：重复调用跳过，避免重复路由 panic。
+	registerGETOnce(r, p, gin.WrapH(promhttp.Handler()))
 }

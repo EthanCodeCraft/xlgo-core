@@ -129,9 +129,13 @@ func createProject(name string) {
 }
 
 func makeFile(fileType, name string) {
+	// 文件名小写，但保留原分隔用于多词；标识符须为合法 Go 标识符（仅字母数字下划线）。
+	// 将连字符/空格等转为下划线后再 Title，避免 "my-thing" → "My-Thing" 生成非法标识符（M20）。
 	name = strings.ToLower(name)
+	identBase := sanitizeIdent(name)
 	caser := cases.Title(language.English)
-	nameTitle := caser.String(name)
+	nameTitle := caser.String(strings.ReplaceAll(identBase, "_", " "))
+	nameTitle = strings.ReplaceAll(nameTitle, " ", "") // 拼回 CamelCase
 
 	switch fileType {
 	case "handler":
@@ -146,6 +150,26 @@ func makeFile(fileType, name string) {
 		fmt.Printf("未知类型: %s\n", fileType)
 		fmt.Println("可用类型: handler, repository, model, service")
 	}
+}
+
+// sanitizeIdent 把 name 中的非字母数字字符替换为下划线，生成合法 Go 标识符基串（M20）。
+// 如 "my-thing" → "my_thing"，后续 Title 后得到 "MyThing"。
+func sanitizeIdent(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else if r >= 'A' && r <= 'Z' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	s := strings.Trim(b.String(), "_")
+	if s == "" {
+		return "xlgo"
+	}
+	return s
 }
 
 func createHandler(name, nameTitle string) {

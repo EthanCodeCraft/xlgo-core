@@ -1,6 +1,8 @@
 package logger
 
 import (
+	"time"
+
 	"go.uber.org/zap"
 )
 
@@ -12,23 +14,16 @@ var Field = struct {
 	Bool     func(key string, value bool) zap.Field
 	Uint     func(key string, value uint) zap.Field
 	Float64  func(key string, value float64) zap.Field
-	Duration func(key string, value interface{}) zap.Field
+	Duration func(key string, value time.Duration) zap.Field
 	Error    func(err error) zap.Field
 }{
-	String:  zap.String,
-	Int:     zap.Int,
-	Int64:   zap.Int64,
-	Bool:    zap.Bool,
-	Uint:    zap.Uint,
-	Float64: zap.Float64,
-	Duration: func(key string, value interface{}) zap.Field {
-		switch v := value.(type) {
-		case zap.Field:
-			return v
-		default:
-			return zap.Any(key, value)
-		}
-	},
+	String:   zap.String,
+	Int:      zap.Int,
+	Int64:    zap.Int64,
+	Bool:     zap.Bool,
+	Uint:     zap.Uint,
+	Float64:  zap.Float64,
+	Duration: zap.Duration,
 	Error: func(err error) zap.Field {
 		return zap.Error(err)
 	},

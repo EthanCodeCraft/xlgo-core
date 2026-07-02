@@ -92,19 +92,17 @@ func Nl2br(s string, isXhtml bool) string {
 	for i, r := range runes {
 		switch r {
 		case '\n':
-			// 检查是否是 \r\n 或 \n\r
-			if i+1 < length {
-				next := runes[i+1]
-				if (r == '\n' && next == '\r') || (r == '\r' && next == '\n') {
-					buf.WriteString(br)
-					continue
-				}
+			// \n\r（罕见顺序）作为一个换行处理；普通 \n 单独处理。
+			// （N4：原条件含 r == '\r' 半，但本 case 内 r 恒为 '\n'，该半恒假，已清理。）
+			if i+1 < length && runes[i+1] == '\r' {
+				buf.WriteString(br)
+				continue
 			}
 			buf.WriteString(br)
 		case '\r':
-			// 单独的 \r 或 \r\n 已在上面处理
+			// \r\n 由上面的 \n 分支处理（\r 在此跳过）；单独 \r 作为一个换行。
 			if i+1 < length && runes[i+1] == '\n' {
-				continue // \r\n 由 \n 处理
+				continue
 			}
 			buf.WriteString(br)
 		default:

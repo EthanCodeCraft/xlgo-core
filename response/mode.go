@@ -41,7 +41,7 @@ func statusForCode(code int) int {
 		return http.StatusForbidden
 	case CodeNotFound, CodeUserNotFound, CodeFileNotFound, CodeDataNotFound:
 		return http.StatusNotFound
-	case CodeDataConflict:
+	case CodeDataConflict, CodeDataAlreadyExists:
 		return http.StatusConflict
 	case CodeRateLimit:
 		return http.StatusTooManyRequests

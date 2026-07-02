@@ -28,9 +28,14 @@ func Recover() gin.HandlerFunc {
 					zap.String("stack", string(debug.Stack())),
 				)
 
-				// 返回错误响应
-				response.FailWithCode(c, response.CodeServerError, "服务器内部错误")
-				c.AbortWithStatus(http.StatusInternalServerError)
+				// 返回错误响应。
+				// 必须用 response.Custom 显式写 HTTP 500：FailWithCode 经 writeResp→httpStatusFor，
+				// 在默认 ModeBusiness 下对 CodeServerError 返回 200，c.JSON(200,...) 会先 flush
+				// 锁定状态，随后 AbortWithStatus(500) 因 w.Written()==true 沦为 no-op，
+				// 导致客户端收到 HTTP 200 + body code:500，网关/APM 按 status 看不到 panic。
+				// Custom 不受 Mode 影响，直接写 500 且保留 RequestID。
+				response.Custom(c, http.StatusInternalServerError, response.CodeServerError, "服务器内部错误", nil)
+				c.Abort()
 			}
 		}()
 		c.Next()
@@ -53,9 +58,9 @@ func RecoverWithDetail() gin.HandlerFunc {
 					zap.String("stack", string(debug.Stack())),
 				)
 
-				// 开发环境返回详细错误
-				response.FailWithCode(c, response.CodeServerError, fmt.Sprintf("服务器内部错误: %v", err))
-				c.AbortWithStatus(http.StatusInternalServerError)
+				// 开发环境返回详细错误。同样用 Custom 显式写 500（见 Recover 注释）。
+				response.Custom(c, http.StatusInternalServerError, response.CodeServerError, fmt.Sprintf("服务器内部错误: %v", err), nil)
+				c.Abort()
 			}
 		}()
 		c.Next()

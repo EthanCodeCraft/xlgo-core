@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 
+	"github.com/EthanCodeCraft/xlgo-core/database"
 	"gorm.io/gorm"
 )
 
@@ -20,9 +21,21 @@ type BaseRepository[T any] interface {
 	FindByIDs(ctx context.Context, ids []uint) ([]T, error)
 }
 
-// BaseRepo 基础仓库实现
+// BaseRepo 基础仓库实现。
+//
+// 连接路由契约（H6c 修复）：
+//   - 读操作经 readConn(ctx) 路由：优先 join 外层事务，否则走 database.GetDBFromContext
+//     （默认从库，支持 UseMaster/UseReplica 读写分离），DefaultManager 未初始化时回退 r.db。
+//   - 写操作经 writeConn(ctx) 路由：优先 join 外层事务，否则走主库 database.GetWriteDB()，
+//     回退 r.db。写操作不路由到从库（从库只读）。
+//   - 事务内（WithTransaction 创建的 txRepo）所有方法 join 同一事务。
+//
+// 下游典型用法 NewBaseRepo[T](database.GetDB()) 仍兼容：GetDB 返回主库，DefaultManager
+// 初始化后读操作自动路由到从库；未初始化（如单测注入 sqlite）时回退到 r.db。
 type BaseRepo[T any] struct {
 	db *gorm.DB
+	// tx 在事务内（WithTransaction）非 nil，使 txRepo 的方法 join 该事务而非另开连接/路由。
+	tx *gorm.DB
 }
 
 // NewBaseRepo 创建基础仓库
@@ -30,10 +43,39 @@ func NewBaseRepo[T any](db *gorm.DB) *BaseRepo[T] {
 	return &BaseRepo[T]{db: db}
 }
 
+// readConn 返回读连接：外层 ctx 事务 > 本 repo 事务 > 读写分离路由 > r.db 回退。
+func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
+	if tx := database.TxFromContext(ctx); tx != nil {
+		return tx.WithContext(ctx)
+	}
+	if r.tx != nil {
+		return r.tx.WithContext(ctx)
+	}
+	if gdb := database.GetDBFromContext(ctx); gdb != nil {
+		return gdb.WithContext(ctx)
+	}
+	return r.db.WithContext(ctx)
+}
+
+// writeConn 返回写连接：外层 ctx 事务 > 本 repo 事务 > 主库 > r.db 回退。
+// 写操作始终走主库，不路由到只读从库。
+func (r *BaseRepo[T]) writeConn(ctx context.Context) *gorm.DB {
+	if tx := database.TxFromContext(ctx); tx != nil {
+		return tx.WithContext(ctx)
+	}
+	if r.tx != nil {
+		return r.tx.WithContext(ctx)
+	}
+	if mdb := database.GetWriteDB(); mdb != nil {
+		return mdb.WithContext(ctx)
+	}
+	return r.db.WithContext(ctx)
+}
+
 // FindByID 根据 ID 查询
 func (r *BaseRepo[T]) FindByID(ctx context.Context, id uint) (*T, error) {
 	var model T
-	err := r.db.WithContext(ctx).First(&model, id).Error
+	err := r.readConn(ctx).First(&model, id).Error
 	if err != nil {
 		return nil, err
 	}
@@ -42,54 +84,82 @@ func (r *BaseRepo[T]) FindByID(ctx context.Context, id uint) (*T, error) {
 
 // Create 创建记录
 func (r *BaseRepo[T]) Create(ctx context.Context, model *T) error {
-	return r.db.WithContext(ctx).Create(model).Error
+	return r.writeConn(ctx).Create(model).Error
 }
 
-// Update 更新记录
+// Update 更新记录（全列覆写，基于 Save）。
+//
+// 注意（H6a）：Save 会写入所有字段（包括零值），无法区分"未设置"与"清零"，
+// 且可能用零值覆盖并发更新。需要局部更新（仅更新非零字段或指定字段）请用 UpdateFields。
 func (r *BaseRepo[T]) Update(ctx context.Context, model *T) error {
-	return r.db.WithContext(ctx).Save(model).Error
+	return r.writeConn(ctx).Save(model).Error
 }
 
-// Delete 删除记录（软删除）
+// UpdateFields 局部更新（H6a）：基于 gorm.Updates，仅更新非零字段（struct）或指定字段（map）。
+//
+//   - 传 struct：仅更新非零字段（零值被忽略，避免覆盖）。
+//   - 传 map[string]any：更新指定字段（可显式置零）。
+//
+// 示例：
+//
+//	repo.UpdateFields(ctx, &User{Name: "new"}, "name")        // 仅更新 name
+//	repo.UpdateFields(ctx, map[string]any{"status": 0}, "id = ?", id) // 显式置零
+func (r *BaseRepo[T]) UpdateFields(ctx context.Context, model any, conds ...any) error {
+	db := r.writeConn(ctx).Model(new(T))
+	if len(conds) > 0 {
+		db = db.Where(conds[0], conds[1:]...)
+	}
+	return db.Updates(model).Error
+}
+
+// Delete 删除记录。
+//
+// 行为契约（H6b）：若 T 内嵌 gorm.DeletedAt（或 gorm.Model），为软删除；
+// 否则为硬删除（泛型类型约束无法在编译期强制）。需硬删用 HardDelete，需恢复用 Restore。
 func (r *BaseRepo[T]) Delete(ctx context.Context, id uint) error {
-	return r.db.WithContext(ctx).Delete(new(T), id).Error
+	return r.writeConn(ctx).Delete(new(T), id).Error
 }
 
 // HardDelete 硬删除记录（物理删除）
 func (r *BaseRepo[T]) HardDelete(ctx context.Context, id uint) error {
-	return r.db.WithContext(ctx).Unscoped().Delete(new(T), id).Error
+	return r.writeConn(ctx).Unscoped().Delete(new(T), id).Error
 }
 
 // FindByIDs 批量查询
 func (r *BaseRepo[T]) FindByIDs(ctx context.Context, ids []uint) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Where("id IN ?", ids).Find(&models).Error
+	err := r.readConn(ctx).Where("id IN ?", ids).Find(&models).Error
 	return models, err
 }
 
 // FindAll 查询所有记录
 func (r *BaseRepo[T]) FindAll(ctx context.Context) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Find(&models).Error
+	err := r.readConn(ctx).Find(&models).Error
 	return models, err
 }
 
 // Count 统计数量
 func (r *BaseRepo[T]) Count(ctx context.Context) (int64, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(new(T)).Count(&count).Error
+	err := r.readConn(ctx).Model(new(T)).Count(&count).Error
 	return count, err
 }
 
 // CountWhere 条件统计
 func (r *BaseRepo[T]) CountWhere(ctx context.Context, query string, args ...any) (int64, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(new(T)).Where(query, args...).Count(&count).Error
+	err := r.readConn(ctx).Model(new(T)).Where(query, args...).Count(&count).Error
 	return count, err
 }
 
-// GetDB 获取数据库实例
+// GetDB 获取数据库实例。
+// 事务内（txRepo）返回当前事务的 tx；否则返回构造时注入的 db。
+// 注意：此方法无 ctx 参数，不参与读写分离路由；需要路由请用具体方法（FindByID/FindPage 等）。
 func (r *BaseRepo[T]) GetDB() *gorm.DB {
+	if r.tx != nil {
+		return r.tx
+	}
 	return r.db
 }
 
@@ -98,7 +168,7 @@ func (r *BaseRepo[T]) GetDB() *gorm.DB {
 // FindOne 条件查询单条记录
 func (r *BaseRepo[T]) FindOne(ctx context.Context, query string, args ...any) (*T, error) {
 	var model T
-	err := r.db.WithContext(ctx).Where(query, args...).First(&model).Error
+	err := r.readConn(ctx).Where(query, args...).First(&model).Error
 	if err != nil {
 		return nil, err
 	}
@@ -108,21 +178,21 @@ func (r *BaseRepo[T]) FindOne(ctx context.Context, query string, args ...any) (*
 // FindWhere 条件查询多条记录
 func (r *BaseRepo[T]) FindWhere(ctx context.Context, query string, args ...any) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Where(query, args...).Find(&models).Error
+	err := r.readConn(ctx).Where(query, args...).Find(&models).Error
 	return models, err
 }
 
 // FindWhereOrdered 条件查询并排序
 func (r *BaseRepo[T]) FindWhereOrdered(ctx context.Context, query string, args []any, order string) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Where(query, args...).Order(order).Find(&models).Error
+	err := r.readConn(ctx).Where(query, args...).Order(order).Find(&models).Error
 	return models, err
 }
 
 // FindOrdered 查询并排序
 func (r *BaseRepo[T]) FindOrdered(ctx context.Context, order string, limit int) ([]T, error) {
 	var models []T
-	query := r.db.WithContext(ctx).Order(order)
+	query := r.readConn(ctx).Order(order)
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
@@ -133,7 +203,7 @@ func (r *BaseRepo[T]) FindOrdered(ctx context.Context, order string, limit int) 
 // FindLimited 查询指定数量记录
 func (r *BaseRepo[T]) FindLimited(ctx context.Context, limit int) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Limit(limit).Find(&models).Error
+	err := r.readConn(ctx).Limit(limit).Find(&models).Error
 	return models, err
 }
 
@@ -147,133 +217,109 @@ type PageResult[T any] struct {
 	PageSize int   `json:"page_size"`
 }
 
-// FindPage 分页查询
+// pageOffset 计算 (page-1)*pageSize，负值归零。
+func pageOffset(page, pageSize int) int {
+	offset := (page - 1) * pageSize
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
+// FindPage 分页查询。
+//
+// count 与 list 包进单事务（H6d），保证 total 与 items 在同一快照下一致，
+// 避免高并发下两条独立语句间数据变动致 total/items 不一致。
+//
+// 若 ctx 已携带外层事务（database.WithTx），readConn 返回该 tx，此处 .Transaction
+// 在其上开 savepoint（gorm 行为），count+list 仍同快照一致；无外层事务则开独立读事务。
 func (r *BaseRepo[T]) FindPage(ctx context.Context, page, pageSize int) (*PageResult[T], error) {
 	var models []T
 	var total int64
-
-	// 统计总数
-	if err := r.db.WithContext(ctx).Model(new(T)).Count(&total).Error; err != nil {
+	offset := pageOffset(page, pageSize)
+	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
+		if e := tx.Model(new(T)).Count(&total).Error; e != nil {
+			return e
+		}
+		return tx.Offset(offset).Limit(pageSize).Find(&models).Error
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	// 计算偏移量
-	offset := (page - 1) * pageSize
-	if offset < 0 {
-		offset = 0
-	}
-
-	// 查询数据
-	if err := r.db.WithContext(ctx).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
-		return nil, err
-	}
-
-	return &PageResult[T]{
-		Items:    models,
-		Total:    total,
-		Page:     page,
-		PageSize: pageSize,
-	}, nil
+	return &PageResult[T]{Items: models, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
-// FindPageOrdered 分页查询并排序
+// FindPageOrdered 分页查询并排序（count+list 单事务，H6d）
 func (r *BaseRepo[T]) FindPageOrdered(ctx context.Context, page, pageSize int, order string) (*PageResult[T], error) {
 	var models []T
 	var total int64
-
-	if err := r.db.WithContext(ctx).Model(new(T)).Count(&total).Error; err != nil {
+	offset := pageOffset(page, pageSize)
+	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
+		if e := tx.Model(new(T)).Count(&total).Error; e != nil {
+			return e
+		}
+		return tx.Order(order).Offset(offset).Limit(pageSize).Find(&models).Error
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	offset := (page - 1) * pageSize
-	if offset < 0 {
-		offset = 0
-	}
-
-	if err := r.db.WithContext(ctx).Order(order).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
-		return nil, err
-	}
-
-	return &PageResult[T]{
-		Items:    models,
-		Total:    total,
-		Page:     page,
-		PageSize: pageSize,
-	}, nil
+	return &PageResult[T]{Items: models, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
-// FindPageWhere 条件分页查询
+// FindPageWhere 条件分页查询（count+list 单事务，H6d）
 func (r *BaseRepo[T]) FindPageWhere(ctx context.Context, page, pageSize int, query string, args ...any) (*PageResult[T], error) {
 	var models []T
 	var total int64
-
-	if err := r.db.WithContext(ctx).Model(new(T)).Where(query, args...).Count(&total).Error; err != nil {
+	offset := pageOffset(page, pageSize)
+	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
+		if e := tx.Model(new(T)).Where(query, args...).Count(&total).Error; e != nil {
+			return e
+		}
+		return tx.Where(query, args...).Offset(offset).Limit(pageSize).Find(&models).Error
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	offset := (page - 1) * pageSize
-	if offset < 0 {
-		offset = 0
-	}
-
-	if err := r.db.WithContext(ctx).Where(query, args...).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
-		return nil, err
-	}
-
-	return &PageResult[T]{
-		Items:    models,
-		Total:    total,
-		Page:     page,
-		PageSize: pageSize,
-	}, nil
+	return &PageResult[T]{Items: models, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
-// FindPageWhereOrdered 条件分页查询并排序
+// FindPageWhereOrdered 条件分页查询并排序（count+list 单事务，H6d）
 func (r *BaseRepo[T]) FindPageWhereOrdered(ctx context.Context, page, pageSize int, query string, args []any, order string) (*PageResult[T], error) {
 	var models []T
 	var total int64
-
-	if err := r.db.WithContext(ctx).Model(new(T)).Where(query, args...).Count(&total).Error; err != nil {
+	offset := pageOffset(page, pageSize)
+	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
+		if e := tx.Model(new(T)).Where(query, args...).Count(&total).Error; e != nil {
+			return e
+		}
+		return tx.Where(query, args...).Order(order).Offset(offset).Limit(pageSize).Find(&models).Error
+	})
+	if err != nil {
 		return nil, err
 	}
-
-	offset := (page - 1) * pageSize
-	if offset < 0 {
-		offset = 0
-	}
-
-	if err := r.db.WithContext(ctx).Where(query, args...).Order(order).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
-		return nil, err
-	}
-
-	return &PageResult[T]{
-		Items:    models,
-		Total:    total,
-		Page:     page,
-		PageSize: pageSize,
-	}, nil
+	return &PageResult[T]{Items: models, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
 // ===== 批量操作 =====
 
 // CreateBatch 批量创建
 func (r *BaseRepo[T]) CreateBatch(ctx context.Context, models []T) error {
-	return r.db.WithContext(ctx).Create(models).Error
+	return r.writeConn(ctx).Create(models).Error
 }
 
 // UpdateBatch 批量更新（指定字段）
 func (r *BaseRepo[T]) UpdateBatch(ctx context.Context, ids []uint, field string, value any) error {
-	return r.db.WithContext(ctx).Model(new(T)).Where("id IN ?", ids).Update(field, value).Error
+	return r.writeConn(ctx).Model(new(T)).Where("id IN ?", ids).Update(field, value).Error
 }
 
 // DeleteBatch 批量删除
 func (r *BaseRepo[T]) DeleteBatch(ctx context.Context, ids []uint) error {
-	return r.db.WithContext(ctx).Delete(new(T), ids).Error
+	return r.writeConn(ctx).Delete(new(T), ids).Error
 }
 
 // HardDeleteBatch 批量硬删除
 func (r *BaseRepo[T]) HardDeleteBatch(ctx context.Context, ids []uint) error {
-	return r.db.WithContext(ctx).Unscoped().Delete(new(T), ids).Error
+	return r.writeConn(ctx).Unscoped().Delete(new(T), ids).Error
 }
 
 // ===== 存在性检查 =====
@@ -281,14 +327,14 @@ func (r *BaseRepo[T]) HardDeleteBatch(ctx context.Context, ids []uint) error {
 // Exists 检查是否存在
 func (r *BaseRepo[T]) Exists(ctx context.Context, id uint) (bool, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(new(T)).Where("id = ?", id).Count(&count).Error
+	err := r.readConn(ctx).Model(new(T)).Where("id = ?", id).Count(&count).Error
 	return count > 0, err
 }
 
 // ExistsWhere 条件检查是否存在
 func (r *BaseRepo[T]) ExistsWhere(ctx context.Context, query string, args ...any) (bool, error) {
 	var count int64
-	err := r.db.WithContext(ctx).Model(new(T)).Where(query, args...).Limit(1).Count(&count).Error
+	err := r.readConn(ctx).Model(new(T)).Where(query, args...).Limit(1).Count(&count).Error
 	return count > 0, err
 }
 
@@ -296,39 +342,62 @@ func (r *BaseRepo[T]) ExistsWhere(ctx context.Context, query string, args ...any
 
 // Restore 恢复软删除记录
 func (r *BaseRepo[T]) Restore(ctx context.Context, id uint) error {
-	return r.db.WithContext(ctx).Model(new(T)).Unscoped().Where("id = ?", id).Update("deleted_at", nil).Error
+	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id = ?", id).Update("deleted_at", nil).Error
 }
 
 // RestoreBatch 批量恢复软删除记录
 func (r *BaseRepo[T]) RestoreBatch(ctx context.Context, ids []uint) error {
-	return r.db.WithContext(ctx).Model(new(T)).Unscoped().Where("id IN ?", ids).Update("deleted_at", nil).Error
+	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id IN ?", ids).Update("deleted_at", nil).Error
 }
 
 // FindDeleted 查询已软删除的记录
 func (r *BaseRepo[T]) FindDeleted(ctx context.Context) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Unscoped().Where("deleted_at IS NOT NULL").Find(&models).Error
+	err := r.readConn(ctx).Unscoped().Where("deleted_at IS NOT NULL").Find(&models).Error
 	return models, err
 }
 
 // FindAllWithDeleted 查询所有记录（包括软删除）
 func (r *BaseRepo[T]) FindAllWithDeleted(ctx context.Context) ([]T, error) {
 	var models []T
-	err := r.db.WithContext(ctx).Unscoped().Find(&models).Error
+	err := r.readConn(ctx).Unscoped().Find(&models).Error
 	return models, err
 }
 
 // ===== 事务支持 =====
 
-// WithTransaction 在事务中执行操作
+// WithTransaction 在事务中执行操作。
+//
+// fn 收到的 txRepo 处于事务内，其所有方法（FindByID/Create/Update/...）自动 join 该事务，
+// 不再路由到主从库（H6c）。事务在主库上开启。
+//
+// 跨 repo / 跨层 join：若 fn 内需调用其它 repo 或 database 层方法参与同一事务，
+// 用 database.WithTx(ctx, tx) 把事务注入 ctx 后传递：
+//
+//	return repo.WithTransaction(ctx, func(txRepo *BaseRepo[T]) error {
+//	    if err := txRepo.Create(ctx, a); err != nil { return err }
+//	    // 另一个 repo 也加入同一事务：
+//	    ctx2 := database.WithTx(ctx, txRepo.GetDB())
+//	    return otherRepo.Update(ctx2, b)
+//	})
+//
+// 注：fn 内捕获的 ctx 不会自动携带 tx；仅 txRepo 的方法 join 事务。
 func (r *BaseRepo[T]) WithTransaction(ctx context.Context, fn func(txRepo *BaseRepo[T]) error) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		txRepo := NewBaseRepo[T](tx)
+	return r.writeConn(ctx).Transaction(func(tx *gorm.DB) error {
+		txRepo := &BaseRepo[T]{db: r.db, tx: tx}
 		return fn(txRepo)
 	})
 }
 
 // ===== QueryBuilder 链式查询 =====
+//
+// QueryBuilder 为单次使用、非并发安全（H6e）：链式方法 Where/Or/Order/Limit/Offset 会
+// mutate qb.db，禁止跨 goroutine 共用同一实例或多次终结调用复用累积条件。
+// 终结方法（Find/First/Count/Page）基于 Session 克隆，不污染 qb.db；Count 额外剥离
+// Limit/Offset 避免残留分页条件截断统计。
+//
+// 路由：QueryBuilder 查询经构造时注入的 db（通常主库），不参与读写分离路由；
+// 需读写分离请用具体方法（FindPage/FindWhere 等）。
 
 // QueryBuilder 链式查询构建器
 type QueryBuilder[T any] struct {
@@ -372,44 +441,52 @@ func (qb *QueryBuilder[T]) Offset(offset int) *QueryBuilder[T] {
 	return qb
 }
 
+// clone 返回 qb.db 的 Session 克隆，确保终结方法不污染 qb.db（H6e）。
+func (qb *QueryBuilder[T]) clone() *gorm.DB {
+	return qb.db.Session(&gorm.Session{})
+}
+
 // Find 执行查询
 func (qb *QueryBuilder[T]) Find(ctx context.Context) ([]T, error) {
 	var models []T
-	err := qb.db.WithContext(ctx).Find(&models).Error
+	err := qb.clone().WithContext(ctx).Find(&models).Error
 	return models, err
 }
 
 // First 执行查询并返回第一条
 func (qb *QueryBuilder[T]) First(ctx context.Context) (*T, error) {
 	var model T
-	err := qb.db.WithContext(ctx).First(&model).Error
+	err := qb.clone().WithContext(ctx).First(&model).Error
 	if err != nil {
 		return nil, err
 	}
 	return &model, nil
 }
 
-// Count 执行统计
+// Count 执行统计。
+// 克隆并剥离 Limit/Offset（H6e），避免先前 Limit()/Offset() 残留截断统计行数。
 func (qb *QueryBuilder[T]) Count(ctx context.Context) (int64, error) {
 	var count int64
-	err := qb.db.WithContext(ctx).Count(&count).Error
+	err := qb.clone().Limit(-1).Offset(-1).WithContext(ctx).Count(&count).Error
 	return count, err
 }
 
-// Page 执行分页查询
+// Page 执行分页查询。
+// count 与 list 基于同一 Session 克隆，count 剥离 Limit/Offset（H6e）。
+// 注意：与 FindPage 不同，Page 的 count+list 不包单事务（QueryBuilder 为轻量构建器）；
+// 需要 total/items 快照一致请用 BaseRepo.FindPage。
 func (qb *QueryBuilder[T]) Page(ctx context.Context, page, pageSize int) (*PageResult[T], error) {
 	var models []T
 	var total int64
 
-	// 复制 query 用于统计（避免影响原查询）
-	// 清除残留的 Limit/Offset，否则统计行数会被截断（GORM 中 Limit(-1)/Offset(-1) 表示移除该条件）
-	countDB := qb.db.Session(&gorm.Session{}).Limit(-1).Offset(-1)
+	// count 克隆并剥离 Limit/Offset
+	countDB := qb.clone().Limit(-1).Offset(-1)
 	if err := countDB.WithContext(ctx).Count(&total).Error; err != nil {
 		return nil, err
 	}
 
-	offset := (page - 1) * pageSize
-	if err := qb.db.WithContext(ctx).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
+	offset := pageOffset(page, pageSize)
+	if err := qb.clone().WithContext(ctx).Offset(offset).Limit(pageSize).Find(&models).Error; err != nil {
 		return nil, err
 	}
 

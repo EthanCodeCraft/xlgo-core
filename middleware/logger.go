@@ -44,6 +44,10 @@ func Logger() gin.HandlerFunc {
 
 // LoggerWithConfig 使用自定义配置的日志中间件
 func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
+	// 统一封顶：MaxBodyLength<=0 时回退默认值，确保请求/响应 body 捕获均有上限（防 OOM）
+	if cfg.MaxBodyLength <= 0 {
+		cfg.MaxBodyLength = DefaultLoggerConfig.MaxBodyLength
+	}
 	return func(c *gin.Context) {
 		// 检查是否跳过此路径
 		path := c.Request.URL.Path
@@ -57,26 +61,17 @@ func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
 		// 记录请求体（可选）
 		var requestBody []byte
 		if cfg.LogRequestBody && c.Request.Body != nil {
-			requestBody, _ = io.ReadAll(c.Request.Body)
-			// 恢复请求体供后续处理
-			c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
-			// 限制记录长度
-			if len(requestBody) > cfg.MaxBodyLength {
-				requestBody = requestBody[:cfg.MaxBodyLength]
-			}
+			requestBody = readBodyBounded(c, cfg.MaxBodyLength)
 		}
 
 		// 记录响应体（可选）
 		var responseBody []byte
 		if cfg.LogResponseBody {
-			// 使用 ResponseWriter 包装器捕获响应体
-			blw := &bodyLogWriter{body: bytes.NewBufferString(""), ResponseWriter: c.Writer}
+			// 使用 ResponseWriter 包装器捕获响应体（缓冲区封顶，防止大响应 OOM）
+			blw := &bodyLogWriter{body: bytes.NewBufferString(""), maxLen: cfg.MaxBodyLength, ResponseWriter: c.Writer}
 			c.Writer = blw
 			c.Next()
 			responseBody = blw.body.Bytes()
-			if len(responseBody) > cfg.MaxBodyLength {
-				responseBody = responseBody[:cfg.MaxBodyLength]
-			}
 		} else {
 			c.Next()
 		}
@@ -135,21 +130,58 @@ func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
 	}
 }
 
+// readBodyBounded 读取请求体用于日志记录，封顶 maxLen 字节以防 OOM。
+//
+// 仅向内存读入最多 maxLen+1 字节（+1 用于检测截断），其余部分不读入内存；
+// 通过 io.MultiReader 把「已读前缀 + 原始 body 剩余」复原为 c.Request.Body，
+// 因此下游处理器仍能拿到完整请求体。返回的日志副本截断为 maxLen。
+func readBodyBounded(c *gin.Context, maxLen int) []byte {
+	if maxLen <= 0 {
+		maxLen = DefaultLoggerConfig.MaxBodyLength
+	}
+	// io.ReadAll 永远返回非 nil 切片（即使出错也带已读部分）。LimitReader 封顶至 maxLen+1 字节。
+	read, _ := io.ReadAll(io.LimitReader(c.Request.Body, int64(maxLen)+1))
+	// 复原完整请求体供后续处理：已读前缀 + 原始 body 剩余部分（出错时保留已读字节，下游可重试读取剩余）
+	c.Request.Body = io.NopCloser(io.MultiReader(bytes.NewReader(read), c.Request.Body))
+	// 日志副本截断到 maxLen
+	if len(read) > maxLen {
+		return read[:maxLen]
+	}
+	return read
+}
+
 // bodyLogWriter 响应体记录包装器
 type bodyLogWriter struct {
 	gin.ResponseWriter
-	body *bytes.Buffer
+	body   *bytes.Buffer
+	maxLen int // 缓冲区上限（字节），<=0 表示不限制
 }
 
-// Write 捕获响应体
-func (w *bodyLogWriter) Write(b []byte) (int, error) {
+// appendBounded 向缓冲区追加字节，但不超过 maxLen 上限，防止大响应 OOM。
+func (w *bodyLogWriter) appendBounded(b []byte) {
+	if w.maxLen <= 0 {
+		w.body.Write(b)
+		return
+	}
+	remaining := w.maxLen - w.body.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(b) > remaining {
+		b = b[:remaining]
+	}
 	w.body.Write(b)
+}
+
+// Write 捕获响应体（缓冲区封顶，完整响应仍写入下游 ResponseWriter）
+func (w *bodyLogWriter) Write(b []byte) (int, error) {
+	w.appendBounded(b)
 	return w.ResponseWriter.Write(b)
 }
 
 // WriteString 捕获字符串响应
 func (w *bodyLogWriter) WriteString(s string) (int, error) {
-	w.body.WriteString(s)
+	w.appendBounded([]byte(s))
 	return w.ResponseWriter.WriteString(s)
 }
 

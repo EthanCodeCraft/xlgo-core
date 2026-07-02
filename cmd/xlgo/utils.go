@@ -21,6 +21,12 @@ func writeFile(path, content string) {
 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
+	if err == nil {
+		return true
+	}
+	// 仅当"不存在"才返回 false；权限错误等其它错误视为"可能存在/不可覆写"，
+	// 避免把无权限访问的路径误判为可创建（M20：原 !os.IsNotExist 把权限错误当存在，
+	// 反而安全；但语义模糊，显式区分更清晰）。
 	return !os.IsNotExist(err)
 }
 

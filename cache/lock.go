@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/database"
@@ -11,12 +12,32 @@ import (
 
 // 分布式锁错误
 var (
-	ErrLockNotHeld    = errors.New("锁未被当前客户端持有")
-	ErrLockExpired    = errors.New("锁已过期")
-	ErrRedisNotReady  = errors.New("Redis 未初始化")
+	ErrLockNotHeld   = errors.New("锁未被当前客户端持有")
+	ErrLockExpired   = errors.New("锁已过期")
+	ErrRedisNotReady = errors.New("Redis 未初始化")
+	// ErrLockUnexpectedResult Lua 脚本返回了非预期的结果类型（C1b：裸类型断言防护）。
+	ErrLockUnexpectedResult = errors.New("锁脚本返回非预期结果")
 )
 
-// LockToken 锁令牌（用于安全释放锁）
+// toInt64 将 Lua 脚本返回值安全断言为 int64（C1b：禁止裸断言 panic）。
+// go-redis 对整数返回 int64，但 nil/错误响应下可能为其他类型。
+func toInt64(v any) (int64, error) {
+	n, ok := v.(int64)
+	if !ok {
+		return 0, fmt.Errorf("脚本返回类型 %T: %w", v, ErrLockUnexpectedResult)
+	}
+	return n, nil
+}
+
+// LockToken 锁令牌（用于安全释放锁）。
+//
+// 安全说明（C1d 设计局限）：Token 是随机 UUID（非单调递增的 fencing token）。
+// 本实现基于 Redis SET PX + Lua CAS，保证"持有者才能解锁/续期"，但**无法防 TTL 到期后的
+// 双 worker 并发**：若 worker A 因 GC/网络停滞超过 TTL，锁过期后 worker B 获得锁，
+// A 恢复后仍可能写过期数据。完整的 fencing token 防护需：① 用 Redis INCR 生成单调 token，
+// ② 下游存储层（DB/外部服务）记录已见最大 token 并拒绝旧 token 写入。
+// 框架无法单方面保证②，需下游配合，故本类型仅提供 UUID token。对 TTL 到期敏感的场景，
+// 请确保 ttl >> 业务最长执行时间，或下游实现 fencing token 校验。
 type LockToken struct {
 	Key   string // 锁的键名
 	Token string // 锁的唯一标识（UUID）
@@ -73,7 +94,11 @@ func NewLock(ctx context.Context, key string, ttl time.Duration) (*LockToken, er
 		return nil, err
 	}
 
-	if result.(int64) == 1 {
+	n, err := toInt64(result)
+	if err != nil {
+		return nil, err
+	}
+	if n == 1 {
 		return &LockToken{Key: key, Token: token}, nil
 	}
 
@@ -105,7 +130,11 @@ func Unlock(ctx context.Context, token *LockToken) error {
 		return err
 	}
 
-	if result.(int64) == 0 {
+	n, err := toInt64(result)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return ErrLockNotHeld
 	}
 
@@ -139,14 +168,18 @@ func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error 
 		return err
 	}
 
-	if result.(int64) == 0 {
+	n, err := toInt64(result)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return ErrLockNotHeld
 	}
 
 	return nil
 }
 
-// TryLock 尝试获取锁，失败时等待重试
+// TryLock 尝试获取锁，失败时等待重试。重试等待响应 ctx 取消（C1c 修复）。
 func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval time.Duration, maxRetry int) (*LockToken, error) {
 	for i := 0; i < maxRetry; i++ {
 		token, err := NewLock(ctx, key, ttl)
@@ -156,14 +189,22 @@ func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval t
 		if token != nil {
 			return token, nil
 		}
-		time.Sleep(retryInterval)
+		// 响应 ctx 取消，避免最长阻塞 maxRetry*retryInterval（C1c：禁止 time.Sleep 无视 ctx）。
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryInterval):
+		}
 	}
 	return nil, nil
 }
 
-// WithLock 使用分布式锁执行函数（自动管理锁）
+// WithLock 使用分布式锁执行函数（自动管理锁）。
 // 参数: key 锁名称，ttl 锁定时长，fn 业务函数
-// 注意: 如果任务执行时间超过 ttl，需要设置更长的 ttl 或使用 WithLockAutoExtend
+// 注意: 如果任务执行时间超过 ttl，需要设置更长的 ttl 或使用 WithLockAutoExtend。
+//
+// 解锁用独立 Background ctx（C1a 一致性修复）：fn 返回或 panic 后，原 ctx 可能已被
+// 调用方取消，用其解锁会失败导致锁泄漏到 TTL。fn panic 时 defer 也保证解锁执行。
 func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() error) error {
 	token, err := NewLock(ctx, key, ttl)
 	if err != nil {
@@ -172,13 +213,23 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 	if token == nil {
 		return nil // 未获取到锁，跳过执行
 	}
-	defer Unlock(ctx, token)
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = Unlock(unlockCtx, token)
+	}()
 
 	return fn()
 }
 
-// WithLockAutoExtend 使用分布式锁执行函数（自动续期）
+// WithLockAutoExtend 使用分布式锁执行函数（自动续期）。
 // 参数: key 锁名称，initialTTL 初始锁定时长，extendInterval 续期间隔，fn 业务函数
+//
+// 并发安全说明（C1a 修复）：续期 goroutine 与父用"父关停 + 子 ack"双 channel 协调——
+// 父用 close(stop) 通知子退出（close 由唯一所有者执行，安全），子用 close(finished) ack。
+// 避免旧实现 done 无缓冲 + 子 defer close(done) + 父 done<-struct{}{} 的 send-on-closed panic
+// （ctx 取消或 ExtendLock 失败时 done 已 closed，父再 send 即 panic，Unlock 不执行、锁泄漏到 TTL）。
+// Unlock 用 context.Background() 派生超时，避免原 ctx 已取消致 Unlock 失败再泄漏。
 func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duration, extendInterval time.Duration, fn func() error) error {
 	token, err := NewLock(ctx, key, initialTTL)
 	if err != nil {
@@ -188,10 +239,12 @@ func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duratio
 		return nil // 未获取到锁，跳过执行
 	}
 
-	// 启动续期协程
-	done := make(chan struct{})
+	// 父关停信号（仅父 close）与子 ack 信号（仅子 close）。
+	stop := make(chan struct{})
+	finished := make(chan struct{})
+
 	go func() {
-		defer close(done)
+		defer close(finished) // 子退出时 ack，父等待 finished
 		ticker := time.NewTicker(extendInterval)
 		defer ticker.Stop()
 
@@ -199,23 +252,29 @@ func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duratio
 			select {
 			case <-ctx.Done():
 				return
-			case <-done:
+			case <-stop:
 				return
 			case <-ticker.C:
-				// 续期锁（每次续期为 initialTTL）
+				// 续期锁（每次续期为 initialTTL）。续期失败则停止续期，fn 应尽快结束。
 				if err := ExtendLock(ctx, token, initialTTL); err != nil {
-					return // 续期失败，停止续期
+					return
 				}
 			}
 		}
 	}()
 
-	// 执行业务函数
-	err = fn()
+	// defer 兜底：fn panic 时也要停止续期 goroutine 并释放锁（C1a panic 路径修复）。
+	// 无 defer 时 fn panic 会导致 close(stop) 不执行 → 续期 goroutine 永久泄漏，且 Unlock 不执行 → 锁泄漏到 TTL。
+	defer func() {
+		close(stop)
+		<-finished
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = Unlock(unlockCtx, token)
+	}()
 
-	// 停止续期并释放锁
-	done <- struct{}{}
-	Unlock(ctx, token)
+	// 执行业务函数。
+	err = fn()
 
 	return err
 }

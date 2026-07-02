@@ -7,6 +7,13 @@ import (
 	"path/filepath"
 )
 
+// 本文件提供通用本地文件操作工具（读/写/复制/追加/存在性/删除）。
+//
+// ⚠️ 安全说明（M3）：这些函数直接操作调用方传入的路径，不做路径穿越校验。
+// 若路径可能来自不可信输入（用户上传文件名、URL 参数等），调用方必须自行净化
+// （如 filepath.Clean + 前缀锚定），否则存在任意文件读/写/删风险。
+// 框架自身的不可信文件处理（storage 上传/下载）已在 storage 包内做穿越防护（C4）。
+
 // FileExists 检查文件是否存在
 func FileExists(path string) bool {
 	_, err := os.Stat(path)

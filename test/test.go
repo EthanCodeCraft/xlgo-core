@@ -3,6 +3,8 @@ package test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,7 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// SetupRouter 创建测试路由
+// SetupRouter 创建测试路由。
+//
+// 刻意返回裸 gin.New()（N3 文档化）：不含框架中间件（RequestID/Recover/超时等），
+// 让测试方完全控制中间件链。需要框架中间件的集成测试应直接构造 xlgo.App 或手动 Use。
 func SetupRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	return gin.New()
@@ -280,7 +285,12 @@ func (m *MockCache) Clear() {
 	m.data = make(map[string][]byte)
 }
 
-// MockStorage 模拟存储
+// MockStorage 模拟存储。
+//
+// 注意（N3）：本 mock 与真实 storage 的签名已对齐——
+//   - Upload(file *multipart.FileHeader, subdir string) 对应 storage.Upload
+//   - UploadFromBytes(data []byte, filename, subdir string) 对应 storage.UploadFromBytes
+// 真实 storage 无导出接口，此 mock 仅供测试手写注入，不强制实现接口。
 type MockStorage struct {
 	files map[string][]byte
 	urls  map[string]string
@@ -294,9 +304,25 @@ func NewMockStorage() *MockStorage {
 	}
 }
 
-// Upload 模拟上传
-func (m *MockStorage) Upload(data []byte, filename string) (string, error) {
-	path := "/mock/" + filename
+// Upload 模拟上传（签名对齐 storage.Upload）。
+func (m *MockStorage) Upload(file *multipart.FileHeader, subdir string) (string, error) {
+	data, err := file.Open()
+	if err != nil {
+		return "", err
+	}
+	defer data.Close()
+	b, err := io.ReadAll(data)
+	if err != nil {
+		return "", err
+	}
+	path := "/mock/" + subdir + "/" + file.Filename
+	m.files[path] = b
+	return path, nil
+}
+
+// UploadFromBytes 模拟从字节上传（签名对齐 storage.UploadFromBytes）。
+func (m *MockStorage) UploadFromBytes(data []byte, filename, subdir string) (string, error) {
+	path := "/mock/" + subdir + "/" + filename
 	m.files[path] = data
 	return path, nil
 }

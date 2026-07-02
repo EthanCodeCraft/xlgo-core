@@ -198,6 +198,29 @@ func TestDownload(t *testing.T) {
 	}
 }
 
+// TestDownloadChineseFilename_M6：中文文件名经 RFC 5987 编码（filename*），不乱码。
+func TestDownloadChineseFilename_M6(t *testing.T) {
+	r := setupTestRouter()
+	r.GET("/test", func(c *gin.Context) {
+		response.Download(c, "报告.txt", []byte("x"))
+	})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+
+	disposition := w.Header().Get("Content-Disposition")
+	// 应含 RFC 5987 编码的 filename*（百分号编码），且无原始 UTF-8 字节直接拼入 filename= 段
+	if !contains(disposition, "filename*=UTF-8''") {
+		t.Fatalf("Content-Disposition should contain filename*=UTF-8''..., got %s", disposition)
+	}
+	if !contains(disposition, "%E6%8A%A5%E5%91%8A") { // "报告" 的百分号编码
+		t.Fatalf("Content-Disposition should contain percent-encoded 报告, got %s", disposition)
+	}
+	// ASCII 回退名不应为空
+	if !contains(disposition, `filename="`) {
+		t.Fatalf("Content-Disposition should contain ASCII fallback filename, got %s", disposition)
+	}
+}
+
 func TestDownloadWithContentType(t *testing.T) {
 	r := setupTestRouter()
 	r.GET("/test", func(c *gin.Context) {

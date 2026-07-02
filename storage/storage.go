@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,6 +32,88 @@ type Storage interface {
 	Exists(path string) bool
 }
 
+var (
+	// ErrStorageNotInitialized storage 未初始化。
+	ErrStorageNotInitialized = errors.New("storage not initialized")
+	// ErrPathTraversal 路径穿越被拒绝（C4a）。Delete/Get/Exists/Upload 的相对路径
+	// 含 `..` 或绝对路径、逃逸根目录时返回。
+	ErrPathTraversal = errors.New("path traversal detected")
+	// ErrInvalidPath 路径非法（空、含 NUL 等）。
+	ErrInvalidPath = errors.New("invalid path")
+)
+
+const (
+	// defaultMaxReadBytes Get 默认读取上限（100MB），防止全量读入内存 OOM（C4c）。
+	defaultMaxReadBytes int64 = 100 * 1024 * 1024
+	// mimeSniffPrefixLen http.DetectContentType 最多嗅探 512 字节。
+	mimeSniffPrefixLen = 512
+)
+
+// resolveMaxRead 解析 Get 读取上限：n<0 不限，n==0 用默认，n>0 用 n。
+func resolveMaxRead(n int64) int64 {
+	if n < 0 {
+		return -1
+	}
+	if n == 0 {
+		return defaultMaxReadBytes
+	}
+	return n
+}
+
+// validateUploadSize 校验上传文件大小（C4b）。MaxSizeBytes<=0 表示不限。
+func validateUploadSize(p config.UploadPolicy, size int64) error {
+	if p.MaxSizeBytes > 0 && size > p.MaxSizeBytes {
+		return fmt.Errorf("文件大小 %d 超过上限 %d: %w", size, p.MaxSizeBytes, ErrInvalidPath)
+	}
+	return nil
+}
+
+// validateUploadExt 校验上传文件扩展名（C4b）。AllowedExts 为空表示不限。
+func validateUploadExt(p config.UploadPolicy, filename string) error {
+	if len(p.AllowedExts) == 0 {
+		return nil
+	}
+	ext := strings.ToLower(filepath.Ext(filename))
+	if !containsString(p.AllowedExts, ext) {
+		return fmt.Errorf("扩展名 %s 不在白名单: %w", ext, ErrInvalidPath)
+	}
+	return nil
+}
+
+// sniffUploadMIME 嗅探 src 前 512 字节并按 AllowedMIMEs 校验（C4b）。
+// 返回的 reader 已拼回已读头部，后续可继续读到完整内容。
+// AllowedMIMEs 为空时直接返回原 src 不嗅探。
+func sniffUploadMIME(p config.UploadPolicy, src io.Reader) (io.Reader, error) {
+	if len(p.AllowedMIMEs) == 0 {
+		return src, nil
+	}
+	head := make([]byte, mimeSniffPrefixLen)
+	n, err := io.ReadFull(src, head)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, fmt.Errorf("读取文件头失败: %w", err)
+	}
+	// http.DetectContentType 可能返回 "text/plain; charset=utf-8"，
+	// 与白名单 "text/plain" 比较时取主类型（分号前）。
+	detected := strings.ToLower(strings.TrimSpace(strings.Split(http.DetectContentType(head[:n]), ";")[0]))
+	allowed := make([]string, len(p.AllowedMIMEs))
+	for i, m := range p.AllowedMIMEs {
+		allowed[i] = strings.ToLower(strings.TrimSpace(strings.Split(m, ";")[0]))
+	}
+	if !containsString(allowed, detected) {
+		return nil, fmt.Errorf("文件类型 %s 不在白名单: %w", detected, ErrInvalidPath)
+	}
+	return io.MultiReader(bytes.NewReader(head[:n]), src), nil
+}
+
+func containsString(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
 // uniqueFilename 生成带随机后缀的唯一文件名，避免同一纳秒内并发上传导致文件名冲突。
 // 格式: <unixNano>-<8字节随机hex>.<ext>
 func uniqueFilename(now time.Time, ext string) string {
@@ -39,35 +123,98 @@ func uniqueFilename(now time.Time, ext string) string {
 	return fmt.Sprintf("%d-%x%s", now.UnixNano(), randBytes, ext)
 }
 
+// sanitizeObjectKey 净化 OSS object key（C4a）。OSS key 为扁平字符串无 FS 穿越语义，
+// 但拒绝含 `..`、绝对路径、NUL、空值等可疑输入，防止 key 注入与越权访问。
+// 同时将 Windows 反斜杠归一化为 OSS 规范的正斜杠，保证跨平台 key 一致。
+func sanitizeObjectKey(key string) (string, error) {
+	if key == "" || strings.ContainsRune(key, 0) {
+		return "", ErrInvalidPath
+	}
+	// 归一化 Windows 反斜杠为正斜杠（OSS key 规范分隔符），保证 Windows/Linux 部署 key 一致。
+	key = strings.ReplaceAll(key, "\\", "/")
+	if strings.Contains(key, "..") {
+		return "", ErrPathTraversal
+	}
+	// 框架生成的 key 不以 / 开头；拒绝绝对路径形式避免歧义。
+	if strings.HasPrefix(key, "/") {
+		return "", ErrPathTraversal
+	}
+	// 规范化多余分隔符，不改变合法 key 语义。
+	return path.Clean(key), nil
+}
+
 // LocalStorage 本地存储
 type LocalStorage struct {
-	path    string
-	baseURL string
+	rootAbs      string // 绝对根路径（已 Clean），前缀锚定用（C4a）
+	baseURL      string
+	policy       config.UploadPolicy
+	maxReadBytes int64
 }
 
 // NewLocalStorage 创建本地存储实例
+//
+// 安全约束：Path 指向的根目录应为框架独占目录，不与用户可控内容混用。
+// safeJoin 已防 `..` 路径穿越，但若根目录内已存在指向外部的符号链接，
+// Get 会跟随 symlink 读到根外内容——需保证攻击者无法在根目录内创建 symlink。
 func NewLocalStorage(cfg *config.LocalStorageConfig) *LocalStorage {
-	return &LocalStorage{
-		path:    cfg.Path,
-		baseURL: cfg.BaseURL,
+	// 用绝对路径作根锚定，避免相对路径 + `..` 组合绕过前缀校验（C4a）。
+	rootAbs, err := filepath.Abs(cfg.Path)
+	if err != nil {
+		rootAbs = cfg.Path
 	}
+	return &LocalStorage{
+		rootAbs:      filepath.Clean(rootAbs),
+		baseURL:      cfg.BaseURL,
+		policy:       cfg.Upload,
+		maxReadBytes: resolveMaxRead(cfg.MaxReadBytes),
+	}
+}
+
+// safeJoin 将根路径与相对片段拼接为绝对路径，并以前缀锚定拒绝穿越（C4a）。
+// 任何片段为绝对路径或含 NUL、最终路径逃逸 rootAbs 时返回错误。
+func (s *LocalStorage) safeJoin(parts ...string) (string, error) {
+	for _, p := range parts {
+		if filepath.IsAbs(p) {
+			return "", ErrPathTraversal
+		}
+		if strings.ContainsRune(p, 0) {
+			return "", ErrInvalidPath
+		}
+	}
+	joined := filepath.Join(append([]string{s.rootAbs}, parts...)...)
+	if joined == s.rootAbs || !strings.HasPrefix(joined, s.rootAbs+string(os.PathSeparator)) {
+		return "", ErrPathTraversal
+	}
+	return joined, nil
 }
 
 // Upload 上传文件
 func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string, error) {
+	// 上传安全策略校验（大小 / 扩展名）；file.Size 由 multipart 解析时填，无需打开文件（C4b）。
+	if err := validateUploadSize(s.policy, file.Size); err != nil {
+		return "", err
+	}
+	if err := validateUploadExt(s.policy, file.Filename); err != nil {
+		return "", err
+	}
+
 	// 生成存储路径: /年/月/日/文件名
 	now := time.Now()
 	datePath := fmt.Sprintf("%d/%02d/%02d", now.Year(), now.Month(), now.Day())
 	relativePath := filepath.Join(subdir, datePath)
 
-	// 确保目录存在
-	fullPath := filepath.Join(s.path, relativePath)
-	if err := os.MkdirAll(fullPath, 0755); err != nil {
+	// 确保目录存在，且未逃逸根目录（C4a：subdir 含 `..` 会被 safeJoin 拒绝）
+	fullPath, err := s.safeJoin(relativePath)
+	if err != nil {
+		logger.Warn("上传路径被拒绝", zap.String("subdir", subdir), zap.Error(err))
+		return "", err
+	}
+	if err := os.MkdirAll(fullPath, 0750); err != nil {
 		logger.Error("创建目录失败", zap.Error(err), zap.String("path", fullPath))
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
 
-	// 生成唯一文件名
+	// 生成唯一文件名（服务端随机，可信）
 	ext := filepath.Ext(file.Filename)
 	filename := uniqueFilename(now, ext)
 	dst := filepath.Join(fullPath, filename)
@@ -79,7 +226,15 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 	}
 	defer src.Close()
 
+	// MIME 嗅探（如配置 AllowedMIMEs），嗅探后拼回头部
+	var srcReader io.Reader = src
+	srcReader, err = sniffUploadMIME(s.policy, srcReader)
+	if err != nil {
+		return "", err
+	}
+
 	// 创建目标文件
+	// #nosec G304 -- dst 由 safeJoin 净化后的 fullPath 与服务端随机生成的 filename 拼成，路径已防穿越
 	dstFile, err := os.Create(dst)
 	if err != nil {
 		return "", fmt.Errorf("创建文件失败: %w", err)
@@ -87,7 +242,7 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 	defer dstFile.Close()
 
 	// 复制文件内容
-	if _, err := io.Copy(dstFile, src); err != nil {
+	if _, err := io.Copy(dstFile, srcReader); err != nil {
 		return "", fmt.Errorf("保存文件失败: %w", err)
 	}
 
@@ -102,27 +257,47 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 
 // UploadFromBytes 从字节数组上传文件
 func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (string, error) {
+	// 上传安全策略校验（C4b）
+	if err := validateUploadSize(s.policy, int64(len(data))); err != nil {
+		return "", err
+	}
+	if err := validateUploadExt(s.policy, filename); err != nil {
+		return "", err
+	}
+
 	// 生成存储路径: /年/月/日/文件名
 	now := time.Now()
 	datePath := fmt.Sprintf("%d/%02d/%02d", now.Year(), now.Month(), now.Day())
 	relativePath := filepath.Join(subdir, datePath)
 
-	// 确保目录存在
-	fullPath := filepath.Join(s.path, relativePath)
-	if err := os.MkdirAll(fullPath, 0755); err != nil {
+	// 确保目录存在，且未逃逸根目录（C4a）
+	fullPath, err := s.safeJoin(relativePath)
+	if err != nil {
+		logger.Warn("上传路径被拒绝", zap.String("subdir", subdir), zap.Error(err))
+		return "", err
+	}
+	if err := os.MkdirAll(fullPath, 0750); err != nil {
 		logger.Error("创建目录失败", zap.Error(err), zap.String("path", fullPath))
 		return "", fmt.Errorf("创建目录失败: %w", err)
 	}
 
-	// 生成唯一文件名（如果未提供扩展名，添加时间戳）
+	// 生成唯一文件名（如果未提供扩展名，添加 .bin）
 	ext := filepath.Ext(filename)
 	if ext == "" {
 		ext = ".bin"
 	}
-	uniqueFilename := uniqueFilename(now, ext)
-	dst := filepath.Join(fullPath, uniqueFilename)
+	fname := uniqueFilename(now, ext)
+	dst := filepath.Join(fullPath, fname)
+
+	// MIME 嗅探（如配置 AllowedMIMEs）
+	var srcReader io.Reader = bytes.NewReader(data)
+	srcReader, err = sniffUploadMIME(s.policy, srcReader)
+	if err != nil {
+		return "", err
+	}
 
 	// 创建目标文件
+	// #nosec G304 -- dst 由 safeJoin 净化后的 fullPath 与服务端随机生成的 filename 拼成，路径已防穿越
 	dstFile, err := os.Create(dst)
 	if err != nil {
 		return "", fmt.Errorf("创建文件失败: %w", err)
@@ -130,12 +305,12 @@ func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (st
 	defer dstFile.Close()
 
 	// 写入文件内容
-	if _, err := io.Copy(dstFile, bytes.NewReader(data)); err != nil {
+	if _, err := io.Copy(dstFile, srcReader); err != nil {
 		return "", fmt.Errorf("保存文件失败: %w", err)
 	}
 
 	// 返回相对路径
-	relativeFilePath := filepath.Join(relativePath, uniqueFilename)
+	relativeFilePath := filepath.Join(relativePath, fname)
 	// 统一使用正斜杠
 	relativeFilePath = strings.ReplaceAll(relativeFilePath, "\\", "/")
 
@@ -149,41 +324,69 @@ func (s *LocalStorage) GetURL(path string) string {
 }
 
 // Delete 删除文件
-func (s *LocalStorage) Delete(path string) error {
-	fullPath := filepath.Join(s.path, path)
+func (s *LocalStorage) Delete(p string) error {
+	fullPath, err := s.safeJoin(p)
+	if err != nil {
+		logger.Warn("删除路径被拒绝", zap.String("path", p), zap.Error(err))
+		return err
+	}
 	if err := os.Remove(fullPath); err != nil {
 		logger.Error("删除文件失败", zap.Error(err), zap.String("path", fullPath))
 		return fmt.Errorf("删除文件失败: %w", err)
 	}
-	logger.Info("文件删除成功", zap.String("path", path))
+	logger.Info("文件删除成功", zap.String("path", p))
 	return nil
 }
 
-// Get 获取文件内容
-func (s *LocalStorage) Get(path string) ([]byte, error) {
-	fullPath := filepath.Join(s.path, path)
-	data, err := os.ReadFile(fullPath)
+// Get 获取文件内容。读取受 maxReadBytes 封顶，防止全量读入内存 OOM（C4c）。
+func (s *LocalStorage) Get(p string) ([]byte, error) {
+	fullPath, err := s.safeJoin(p)
+	if err != nil {
+		logger.Warn("读取路径被拒绝", zap.String("path", p), zap.Error(err))
+		return nil, err
+	}
+	// #nosec G304 -- fullPath 经 safeJoin 前缀锚定净化，已防穿越
+	f, err := os.Open(fullPath)
 	if err != nil {
 		logger.Error("读取文件失败", zap.Error(err), zap.String("path", fullPath))
 		return nil, fmt.Errorf("读取文件失败: %w", err)
+	}
+	defer f.Close()
+
+	var reader io.Reader = f
+	if s.maxReadBytes > 0 {
+		// 多读 1 字节用于判断是否超限
+		reader = io.LimitReader(f, s.maxReadBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("读取文件内容失败: %w", err)
+	}
+	if s.maxReadBytes > 0 && int64(len(data)) > s.maxReadBytes {
+		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrInvalidPath)
 	}
 	return data, nil
 }
 
 // Exists 检查文件是否存在
-func (s *LocalStorage) Exists(path string) bool {
-	fullPath := filepath.Join(s.path, path)
-	_, err := os.Stat(fullPath)
+func (s *LocalStorage) Exists(p string) bool {
+	fullPath, err := s.safeJoin(p)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(fullPath)
 	return err == nil
 }
 
 // OSSStorage OSS 存储
 type OSSStorage struct {
-	client     *oss.Client
-	bucket     *oss.Bucket
-	endpoint   string
-	bucketName string
-	baseURL    string
+	client       *oss.Client
+	bucket       *oss.Bucket
+	endpoint     string
+	bucketName   string
+	baseURL      string
+	policy       config.UploadPolicy
+	maxReadBytes int64
 }
 
 // NewOSSStorage 创建 OSS 存储实例
@@ -199,21 +402,39 @@ func NewOSSStorage(cfg *config.OSSStorageConfig) (*OSSStorage, error) {
 	}
 
 	return &OSSStorage{
-		client:     client,
-		bucket:     bucket,
-		endpoint:   cfg.Endpoint,
-		bucketName: cfg.Bucket,
-		baseURL:    cfg.BaseURL,
+		client:       client,
+		bucket:       bucket,
+		endpoint:     cfg.Endpoint,
+		bucketName:   cfg.Bucket,
+		baseURL:      cfg.BaseURL,
+		policy:       cfg.Upload,
+		maxReadBytes: resolveMaxRead(cfg.MaxReadBytes),
 	}, nil
 }
 
 // Upload 上传文件到 OSS
 func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, error) {
+	// 上传安全策略校验（C4b）
+	if err := validateUploadSize(s.policy, file.Size); err != nil {
+		return "", err
+	}
+	if err := validateUploadExt(s.policy, file.Filename); err != nil {
+		return "", err
+	}
+
 	// 生成存储路径: /年/月/日/文件名
 	now := time.Now()
 	datePath := fmt.Sprintf("%d/%02d/%02d", now.Year(), now.Month(), now.Day())
 	ext := filepath.Ext(file.Filename)
-	objectKey := fmt.Sprintf("%s/%s", filepath.Join(subdir, datePath), uniqueFilename(now, ext))
+	// OSS object key 规范用正斜杠；用 path.Join（POSIX）而非 filepath.Join，
+	// 避免 Windows 产反斜杠导致跨平台 key 不一致。
+	rawKey := path.Join(filepath.ToSlash(subdir), datePath, uniqueFilename(now, ext))
+	// 净化 object key，拒绝含 `..` 的 subdir（C4a key 注入）
+	objectKey, err := sanitizeObjectKey(rawKey)
+	if err != nil {
+		logger.Warn("OSS 上传 key 被拒绝", zap.String("subdir", subdir), zap.Error(err))
+		return "", err
+	}
 
 	// 打开源文件
 	src, err := file.Open()
@@ -222,8 +443,15 @@ func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, 
 	}
 	defer src.Close()
 
+	// MIME 嗅探（如配置）
+	var srcReader io.Reader = src
+	srcReader, err = sniffUploadMIME(s.policy, srcReader)
+	if err != nil {
+		return "", err
+	}
+
 	// 上传到 OSS
-	if err := s.bucket.PutObject(objectKey, src); err != nil {
+	if err := s.bucket.PutObject(objectKey, srcReader); err != nil {
 		logger.Error("OSS 上传失败", zap.Error(err), zap.String("key", objectKey))
 		return "", fmt.Errorf("OSS 上传失败: %w", err)
 	}
@@ -234,16 +462,38 @@ func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, 
 
 // UploadFromBytes 从字节数组上传文件到 OSS
 func (s *OSSStorage) UploadFromBytes(data []byte, filename, subdir string) (string, error) {
+	// 上传安全策略校验（C4b）
+	if err := validateUploadSize(s.policy, int64(len(data))); err != nil {
+		return "", err
+	}
+	if err := validateUploadExt(s.policy, filename); err != nil {
+		return "", err
+	}
+
 	now := time.Now()
 	datePath := fmt.Sprintf("%d/%02d/%02d", now.Year(), now.Month(), now.Day())
 	ext := filepath.Ext(filename)
 	if ext == "" {
 		ext = ".bin"
 	}
-	objectKey := fmt.Sprintf("%s/%s", filepath.Join(subdir, datePath), uniqueFilename(now, ext))
+	// OSS object key 规范用正斜杠；用 path.Join（POSIX）而非 filepath.Join，
+	// 避免 Windows 产反斜杠导致跨平台 key 不一致。
+	rawKey := path.Join(filepath.ToSlash(subdir), datePath, uniqueFilename(now, ext))
+	objectKey, err := sanitizeObjectKey(rawKey)
+	if err != nil {
+		logger.Warn("OSS 上传 key 被拒绝", zap.String("subdir", subdir), zap.Error(err))
+		return "", err
+	}
+
+	// MIME 嗅探（如配置）
+	var srcReader io.Reader = bytes.NewReader(data)
+	srcReader, err = sniffUploadMIME(s.policy, srcReader)
+	if err != nil {
+		return "", err
+	}
 
 	// 上传到 OSS
-	if err := s.bucket.PutObject(objectKey, bytes.NewReader(data)); err != nil {
+	if err := s.bucket.PutObject(objectKey, srcReader); err != nil {
 		logger.Error("OSS 上传失败", zap.Error(err), zap.String("key", objectKey))
 		return "", fmt.Errorf("OSS 上传失败: %w", err)
 	}
@@ -266,38 +516,55 @@ func (s *OSSStorage) GetSignedURL(path string, expire time.Duration) (string, er
 }
 
 // Delete 删除 OSS 文件
-func (s *OSSStorage) Delete(path string) error {
-	if err := s.bucket.DeleteObject(path); err != nil {
-		logger.Error("OSS 删除失败", zap.Error(err), zap.String("key", path))
+func (s *OSSStorage) Delete(p string) error {
+	key, err := sanitizeObjectKey(p)
+	if err != nil {
+		return err
+	}
+	if err := s.bucket.DeleteObject(key); err != nil {
+		logger.Error("OSS 删除失败", zap.Error(err), zap.String("key", key))
 		return fmt.Errorf("OSS 删除失败: %w", err)
 	}
-	logger.Info("OSS 文件删除成功", zap.String("key", path))
+	logger.Info("OSS 文件删除成功", zap.String("key", key))
 	return nil
 }
 
-// Get 获取 OSS 文件内容
-func (s *OSSStorage) Get(path string) ([]byte, error) {
-	body, err := s.bucket.GetObject(path)
+// Get 获取 OSS 文件内容。读取受 maxReadBytes 封顶，防止 OOM（C4c）。
+func (s *OSSStorage) Get(p string) ([]byte, error) {
+	key, err := sanitizeObjectKey(p)
 	if err != nil {
-		logger.Error("OSS 读取失败", zap.Error(err), zap.String("key", path))
+		return nil, err
+	}
+	body, err := s.bucket.GetObject(key)
+	if err != nil {
+		logger.Error("OSS 读取失败", zap.Error(err), zap.String("key", key))
 		return nil, fmt.Errorf("OSS 读取失败: %w", err)
 	}
 	defer body.Close()
 
-	data, err := io.ReadAll(body)
+	var reader io.Reader = body
+	if s.maxReadBytes > 0 {
+		reader = io.LimitReader(body, s.maxReadBytes+1)
+	}
+	data, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("读取 OSS 文件内容失败: %w", err)
+	}
+	if s.maxReadBytes > 0 && int64(len(data)) > s.maxReadBytes {
+		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrInvalidPath)
 	}
 	return data, nil
 }
 
 // Exists 检查 OSS 文件是否存在
-func (s *OSSStorage) Exists(path string) bool {
-	_, err := s.bucket.GetObjectMeta(path)
+func (s *OSSStorage) Exists(p string) bool {
+	key, err := sanitizeObjectKey(p)
+	if err != nil {
+		return false
+	}
+	_, err = s.bucket.GetObjectMeta(key)
 	return err == nil
 }
-
-var ErrStorageNotInitialized = errors.New("storage not initialized")
 
 // 全局存储实例（兼容 facade，由 Manager.Init 同步维护）
 var storage Storage

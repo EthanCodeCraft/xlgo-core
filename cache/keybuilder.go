@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -137,7 +138,10 @@ func (kb *KeyBuilder) GetPrefix() string {
 	return kb.prefix
 }
 
-// SetPrefix 动态设置前缀
+// SetPrefix 动态设置前缀。
+//
+// 注意（M13）：KeyBuilder 实例非并发安全——并发 Build 与 SetPrefix 会竞争 prefix。
+// 全局构建器主要在启动期配置，运行期改前缀请自行加锁或重建实例。
 func (kb *KeyBuilder) SetPrefix(prefix string) *KeyBuilder {
 	kb.prefix = prefix
 	return kb
@@ -145,7 +149,12 @@ func (kb *KeyBuilder) SetPrefix(prefix string) *KeyBuilder {
 
 // ===== 全局键名构建器 =====
 
-var globalKeyBuilder *KeyBuilder
+// globalKeyBuilder 全局构建器，受 globalKBMu 保护；globalKBOnce 保证自动初始化只执行一次（M13）。
+var (
+	globalKeyBuilder *KeyBuilder
+	globalKBMu       sync.RWMutex
+	globalKBOnce     sync.Once
+)
 
 // InitKeyBuilder 初始化全局键名构建器
 // 参数: prefix 站点别名，如果为空则自动从配置读取
@@ -164,7 +173,10 @@ func InitKeyBuilder(prefix string, opts ...KeyBuilderOption) {
 	}
 
 	opts = append([]KeyBuilderOption{WithPrefix(prefix)}, opts...)
-	globalKeyBuilder = NewKeyBuilder(opts...)
+	kb := NewKeyBuilder(opts...)
+	globalKBMu.Lock()
+	globalKeyBuilder = kb
+	globalKBMu.Unlock()
 }
 
 // AutoInitKeyBuilder 自动从配置初始化键名构建器
@@ -177,12 +189,19 @@ func AutoInitKeyBuilder(opts ...KeyBuilderOption) {
 	InitKeyBuilder("", opts...)
 }
 
-// GetKeyBuilder 获取全局键名构建器
+// GetKeyBuilder 获取全局键名构建器，未初始化时用 sync.Once 自动初始化一次（M13）。
 func GetKeyBuilder() *KeyBuilder {
-	if globalKeyBuilder == nil {
-		// 自动从配置初始化
-		AutoInitKeyBuilder()
-	}
+	globalKBOnce.Do(func() {
+		// 仅在仍为 nil 时自动初始化（已由 InitKeyBuilder 设置则跳过）。
+		globalKBMu.RLock()
+		kb := globalKeyBuilder
+		globalKBMu.RUnlock()
+		if kb == nil {
+			AutoInitKeyBuilder()
+		}
+	})
+	globalKBMu.RLock()
+	defer globalKBMu.RUnlock()
 	return globalKeyBuilder
 }
 

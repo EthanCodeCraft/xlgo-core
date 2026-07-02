@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/gin-gonic/gin"
@@ -223,11 +224,13 @@ func CSRFWithSkip(skipPaths []string) gin.HandlerFunc {
 }
 
 // CSRFForAPI 适用于 API 的 CSRF 中间件（不使用 Cookie）
-// 客户端需要先调用 /csrf-token 获取 Token
+// 客户端需要先调用 GenerateAPIToken 获取 Token，随后在每个非安全方法请求的
+// X-CSRF-Token 头中携带。Token 单次消费（验证通过即删除）且受 TTL 约束，
+// 防止重放与内存无限增长。
+//
+// 注意：存储为进程内内存，仅适用于单实例部署。多实例请自行用 Redis
+// SETEX + GETDEL 实现等价语义。
 func CSRFForAPI() gin.HandlerFunc {
-	tokens := make(map[string]bool)
-	var mu sync.RWMutex
-
 	return func(c *gin.Context) {
 		// 安全方法不需要验证
 		if isSafeMethod(c.Request.Method) {
@@ -243,12 +246,25 @@ func CSRFForAPI() gin.HandlerFunc {
 			return
 		}
 
-		// 验证 Token
-		mu.RLock()
-		valid := tokens[clientToken]
-		mu.RUnlock()
+		// 单次消费 + TTL：校验通过即删除，防止同一 token 被重放。
+		// 写锁内完成“查—删—过期清理”以保证原子性。
+		apiTokensMu.Lock()
+		issuedAt, ok := apiTokens[clientToken]
+		if ok {
+			delete(apiTokens, clientToken)
+		}
+		// 懒清理：map 较大时顺带淘汰过期项，避免内存无限增长。
+		if len(apiTokens) > 256 {
+			now := time.Now()
+			for t, at := range apiTokens {
+				if now.Sub(at) > apiTokenTTL {
+					delete(apiTokens, t)
+				}
+			}
+		}
+		apiTokensMu.Unlock()
 
-		if !valid {
+		if !ok || time.Since(issuedAt) > apiTokenTTL {
 			response.Fail(c, "CSRF Token 无效")
 			c.Abort()
 			return
@@ -259,6 +275,7 @@ func CSRFForAPI() gin.HandlerFunc {
 }
 
 // GenerateAPIToken 生成 API CSRF Token（用于 API 模式）
+// 颁发的 Token 写入进程内存储，供 CSRFForAPI 校验。
 func GenerateAPIToken(c *gin.Context) {
 	token, err := generateCSRFToken(CSRFTokenLength)
 	if err != nil {
@@ -266,22 +283,24 @@ func GenerateAPIToken(c *gin.Context) {
 		return
 	}
 
-	// 存储 Token（实际应用中应使用 Redis）
-	// 这里简化为内存存储
-	mu.Lock()
-	tokens[token] = true
-	mu.Unlock()
+	apiTokensMu.Lock()
+	apiTokens[token] = time.Now()
+	apiTokensMu.Unlock()
 
 	response.Success(c, gin.H{
 		"csrf_token": token,
 	})
 }
 
-// 内存存储（用于 API 模式）
+// API 模式 CSRF Token 存储：token -> 颁发时间。
+// 受 apiTokensMu 保护，单次消费 + TTL（见 CSRFForAPI）。
 var (
-	tokens = make(map[string]bool)
-	mu     sync.RWMutex
+	apiTokens   = make(map[string]time.Time)
+	apiTokensMu sync.RWMutex
 )
+
+// apiTokenTTL API 模式 CSRF Token 有效期
+const apiTokenTTL = 30 * time.Minute
 
 // CSRFExempt 标记路由不需要 CSRF 保护
 // 使用方法：在路由组上使用此中间件
@@ -325,7 +344,9 @@ func DoubleSubmitCookie() gin.HandlerFunc {
 			cookieToken, err := c.Cookie(CSRFCookieName)
 			if err != nil || cookieToken == "" {
 				token, _ := generateCSRFToken(CSRFTokenLength)
-				c.SetCookie(CSRFCookieName, token, 3600, "/", "", false, true)
+				// 双重提交模式要求前端 JS 读取 cookie 并回填 X-CSRF-Token 头，
+				// 故 HttpOnly 必须为 false（与 CSRF() cookie 模式相反）。
+				c.SetCookie(CSRFCookieName, token, 3600, "/", "", false, false)
 				c.Set("csrf_token", token)
 			} else {
 				c.Set("csrf_token", cookieToken)

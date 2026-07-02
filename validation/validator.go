@@ -124,10 +124,12 @@ func registerCustomValidations(v *validator.Validate) {
 		if len(username) < 3 || len(username) > 20 {
 			return false
 		}
-		if !isLetter(rune(username[0])) {
+		// 首字符按 rune 取，避免非 ASCII 首字节误判（M5：原 rune(username[0]) 取字节）。
+		runes := []rune(username)
+		if len(runes) == 0 || !isLetter(runes[0]) {
 			return false
 		}
-		for _, r := range username {
+		for _, r := range runes {
 			if !isLetter(r) && !isDigit(r) && r != '_' {
 				return false
 			}
@@ -163,16 +165,15 @@ func registerCustomValidations(v *validator.Validate) {
 		return false
 	})
 
-	// 身份证号验证（简化版）
+	// 身份证号验证（18 位带校验位；15 位仅格式，向后兼容旧号段）。
 	v.RegisterValidation("idcard", func(fl validator.FieldLevel) bool {
 		id := fl.Field().String()
 		if len(id) != 18 && len(id) != 15 {
 			return false
 		}
-		// 简化验证：只检查长度和基本格式
+		// 基本格式：前 17 位（18 位号）或全部（15 位号）须为数字，18 位号末位可为 X。
 		for i, c := range id {
 			if i == len(id)-1 && len(id) == 18 {
-				// 最后一位可以是 X
 				if !isDigit(c) && c != 'X' && c != 'x' {
 					return false
 				}
@@ -180,6 +181,12 @@ func registerCustomValidations(v *validator.Validate) {
 				if !isDigit(c) {
 					return false
 				}
+			}
+		}
+		// 18 位号校验校验位（M5：原仅查长度+格式，无校验位可被任意构造通过）。
+		if len(id) == 18 {
+			if !validateIDCardChecksum(id) {
+				return false
 			}
 		}
 		return true
@@ -192,6 +199,29 @@ func isLetter(r rune) bool {
 
 func isDigit(r rune) bool {
 	return r >= '0' && r <= '9'
+}
+
+// validateIDCardChecksum 校验 18 位身份证校验位（GB 11643-1999，M5）。
+// 前 17 位按权重 [7,9,10,5,8,4,2,1,6,3,7,9,10,5,8,4,2] 加权求和 mod 11，
+// 对照码表 [1,0,X,9,8,7,6,5,4,3,2] 得期望末位。
+func validateIDCardChecksum(id string) bool {
+	weights := [17]int{7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2}
+	checkCodes := [11]byte{'1', '0', 'X', '9', '8', '7', '6', '5', '4', '3', '2'}
+	sum := 0
+	for i := 0; i < 17; i++ {
+		c := id[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		sum += int(c-'0') * weights[i]
+	}
+	expected := checkCodes[sum%11]
+	last := id[17]
+	// 末位 X 大小写不敏感
+	if last == 'x' {
+		last = 'X'
+	}
+	return last == expected
 }
 
 // ValidateStruct 验证结构体

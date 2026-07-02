@@ -16,12 +16,14 @@ import (
 // @Tags 系统
 // @Accept json
 // @Produce json
-// @Success 200 {object} response.Response
+// @Success 200 {object} map[string]string
 // @Router /health [get]
+//
+// 响应体与 router.RegisterHealthRoute 收敛为同一 schema（H8d）：
+// 恒 200 + {"status":"ok"}，不走 response 业务信封，便于 K8s 探针直读。
+// 需要依赖探活（mysql/redis…失败 503）时改用 router.RegisterHealthRoute 传入 checks。
 func HealthCheck(c *gin.Context) {
-	response.Success(c, gin.H{
-		"status": "ok",
-	})
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 // BindJSON 绑定 JSON 请求
@@ -153,18 +155,20 @@ func ParseInt(s string, defaultValue int) int {
 	return utils.ToIntDefault(s, defaultValue)
 }
 
-// BadRequest 返回 400 错误
+// BadRequest 返回参数/请求错误响应。
+//
+// 委托 response.FailWithCode（CodeFail），遵循当前响应模式（ModeBusiness 下 HTTP 200，
+// 错误信息通过 body 中的 code 表达；ModeREST 下 CodeFail 属业务失败不映射 HTTP 错误，仍 200），
+// 并写入 RequestID——与 response 模式系统一致，不再硬编 HTTP 状态码、不再丢失链路追踪。
 func BadRequest(c *gin.Context, msg string) {
-	c.JSON(http.StatusBadRequest, response.Response{
-		Code: response.CodeFail,
-		Msg:  msg,
-	})
+	response.FailWithCode(c, response.CodeFail, msg)
 }
 
-// InternalError 返回 500 错误
+// InternalError 返回服务器错误响应。
+//
+// 委托 response.ServerError（CodeServerError），遵循当前响应模式（ModeBusiness 下 HTTP 200，
+// ModeREST 下 HTTP 500），并写入 RequestID——与 response 模式系统一致，
+// 不再硬编 HTTP 状态码、不再丢失链路追踪。
 func InternalError(c *gin.Context, msg string) {
-	c.JSON(http.StatusInternalServerError, response.Response{
-		Code: response.CodeServerError,
-		Msg:  msg,
-	})
+	response.ServerError(c, msg)
 }

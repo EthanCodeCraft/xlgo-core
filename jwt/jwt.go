@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -37,6 +38,12 @@ var (
 	ErrTokenNotValidYet = errors.New("令牌尚未生效")
 	//ErrTokenRevoked 令牌已被撤销
 	ErrTokenRevoked = errors.New("令牌已被撤销")
+	// ErrBlacklistUnavailable Redis 未初始化或不可用，黑名单功能失效（C9a 修复）。
+	// Add 返回此错误使调用方（RefreshToken/InvalidateToken）感知黑名单不可用并 fail-closed，
+	// 避免无 Redis 时静默成功致撤销/刷新失效、新旧 token 双有效。
+	// IsBlacklisted 在无 Redis 时仍返回 false（验证侧 fail-open 是无 Redis 部署的固有局限，
+	// 文档约束：安全敏感场景必须启用 Redis）。
+	ErrBlacklistUnavailable = errors.New("token 黑名单不可用：Redis 未初始化")
 )
 
 // generateJTI 生成唯一的 JWT ID
@@ -68,11 +75,14 @@ func (tb *TokenBlacklist) redisClient() *redis.Client {
 
 // Add 将 Token 的 JTI 加入黑名单
 // 参数: jti JWT ID，expiry Token 过期时间
+//
+// 无 Redis 时返回 ErrBlacklistUnavailable（C9a 修复）：让调用方（RefreshToken/InvalidateToken）
+// 感知黑名单不可用并 fail-closed，避免无 Redis 时静默成功致撤销失效。
 func (tb *TokenBlacklist) Add(jti string, expiry time.Time) error {
 	client := tb.redisClient()
 	if client == nil {
-		// Redis 未启用，跳过黑名单
-		return nil
+		// Redis 未启用，黑名单不可用——fail-closed 让调用方决策。
+		return ErrBlacklistUnavailable
 	}
 
 	ctx := context.Background()
@@ -107,8 +117,37 @@ type Manager struct {
 	blacklist *TokenBlacklist
 }
 
-// DefaultJWT 默认 JWT 管理器，包级 facade 代理到它的 blacklist。
-var DefaultJWT = NewJWTManager()
+// defaultManager 是全局默认 JWT 管理器的真实存储，经 atomic 读写（C9c）。
+// 历史上 DefaultJWT/tokenBlacklist 为裸包级指针，SetDefaultJWTManager 写与
+// 请求 goroutine（ParseToken/RefreshToken/InvalidateToken/IsTokenRevoked）读存在数据竞争。
+var defaultManager atomic.Pointer[Manager]
+
+// DefaultJWT 默认 JWT 管理器的兼容导出别名，指向 defaultManager 当前实例。
+// 直接读此变量非并发安全（SetDefaultJWTManager 裸写维护），仅供启动期或兼容存量代码；
+// 并发安全的访问请使用包级函数（ParseToken/RefreshToken/...）或 SetDefaultJWTManager。
+var DefaultJWT *Manager
+
+func init() {
+	m := NewJWTManager()
+	defaultManager.Store(m)
+	DefaultJWT = m
+}
+
+// currentManager 返回全局默认 JWT 管理器（atomic 读取，C9c）。
+// 正常情况下 init 后永不为 nil；防御性地在极罕见的 nil 情况下回退一个懒取 Redis 的实例。
+func currentManager() *Manager {
+	if m := defaultManager.Load(); m != nil {
+		return m
+	}
+	m := NewJWTManager()
+	defaultManager.Store(m)
+	return m
+}
+
+// currentBlacklist 返回全局默认 Manager 持有的黑名单（atomic 读取 Manager 后经 Blacklist()，C9c）。
+func currentBlacklist() *TokenBlacklist {
+	return currentManager().Blacklist()
+}
 
 // NewJWTManager 创建 JWT 管理器实例（blacklist 懒取全局 Redis）。
 func NewJWTManager() *Manager {
@@ -121,11 +160,14 @@ func NewJWTManagerWithRedis(client *redis.Client) *Manager {
 }
 
 // SetDefaultJWTManager 提升指定 Manager 为全局默认。
+// 经 atomic.Pointer 原子置换真实存储（C9c），并同步维护 DefaultJWT 兼容别名。
+// 典型在启动期调用；并发请求期调用也安全（包级函数经 atomic 读取不会观察到撕裂值）。
 func SetDefaultJWTManager(m *Manager) {
-	if m != nil {
-		DefaultJWT = m
-		tokenBlacklist = m.blacklist
+	if m == nil {
+		return
 	}
+	defaultManager.Store(m)
+	DefaultJWT = m // 兼容别名同步（直接读 DefaultJWT 非并发安全，见其注释）
 }
 
 // Blacklist 返回 Manager 持有的黑名单实例。
@@ -134,9 +176,6 @@ func (m *Manager) Blacklist() *TokenBlacklist {
 	defer m.mu.Unlock()
 	return m.blacklist
 }
-
-// 全局黑名单实例（指向 DefaultJWT 的 blacklist，兼容存量包级函数）
-var tokenBlacklist = DefaultJWT.blacklist
 
 // GenerateToken 生成 JWT Token
 func GenerateToken(userID uint, username, role, userType string) (string, error) {
@@ -240,7 +279,7 @@ func ParseToken(tokenString string) (*Claims, error) {
 
 	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
 		// 使用 JTI 检查黑名单（更高效）
-		if claims.JTI != "" && tokenBlacklist.IsBlacklisted(claims.JTI) {
+		if claims.JTI != "" && currentBlacklist().IsBlacklisted(claims.JTI) {
 			return nil, ErrTokenRevoked
 		}
 		return claims, nil
@@ -264,7 +303,7 @@ func InvalidateToken(tokenString string) error {
 
 	if claims, ok := token.Claims.(*Claims); ok {
 		if claims.JTI != "" && claims.ExpiresAt != nil {
-			return tokenBlacklist.Add(claims.JTI, claims.ExpiresAt.Time)
+			return currentBlacklist().Add(claims.JTI, claims.ExpiresAt.Time)
 		}
 	}
 
@@ -274,19 +313,25 @@ func InvalidateToken(tokenString string) error {
 // InvalidateTokenByID 直接通过 JTI 使 Token 失效
 // 参数: jti JWT ID，expiry 过期时间
 func InvalidateTokenByID(jti string, expiry time.Time) error {
-	return tokenBlacklist.Add(jti, expiry)
+	return currentBlacklist().Add(jti, expiry)
 }
 
 // RefreshToken 刷新 Token
+//
+// 安全约束（C9b 修复）：将旧 Token 加入黑名单的 Add 错误必须向上传播——若 Add 失败
+// （Redis 抖动或未启用）仍签发新 token，会导致旧 token 未拉黑、新旧 token 双有效，
+// 形成会话固定窗口。故 Add 失败时不签发新 token（fail-closed）。
 func RefreshToken(tokenString string) (string, error) {
 	claims, err := ParseToken(tokenString)
 	if err != nil {
 		return "", err
 	}
 
-	// 将旧 Token 加入黑名单
+	// 将旧 Token 加入黑名单；失败则不签发新 token（C9b：禁止吞 Add 错误）。
 	if claims.JTI != "" && claims.ExpiresAt != nil {
-		tokenBlacklist.Add(claims.JTI, claims.ExpiresAt.Time)
+		if err := currentBlacklist().Add(claims.JTI, claims.ExpiresAt.Time); err != nil {
+			return "", fmt.Errorf("刷新令牌失败：旧令牌撤销失败: %w", err)
+		}
 	}
 
 	return GenerateToken(claims.UserID, claims.Username, claims.Role, claims.UserType)
@@ -309,7 +354,7 @@ func GetJTI(tokenString string) (string, error) {
 
 // IsTokenRevoked 检查 Token 是否被撤销（通过 JTI）
 func IsTokenRevoked(jti string) bool {
-	return tokenBlacklist.IsBlacklisted(jti)
+	return currentBlacklist().IsBlacklisted(jti)
 }
 
 // GetClaimsFromToken 获取 Token 的 Claims（不验证过期）

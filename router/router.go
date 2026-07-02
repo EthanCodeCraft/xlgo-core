@@ -2,7 +2,10 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -14,6 +17,42 @@ type HealthCheck struct {
 	Name     string
 	Check    func(context.Context) error
 	Disabled bool
+}
+
+// registerGETOnce 幂等注册 GET 路由（H8d 收尾：消除 defaultModule 与 Register* 系列
+// 并存时 Gin 重复路由 panic 的 footgun）。若 (GET, path) 已存在则静默跳过——首次注册胜出。
+//
+// 实现分两条路径：
+//   - *gin.Engine：经 Routes() 精确预检（method+path），命中即跳过；未命中则直接注册，
+//     不吞 panic——真正不同的路由冲突仍按 gin 原语义 panic，不被掩盖。
+//   - *gin.RouterGroup（gin 未暴露其 engine，无法预检）：用 recover 兜底，仅吞 gin 的
+//     重复路由 panic（"already registered" / "conflicts with existing wildcard"，
+//     两者覆盖 gin 对重复注册的两类 panic），其余 panic 原样抛出。defaultModule 的
+//     /swagger/*any 与 /health 重复注册即走此路径被吞。最坏情况（gin 改动文本）退化为
+//     当前行为（panic），不引入新风险。
+//
+// 注册期单线程调用，无并发问题。
+func registerGETOnce(r gin.IRoutes, path string, h gin.HandlerFunc) {
+	if eng, ok := r.(*gin.Engine); ok {
+		for _, ri := range eng.Routes() {
+			if ri.Method == http.MethodGet && ri.Path == path {
+				return
+			}
+		}
+		eng.GET(path, h)
+		return
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			msg := fmt.Sprint(rec)
+			if strings.Contains(msg, "already registered") ||
+				strings.Contains(msg, "conflicts with existing wildcard") {
+				return // 重复路由，静默跳过
+			}
+			panic(rec) // 非重复路由 panic，原样抛出
+		}
+	}()
+	r.GET(path, h)
 }
 
 // runHealthChecks 执行所有检查项，返回总体状态、HTTP code 与逐项结果。
@@ -44,23 +83,33 @@ func runHealthChecks(ctx context.Context, checks []HealthCheck) (string, int, ma
 	return status, code, result
 }
 
-// RegisterHealthRoute 注册健康检查路由（兼容端点，等价于 readiness）。
-func RegisterHealthRoute(r *gin.Engine, checks ...HealthCheck) {
-	r.GET("/health", func(c *gin.Context) {
+// healthHandler 返回统一的 /health 风格响应（H8d 收敛）。
+// 无检查项时视为健康（200 + {"status":"ok"}）；有检查项时任一失败返回 503
+// 并附逐项结果。RegisterHealthRoute / RegisterReadinessRoute / defaultModule
+// 均委托此实现，避免三个 /health 行为与响应体不一致。
+func healthHandler(checks []HealthCheck) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		status, code, result := runHealthChecks(c.Request.Context(), checks)
 		if result == nil {
 			c.JSON(http.StatusOK, gin.H{"status": status})
 			return
 		}
 		c.JSON(code, gin.H{"status": status, "checks": result})
-	})
+	}
+}
+
+// RegisterHealthRoute 注册健康检查路由（兼容端点，等价于 readiness）。
+// 幂等：若 /health 已注册则跳过（首次注册胜出），避免与 defaultModule 等并存时重复路由 panic。
+func RegisterHealthRoute(r *gin.Engine, checks ...HealthCheck) {
+	registerGETOnce(r, "/health", healthHandler(checks))
 }
 
 // RegisterLivenessRoute 注册存活性探针（#17）。
 // GET /livez 永不依赖外部，仅表示进程存活，始终返回 200。
 // 供 K8s livenessProbe 使用：失败由进程崩溃体现，而非端点返回 503。
+// 幂等：重复注册跳过。
 func RegisterLivenessRoute(r *gin.Engine) {
-	r.GET("/livez", func(c *gin.Context) {
+	registerGETOnce(r, "/livez", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 }
@@ -68,20 +117,14 @@ func RegisterLivenessRoute(r *gin.Engine) {
 // RegisterReadinessRoute 注册就绪性探针（#17）。
 // GET /readyz 复用 HealthCheck 检查依赖（mysql/redis...），任一失败返回 503。
 // 供 K8s readinessProbe 使用：未就绪时不接流量。
+// 幂等：重复注册跳过。
 func RegisterReadinessRoute(r *gin.Engine, checks ...HealthCheck) {
-	r.GET("/readyz", func(c *gin.Context) {
-		status, code, result := runHealthChecks(c.Request.Context(), checks)
-		if result == nil {
-			c.JSON(http.StatusOK, gin.H{"status": status})
-			return
-		}
-		c.JSON(code, gin.H{"status": status, "checks": result})
-	})
+	registerGETOnce(r, "/readyz", healthHandler(checks))
 }
 
-// RegisterSwaggerRoutes 注册 Swagger 文档路由
+// RegisterSwaggerRoutes 注册 Swagger 文档路由。幂等：重复注册跳过。
 func RegisterSwaggerRoutes(r *gin.Engine) {
-	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	registerGETOnce(r, "/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 }
 
 // RegisterDefaultRoutes 注册框架默认路由（健康检查、Swagger）
@@ -98,11 +141,11 @@ type defaultModule struct{}
 
 func (m *defaultModule) Name() string { return "default" }
 func (m *defaultModule) Register(r *gin.RouterGroup) {
-	// 作为模块注册时，路由在根路径
-	r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
-	})
+	// 作为模块注册时，路由在根路径。经 registerGETOnce 幂等注册（H8d 收尾）：
+	// 若用户已通过 RegisterSwaggerRoutes / RegisterHealthRoute 注册过同名路由，
+	// 此处静默跳过，避免 Gin 重复路由 panic。首次注册胜出。
+	registerGETOnce(r, "/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	registerGETOnce(r, "/health", healthHandler(nil))
 }
 
 // Module 路由模块接口
@@ -148,6 +191,16 @@ type Registry struct {
 	versions     map[string]*VersionedAPI
 	middlewareGroups map[string]*MiddlewareGroup
 	globalMiddlewares []gin.HandlerFunc
+
+	// metricsMiddleware 在 Apply 时作为首个全局中间件装入（H8c），
+	// 使所有经注册中心注册的路由都被采集，不依赖 RegisterMetricsRoute 的调用顺序。
+	// 为 nil 时不装入。/metrics 端点本身与 /health 等基础路由直接挂在 engine 上，
+	// 不经此中间件，故不被自采集。
+	metricsMiddleware gin.HandlerFunc
+
+	// applied 标记 Apply 是否已执行（H8b），二次 Apply 直接返回，
+	// 避免重复 engine.Use 与 Gin 重复路由 panic。
+	applied bool
 }
 
 // NewRegistry 创建路由注册中心
@@ -206,8 +259,29 @@ func (r *Registry) GetMiddlewareGroup(name string) []gin.HandlerFunc {
 	return nil
 }
 
-// Apply 应用所有路由注册
+// SetMetricsMiddleware 设置指标采集中间件（H8c）。Apply 时它会作为首个全局中间件
+// 装入 engine，使所有经注册中心注册的路由都被采集，不再依赖注册顺序。
+// 传入 nil 清除。须在 Apply 之前调用。
+func (r *Registry) SetMetricsMiddleware(mw gin.HandlerFunc) {
+	r.metricsMiddleware = mw
+}
+
+// Apply 应用所有路由注册。
+//
+// 幂等（H8b）：二次调用直接返回，避免重复 engine.Use 与 Gin 重复路由 panic。
+// 装入顺序：metrics 中间件（若有）→ 用户全局中间件 → 模块/版本路由。
+// metrics 置于首位保证全量业务路由被采集，且不依赖 RegisterMetricsRoute 调用顺序。
 func (r *Registry) Apply() {
+	if r.applied {
+		return
+	}
+	r.applied = true
+
+	// 指标采集中间件首个装入，统计所有经注册中心注册的业务路由
+	if r.metricsMiddleware != nil {
+		r.engine.Use(r.metricsMiddleware)
+	}
+
 	// 应用全局中间件
 	r.engine.Use(r.globalMiddlewares...)
 
@@ -230,42 +304,55 @@ func (r *Registry) Apply() {
 
 // ===== 全局注册中心 =====
 
-var globalRegistry *Registry
+// globalRegistry 包级全局注册中心。用 atomic.Pointer 保护读写（H8a）：
+// Init 写入、各全局 helper 读取，避免裸指针与请求 goroutine 的无锁竞争。
+var globalRegistry atomic.Pointer[Registry]
 
-// Init 初始化全局注册中心
+// Init 初始化全局注册中心。须在使用任何全局 helper（Use/RegisterModule/Apply…）之前调用。
 func Init(engine *gin.Engine) *Registry {
-	globalRegistry = NewRegistry(engine)
-	return globalRegistry
+	r := NewRegistry(engine)
+	globalRegistry.Store(r)
+	return r
 }
 
-// GetRegistry 获取全局注册中心
+// GetRegistry 获取全局注册中心，未初始化时返回 nil。
 func GetRegistry() *Registry {
-	return globalRegistry
+	return globalRegistry.Load()
+}
+
+// ensureRegistry 取全局注册中心，未初始化时以明确信息 panic（H8a）。
+// 把晦涩的 nil 解引用 panic 转成可定位的初始化顺序错误。
+func ensureRegistry() *Registry {
+	r := globalRegistry.Load()
+	if r == nil {
+		panic("router: 全局注册中心未初始化，请先调用 router.Init(engine) 再使用全局 helper")
+	}
+	return r
 }
 
 // Use 注册全局中间件（全局方式）
 func Use(middlewares ...gin.HandlerFunc) *Registry {
-	return globalRegistry.Use(middlewares...)
+	return ensureRegistry().Use(middlewares...)
 }
 
 // RegisterModule 注册模块（全局方式）
 func RegisterModule(module Module) *Registry {
-	return globalRegistry.RegisterModule(module)
+	return ensureRegistry().RegisterModule(module)
 }
 
 // RegisterModuleFunc 注册函数式模块（全局方式）
 func RegisterModuleFunc(name string, fn func(r *gin.RouterGroup)) *Registry {
-	return globalRegistry.RegisterModuleFunc(name, fn)
+	return ensureRegistry().RegisterModuleFunc(name, fn)
 }
 
 // RegisterVersion 注册版本化 API（全局方式）
 func RegisterVersion(version *VersionedAPI) *Registry {
-	return globalRegistry.RegisterVersion(version)
+	return ensureRegistry().RegisterVersion(version)
 }
 
 // Apply 应用路由注册（全局方式）
 func Apply() {
-	globalRegistry.Apply()
+	ensureRegistry().Apply()
 }
 
 // ===== 快捷构建函数 =====

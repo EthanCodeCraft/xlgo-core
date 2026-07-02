@@ -14,6 +14,304 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ---
 
+## [Unreleased]
+
+> v1.1.1 后的安全/正确性补丁，依据 `version_1.1.1_report.md` 权威缺陷清单逐项修复（13 CRITICAL + 8 HIGH）。
+
+### Fixed 🐛
+
+#### P3 清理第三批（MEDIUM/MINOR 收尾）
+
+> 续前两批。本批为校验收紧、全局状态并发、Windows 控制台、trace 遗留、logger 级别、测试质量。`go test -race` + `go vet` + `gosec` 通过。
+
+- **M5 身份证无校验位 + 用户名首字节**（validation/validator.go）：18 位身份证补 GB 11643-1999 校验位验证（`validateIDCardChecksum`），原仅查长度+格式可被任意构造通过；`username` 验证首字符改按 `[]rune` 取，避免非 ASCII 首字节误判（原 `rune(username[0])` 取字节）。
+- **M13 cache globalKeyBuilder 无锁 + 无 sync.Once**（cache/keybuilder.go）：`globalKeyBuilder` 加 `sync.RWMutex` 读写保护，`GetKeyBuilder` 用 `sync.Once` 保证自动初始化只执行一次，消除 check-then-init 竞态。`SetPrefix` 补实例非并发安全注释。
+- **M12 NewRedisCache 构造时快照 client**（cache/cache.go）：`redisCache` 不再构造时 `database.GetRedis()` 快照（Init Redis 之前构造则永久 nil no-op），改每次操作实时取 client，使"先构造后 Init Redis"顺序也能正确工作。
+- **M18 trace 显式设 codes.Ok + Close 无 double-close 守卫**（trace/trace.go）：成功路径不再 `SetStatus(codes.Ok, "")`（OTel 规范默认 UNSET，显式 Ok 会掩盖子 Span 错误状态）；`Close` 用 `sync.Once` 保证只 Shutdown 一次，重复调用安全。
+- **M19 logger 无法显式设级别**（logger/logger.go）：三个 core（app/api/db/console）改共享 `zap.AtomicLevel`，新增 `LogManager.SetLevel`/`GetLevel` + 包级 `SetLevel`/`GetLevel`，支持运行期热切换日志级别。
+- **M17 console_windows 死代码 + 着色句柄分裂**（console/console_windows.go）：移除从未被调用的 `EnableVirtualTerminal`；`printColor` 原对 `syscall.Stdout` 设置颜色、文本却写 `c.output`（非 stdout 时二者分裂），改为按 `c.output` 实际类型取句柄（`*os.File` 用 Fd，否则退化为纯文本）。
+- **N2 repository_test 空壳**（repository/repository_test.go）：原全为注释空壳、CRUD 零覆盖，改为编译期断言 `var _ BaseRepository[T] = (*BaseRepo[T])(nil)` 锁定接口契约（实现与接口漂移即编译失败）。
+- **N3 test MockStorage 签名不符 + SetupRouter 文档**（test/test.go）：`MockStorage.Upload` 签名对齐真实 `storage.Upload(file *multipart.FileHeader, subdir)`，新增 `UploadFromBytes` 对齐 `storage.UploadFromBytes`；`SetupRouter` 补文档说明刻意返回裸 `gin.New()`（不含框架中间件，由测试方控制）。
+- **Added**：`logger.LogManager.SetLevel`/`GetLevel`、`logger.SetLevel`/`GetLevel`、`validation.validateIDCardChecksum`（未导出）。无 breaking（新 API；身份证校验位收紧可能拒绝先前"格式正确但校验位错"的输入——这正是修复目的）。
+
+#### P3 清理第二批（MEDIUM/MINOR 文档/正确性/校验）
+
+> 续上一批。本批以正确性修复 + 文档/命名澄清为主，风险分级处理，`go test -race` + `go vet` + `gosec` 通过。
+
+- **M4 datetime StartOfWeek DST 落错日**（utils/datetime.go）：原用 `t.Add(-N*24h)` 回退到周一，DST 切换日 24h ≠ 1 个日历日会落错日。改为按日历日 `time.Date(..., Day-(weekday-1), ...)` 计算，保留原时区。`ParseDateInt` 补注释说明非法输入会被 time.Date 静默规范化、调用方须校验。
+- **M11 HealthCheck 同步 ping 无超时 + WriteQuery 命名误导**（database/manager.go）：包级 `HealthCheck()` 的 `sqlDB.Ping()` 改 `pingWithTimeout`（3s 超时，尊重调用方 ctx deadline），避免探针被慢/挂起的 DB 长期阻塞。`WriteQuery` 补注释说明其命名沿用历史、实际为读取语义（强制主库 read-your-writes）。
+- **M9 DSN 密码不转义 + 时区硬编**（config/config.go）：MySQL DSN 密码改 `url.QueryEscape`，Postgres DSN 密码改单引号包裹+内嵌单引号翻倍，避免含 `@`/`:`/空格/引号 的密码破坏 DSN。新增 `DatabaseConfig.Timezone` 字段（MySQL loc / Postgres TimeZone 可配，空则保持原默认 `Local`/`Asia/Shanghai` 向后兼容）。
+- **M7 ToResponse 丢 Detail**（response/error.go）：`Error.ToResponse()` 把 `Detail` 放入 `data.detail`（非空时），不再丢失细节信息。
+- **M14 timeout 软超时文档化**（middleware/timeout.go）：注释明确软超时语义——仅注入带 deadline 的 ctx，不主动中断 handler；纯 CPU/不查 ctx 的 handler 不生效，硬中断需配合 `http.Server.WriteTimeout` 或 handler 内 `select ctx.Done`。
+- **C3 收尾：生产者取消信号契约**（sse/sse.go）：包文档化断连契约——框架消费循环已监听 `c.Request.Context()` 断连即退，但生产者（LLM 流）必须自行监听同一 ctx 在取消时停止，否则上游持续运行浪费算力。`StreamText` 注释已有，补包级 doc。
+- **M20 生成器非法标识符 + fileExists 权限误判**（cmd/xlgo）：`make handler my-thing` 原 `cases.Title` 得 `My-ThingHandler`（非法标识符）；新增 `sanitizeIdent` 把非字母数字转下划线再 Title，得 `MyThingHandler`。`fileExists` 注释澄清权限错误的判定语义。
+- **N1 BaseModelWithTime 命名误导**（model/base.go）：补注释说明与 BaseModel 唯一区别是 `type:datetime`（部分 MySQL 丢毫秒），名字 "WithTime" 易误导，保留仅为兼容。
+- **N4 Nl2br 死分支 + IsEmpty 文档不符**（utils/）：`Nl2br` 的 `case '\n'` 内 `r == '\r'` 半恒假（r 恒为 '\n'）已清理；`IsEmpty` 文档原称支持 slice/map 但实现仅支持 string/[]byte/nil，文档修正为实际行为。
+- **N6 sse KeepAlive 触发 onmessage**（sse/sse.go）：心跳由 `data: \n\n`（触发客户端 onmessage）改 SSE 注释行 `: ping\n\n`（不产生消息事件，更符合心跳语义）。
+- **Added**：`config.DatabaseConfig.Timezone`。无 breaking（Timezone 零值保持原默认时区）；DSN 密码转义对合法密码无影响（无特殊字符的密码转义后不变）。Postgres DSN 格式变更（password 加单引号）对下游 GORM 透明。
+
+#### P3 安全/正确性轻量清理（一批 MEDIUM/MINOR）
+
+> 风险分级处理：安全与逻辑正确性项实际修复 + 针对性用例；纯文档/感知项仅加注释。全部经 `go test -race` + `go vet` + `gosec` 验证。
+
+- **M15 requestid 头注入**（middleware/requestid.go）：原无条件信任客户端 `X-Request-ID`，可注入 CRLF 伪造响应头/日志。新增 `sanitizeRequestID`：仅接受可见 ASCII（0x20-0x7e）、无换行、长度 ≤128，非法则忽略并重新生成。合法 ASCII ID 仍沿用客户端值（向后兼容）。
+- **C7/N7 ws CheckOrigin 默认 true（CSWSH）**（ws/ws.go）：默认 `CheckOrigin` 由恒 `true` 改为同源校验（空 Origin 放行非浏览器客户端、否则要求 Origin host 与请求 Host 一致），防 Cross-Site WebSocket Hijacking。新增 `AllowOrigins(origins...)` 辅助多可信域名场景。**Breaking ⚠️**：原默认放行所有跨域 WS 连接，现拒绝跨域；依赖跨域 WS 的下游需用 `ws.SetCheckOrigin` 或 `ws.AllowOrigins(...)` 显式放行。
+- **C5/N5 HTTPClient Upload FD 累积 + 响应体无上限**（utils/http.go）：`Upload` 循环内 `defer file.Close` 改为显式关闭，避免大批量上传累积 FD；`do` 的 `io.ReadAll(resp.Body)` 改 `io.LimitReader` 封顶（默认 32MB，可经 `HTTPClientConfig.MaxResponseBodySize` 配置，-1 不限），防异常服务端返回超大响应打爆内存。
+- **M16/B18 压缩写侧 defer Close 吞错**（compress/compress.go）：`GzipCompressFile`/`Zip` 的 `defer gz.Close()`/`defer zipWriter.Close()`/`defer archive.Close()` 改为显式关闭并向上传播错误——flush 失败（归档损坏）不再被吞成成功返回。
+- **M6 Download 中文文件名乱码**（response/response.go）：`Content-Disposition` 由直接拼接 `filename=` 改为 RFC 5987：同时给 ASCII 回退 `filename="..."` 与 UTF-8 百分号编码 `filename*=UTF-8''...`，中文等非 ASCII 文件名不再乱码。
+- **M8 CodeDataAlreadyExists 状态不一致**（response/mode.go）：`CodeDataAlreadyExists` 在 ModeREST 下原落 200，与同语义的 `CodeDataConflict`(409) 不一致。映射到 409 Conflict。
+- **M10 driver 拼写错误静默回退 MySQL**（database/dialect.go）：未注册驱动回退 MySQL 时新增 `logger.Warnf` 告警（含已注册驱动列表），避免拼错 driver 名（如 `postgrs`）静默回退导致连接错误难排查。
+- **M2 AddQueries 实为 Set**（utils/url.go）：`AddQueries` 原用 `query.Set`（覆盖同名），与 `AddQuery`（追加）语义不一致。改为 `query.Add`，同 key 多值共存。
+- **M3 file.go 路径穿越感知**（utils/file.go）：文件工具函数加包级文档警告——直接操作调用方路径不做穿越校验，不可信输入须调用方自行净化（框架 storage 包已做防护）。
+- **Added**：`ws.AllowOrigins`、`utils.HTTPClientConfig.MaxResponseBodySize`。**Breaking**：`ws` 默认 CheckOrigin 收紧为同源（见 C7）。无配置/migration 变更（MaxResponseBodySize 零值默认 32MB）。
+
+#### H6：`repository/repository.go` BaseRepo 不接 GetDBFromContext + 读写分离失效 + 事务无法 join + 分页不一致（repository/repository.go, database/manager.go）
+
+`BaseRepo` 构造时捕获 `r.db`，所有方法 `r.db.WithContext(ctx)` 从不调 `database.GetDBFromContext` → 读写分离形同虚设（读全走主库）、外层 ctx 事务无法 join、`WithTransaction` 内方法走 `r.db` 拿不到事务。叠加 `Update` 用 `Save` 全列覆写（H6a）、`FindPage` 的 count+list 为两条独立语句高并发下 total/items 不一致（H6d）、`QueryBuilder` 终结方法未克隆且 `Count` 受残留 Limit/Offset 截断（H6e）。修复：
+
+- **H6c 连接路由**：新增 `readConn(ctx)`/`writeConn(ctx)`，优先级为「外层 ctx 事务（`database.TxFromContext`）> 本 repo 事务（`r.tx`）> 路由 db > `r.db` 回退」。读走 `database.GetDBFromContext`（默认从库，支持 `UseMaster`/`UseReplica`），写走 `database.GetWriteDB()`（主库，不路由到只读从库）。`DefaultManager` 未初始化（如单测注入 sqlite）时回退 `r.db`，兼容下游 `NewBaseRepo[T](database.GetDB())`。
+- **H6c 事务 join**：`BaseRepo` 新增未导出 `tx` 字段；`WithTransaction` 创建 `txRepo` 时注入 `tx`，其方法自动 join 事务。新增 `database.WithTx(ctx, tx)`/`TxFromContext(ctx)` 支持跨层/跨 repo join（外层 `database.TransactionWithContext` 拿到的 tx 经 `WithTx` 注入 ctx 后传给 repo 方法即可参与同一事务）。`WithTransaction` 签名**不变**。
+- **H6a 局部更新**：新增 `UpdateFields(ctx, model, conds...)` 基于 `gorm.Updates`（struct 仅更新非零字段、map 可显式置零），避免 `Save` 全列覆写丢失更新/零值不可辨。`Update`（Save）保留并文档化其全列覆写语义。
+- **H6b 软删除契约**：`Delete` 文档化行为契约——`T` 内嵌 `gorm.DeletedAt`/`gorm.Model` 时软删除，否则硬删除（泛型类型约束无法编译期强制）。
+- **H6d 分页一致性**：`FindPage`/`FindPageOrdered`/`FindPageWhere`/`FindPageWhereOrdered` 的 count+list 包进单事务（同一快照），消除高并发下 total/items 不一致。
+- **H6e QueryBuilder 克隆**：终结方法（`Find`/`First`/`Count`/`Page`）基于 `Session(&gorm.Session{})` 克隆，不污染 `qb.db`；`Count`/`Page` 的 count 额外 `Limit(-1).Offset(-1)` 剥离残留分页条件。文档标注 QueryBuilder 单次使用、非并发安全。
+- **Added**：`database.WithTx`/`database.TxFromContext`、`repository.BaseRepo.UpdateFields`。无既有 API 签名/配置/migration 变更（非 breaking）。行为变更：读操作默认路由到从库（原全走主库）、写操作显式走主库、分页查询包单事务（每页一次 BEGIN/COMMIT，见下）。
+
+#### C10：`config/config.go` 全局 Manager 无锁置换 + 热重载绕过 Validate + StopWatcher 空函数（config/config.go）
+
+- **C10a 全局 Manager 无锁置换**：包级 `defaultManager` 原为裸 `*Manager` 指针，`Load`/`LoadWithWatch`/`SetDefaultManager` 直接赋值，与 `Get`/`GetViper`/`GetString` 等请求 goroutine 的无锁读存在数据竞争。改为 `atomic.Pointer[Manager]`，所有包级便捷函数经 `Load()`/`Store()` 原子读写。
+- **C10b 热重载绕过 Validate**：`OnConfigChange` 与 `Reload` 原均不调 `Validate()`（仅 `Load` 调用），非法配置（坏端口、负超时、短密钥）直接发布。`Reload` 与文件监听路径统一走 `reload()`：读取/解析/校验任一步失败均保留旧配置并返回错误，仅新配置通过 `Validate` 后才替换 `m.cfg` 并触发回调。
+- **C10c Load 返回可变指针**：`Load` 原返回 `&cfg` 与 `m.cfg` 同一指针，调用方可变并竞争。改为返回防御性浅拷贝，调用方修改返回值不污染全局读取路径。
+- **C10d StopWatcher 空函数**：原 `StopWatcher()` 为空，viper 内部 watcher goroutine + fd 永不释放。改为自管 `fsnotify.Watcher`（监听配置文件所在目录以兼容编辑器改写/k8s ConfigMap 原子替换，按文件名过滤 + 200ms 去抖），`StopWatcher` 关闭 watcher 并等待监听 goroutine 退出（`watchDone`），幂等。废弃 viper `WatchConfig`/`OnConfigChange`。
+- 无 API 签名/配置结构变更；行为变更（热重载非法配置保留旧配置而非发布、StopWatcher 真正释放监听资源）。
+
+#### C11：`database/manager.go` 池泄漏 + Master/Replicas 无锁读 + 健康状态陈旧（database/manager.go）
+
+- **C11b InitDB 重试泄漏**：`InitDB` 原直接 `m.master = gorm.Open(...)`，`gorm.Open` 成功但 `Ping` 失败时旧池不关、下轮覆盖 `m.master`，每次重试泄漏一池。改为先打开到局部变量，仅 `Ping` 通过后才在锁内安装为 `m.master` 并关闭旧主库池；`Ping`/`DB()` 失败时关闭刚打开的池。
+- **C11c InitDBWithReplicas 泄漏**：原 `m.replicas = nil` 前不关旧从库池，且从库 `DB()`/`Ping` 失败时 `continue` 不关刚打开的池。改为重建前在锁内取出旧从库、重置健康状态后逐个 `closeDB`；从库构建失败时关闭刚打开的池；新从库先构建到局部切片再原子安装。
+- **C11a 健康状态陈旧**：`initReplicaHealth` 的 `replicaHealthSet` 早返回使重新 `InitDBWithReplicas` 后健康切片与新 replicas 长度错位。新增 `resetReplicaHealth`，`InitDBWithReplicas`/`Close` 重建/关闭前调用，使下次 `initReplicaHealth` 按新 replicas 长度重建。
+- **C11d Master/Replicas 无锁读**：`Master()`/`Replicas()` 原裸读 `m.master`/`m.replicas`，与 `Close`/`InitDB` 写竞争。改为全程持 `m.mu` 锁；`Replicas()` 返回拷贝；`Replica()` 的空从库判断移入锁内；`FromContext`/`HealthCheck`/`Transaction`/`TransactionWithContext`/`WriteQuery`/包级 `HealthCheck` 改经 `Master()`/`Replicas()` 读取；`probeOnce` 快照 `replicaHealthy` 切片头避免与重置竞争。
+- **C11f 包级 Close 仅关主库**：包级 `Close()` 原仅关 master 且无锁，命名误导致从库泄漏。改为委托 `CloseAll()`（关主+从并重置健康状态）。
+- **C11e（非缺陷）**：`RoundRobinPicker` `int(n-1)%len` 取模后仍在 `[0,len)` 内，无 panic/正确性问题；`RandomPicker` 全局 `math/rand` 仅锁竞争。属微优化，非功能 bug，未改。
+- 无 API 签名/配置结构变更；行为变更（包级 `Close` 现关闭从库、`InitDB` 重试/重建不再泄漏旧池、`Master`/`Replicas` 加锁读取）。gosec G115/G404 为 `RoundRobinPicker`/`RandomPicker` 既有项（C11e 范围外）。
+
+#### C9c：`jwt/jwt.go` 包级 `DefaultJWT`/`tokenBlacklist` 无锁置换（jwt/jwt.go）
+
+`SetDefaultJWTManager` 原裸写包级 `DefaultJWT`/`tokenBlacklist`，与请求 goroutine（`ParseToken`/`RefreshToken`/`InvalidateToken`/`InvalidateTokenByID`/`IsTokenRevoked` 读 `tokenBlacklist`）存在数据竞争（C9c，C9a/b 已在 C9b 修复 fail-closed，此项是遗留并发隐患）。修复：
+- 新增内部 `defaultManager atomic.Pointer[Manager]` 作真实存储，`init()` Store；包级函数经 `currentManager()`/`currentBlacklist()`（atomic 读取）访问，消除裸指针读写竞争。
+- `SetDefaultJWTManager` 改用 `defaultManager.Store(m)` 原子置换；移除裸写的包级 `tokenBlacklist` 变量。
+- `DefaultJWT` 保留为导出 `*Manager` 兼容别名（类型不变，非 breaking），由 `SetDefaultJWTManager` 同步维护；注释标注直接读 `DefaultJWT` 非并发安全，并发访问应用包级函数或 `SetDefaultJWTManager`。
+- 无 API 签名变更；`DefaultJWT` 类型不变（非 breaking）。行为变更：包级黑名单读写改经 atomic，`SetDefaultJWTManager` 可安全在请求期调用。
+
+#### H3：`middleware/logger.go` 请求/响应 body 无上限读 → OOM（middleware/logger.go）
+
+`LoggerWithConfig` 在 `LogRequestBody:true` 时用 `io.ReadAll(c.Request.Body)` 无封顶读入内存，`MaxBodyLength` 仅在读完后截断**日志副本**，全 body 已驻留并二次 buffer——多 GB POST 可 OOM；响应侧 `bodyLogWriter.body` 同样无上限累积。默认 `LogRequestBody:false` 使默认安全，但 `LoggerForAPI`/`LoggerForDebug` 显式开启即暴露。修复：
+- 请求体新增 `readBodyBounded(c, maxLen)`：`io.LimitReader(body, maxLen+1)` 仅向内存读入最多 `maxLen+1` 字节（+1 检测截断），通过 `io.MultiReader(已读前缀, 原始 body 剩余)` 复原 `c.Request.Body`——**下游处理器仍得完整请求体**；日志副本截断到 `maxLen`。
+- 响应体 `bodyLogWriter` 增 `maxLen` 字段，捕获缓冲区封顶；`Write`/`WriteString` 仍把完整响应写入下游 `ResponseWriter`，仅捕获缓冲区封顶。
+- `LoggerWithConfig` 入口归一化 `MaxBodyLength`：`<=0` 时回退默认值（1024），确保请求/响应两侧捕获均有上限，消除手配 `MaxBodyLength:0` 时响应侧无上限的 OOM 残留路径。
+- 无 API 签名/配置结构变更；行为变更：`MaxBodyLength` 现同时门控响应体捕获（此前响应侧无视该值无上限累积，属 bug 修正）；`MaxBodyLength<=0` 不再意味"无上限"，统一回退默认上限。
+
+#### H7：`logger/logger.go` 全局指针写有锁读无锁 + `Field.Duration` 签名与实现矛盾（logger/logger.go, logger/field.go）
+
+`Init`/`Close` 持 `m.mu`（实例锁）写包级 `Logger`/`sugar`/`apiLog`/`dbLog`，但 `Info`/`Error`/`APILog()`/`DBLog()`/`Sync` 等请求期函数无锁裸读——锁与被保护对象作用域错配（实例锁保护包级全局变量），热重载 re-Init/Close 与请求日志存在数据竞争（H7a）。另 `Field.Duration` 签名为 `func(key string, value interface{})`，`case zap.Field` 分支 `return v` 丢弃 `key`，签名与实现矛盾（H7b）。修复：
+- **H7a**：新增内部 `loggerPtr`/`sugarPtr`/`apiLogPtr`/`dbLogPtr atomic.Pointer[...]` 作真实存储，`init()` Store 为 Nop；`Info`/`Debug`/`Warn`/`Error`/`Fatal`/`Debugf`-`Fatalf`/`APILog`/`DBLog`/`Sync` 读路径统一经 `currentLogger()`/`currentSugar()`/`currentAPILog()`/`currentDBLog()`（atomic Load，nil 防御回退 Nop），消除请求期裸读竞争。`Init`/`Close` 在 `m.mu` 下 Store atomic。
+- **H7a 兼容别名**：`Logger` 保留为导出 `*zap.Logger` 兼容别名（类型不变，非 breaking），由 `Init`/`Close` 在 `m.mu` 下同步维护；注释标注直接读 `Logger` 变量在 re-Init/Close 期间非并发安全，并发访问应用包级函数。
+- **H7b**：`Field.Duration` 签名改为 `func(key string, value time.Duration) zap.Field`，直接委托 `zap.Duration(key, value)`，类型安全、key 不再可能被丢弃。
+- 顺带收紧 `os.MkdirAll` 日志目录权限 `0o755`→`0o750`（与 storage 目录权限一致，gosec G301）。
+- 无 API 签名/配置结构变更（`Logger` 类型不变）；行为变更：包级日志读路径改经 atomic，re-Init/Close 可安全与请求日志并发。`Field.Duration` 签名变更为**类型收紧**（`interface{}`→`time.Duration`），旧调用方传 `time.Duration` 不受影响，传 `zap.Field` 等非 Duration 类型将编译失败（属修复目的）。
+
+#### C12：`cron/cron.go` 数据竞争 + 重叠执行 + 漂移 + Weekly 跳周 + cron 解析缺陷（cron/cron.go）
+
+`cron/cron.go` 存在 5 子项缺陷（C12a–C12e）。修复：
+- **C12a 数据竞争**：`runTask` 原无锁写 `LastRun`/`RunCount`，`GetTask`/`ListTasks` 返回 live 指针并发读 → data race。改为 `LastRun`/`RunCount`/`NextRun` 写入一律在 `s.mu` 写锁内；`GetTask`/`ListTasks` 返回拷贝快照（`cp := *task`）。
+- **C12b 无重叠守卫**：`checkAndRun` 每秒 tick，长任务跨 tick 被反复 spawn 同一任务并发执行。新增 per-task `running *atomic.Bool` 守卫，`checkAndRun` 与 `RunTask` 均经 `CompareAndSwap(false,true)` 占用，正在执行则跳过/返错。
+- **C12c Interval 漂移**：`NextRun` 原在 handler 完成后以 `time.Now()` 锚定，每周期累积 handler 时长。改为 `checkAndRun` spawn 前 `task.NextRun = task.Schedule.Next(task.NextRun)`（以上次 `NextRun` 锚定），`runTask`/`RunTask` 不再更新 `NextRun`。
+- **C12d Weekly 跳周**：原 `daysUntil <= 0 → +7` 仅按 weekday 差值，不比较当天时刻，当天目标未到点被跳一周。重写为 `((day-now)+7)%7` 加天数后 `!next.After(now)` 才 +7，当天未到点返回本周、已过返回下周。
+- **C12e cron 解析缺陷**：`parseInt` 忽略非数字逐位累积，`1-5,8` 因先判 `-` 被当范围（`parseInt("5,8")=58`）、`garbage`→0 误触发、`*/garbage`→step=0 匹配全部、周日 `7` 不匹配。重写 `matchField`：列表分支独立于范围分支（先按逗号拆，每项判 `*/n`/`a-b/n`/`a-b`/单值），全用 `strconv.Atoi` 返错；weekday `7→0`，范围 `lo>hi` 环绕；歧义范围 `0-7`/`7-0` 拒绝。新增 `ParseCronStrict(expr) (*FullCronSchedule, error)` 严格校验；`ParseCron` 保留原签名，非法回退默认全 `*`。
+- 无 API 签名变更（`ParseCron` 仍返 `*FullCronSchedule`，`AddTask`/`RunTask`/`GetTask`/`ListTasks` 签名不变）；新增 `ParseCronStrict`（非 breaking）。`Task` 新增未导出 `running` 字段（外部不可构造）。行为变更：`GetTask`/`ListTasks` 返回拷贝（修改返回值不影响内部状态）；`RunTask` 占用守卫期间再次调用返"任务正在执行中"错误；长任务不再重叠；调度不漂移；Weekly 当天未到点不再跳周；cron 解析拒绝非法表达式。
+
+#### C13：`trace/trace.go` opt-in 即崩 + 未实现导出器/传播器 + Middleware 不更新 c.Request（trace/trace.go）
+
+`trace/trace.go` 存在 5 子项缺陷（C13a–C13e）。修复：
+- **C13a nil tracer panic**：包级 `tracer`/`tracerProvider` 原为裸指针，未 `Init` 即 nil，`Middleware`/`StartSpan`/`StartSpanFromContext`/`GetTracer` 裸用 → 首个请求 panic。改为 `atomic.Pointer` + `init()` Store Noop 兜底，`getTracer()` 永不 nil；`Init` 原子替换，`Close` Shutdown 后 Store 回 Noop（防 Close 后再用 panic）。`GetContext` 裸断言改 comma-ok。
+- **C13b 未知导出器 + stdout 缺失**：`createExporter` `default` 原返 `nil, nil` 喂 `WithBatcher(nil)`，文档承诺的 `stdout` 未实现。新增 `case "stdout"`（官方 `stdouttrace` 包）；`default` 返 `fmt.Errorf`（不再喂 nil）。
+- **C13c OTLP 默认 HTTPS 无 WithInsecure**：`Config` 增 `Insecure bool`（零值 false=TLS，opt-in 明文，安全默认）；`Insecure` 时 otlp-http/otlp-grpc 追加 `WithInsecure()`，对 `localhost:4318` 等明文 collector 不再握手失败。
+- **C13d Middleware 不更新 c.Request**：原仅 `c.Set("otel_ctx", ctx)`，下游 `c.Request.Context()` 拿不到 span。补 `c.Request = c.Request.WithContext(ctx)`（保留 `c.Set` 兼容）。
+- **C13e b3/jaeger 未实现**：`createPropagator` 原仅 `w3c` + default 静默回落 W3C。新增 `case "b3"`（contrib b3 propagator，单头+多头）；`case "jaeger"` 映射 W3C TraceContext（现代 Jaeger agent 透传 W3C，不引入不稳定的 jaegerremix 模块）；`default` 返错（不再静默回落）；`Init` 在非法 propagator 时返错并回滚已创建 provider。
+- 顺带修复 `resource.Merge` SchemaURL 冲突（`resource.Default()` 与 `semconv v1.24.0` schema 不一致致 `Init` 报错）——改用空 schema URL 合并属性。
+- 新增依赖：`go.opentelemetry.io/otel/exporters/stdout/stdouttrace v1.43.0`、`go.opentelemetry.io/contrib/propagators/b3 v1.43.0`（均与 OTel core v1.43.0 同版本族）。
+- 无 API 签名变更（`Init`/`Middleware`/`StartSpan`/`GetTracer`/`Close` 签名不变）；`Config` 新增 `Insecure` 字段（零值兼容，非 breaking）。行为变更：未 Init 不 panic；未知导出器/传播器返错；`Insecure` opt-in 明文；Middleware 更新 c.Request；b3 实现、jaeger 映射 W3C。`Propagator` 空字符串现按 `w3c` 处理（兼容）。
+
+#### H5：`handler` 业务码与 HTTP 状态混乱 + 丢失 RequestID（handler/handler.go）
+
+`handler.BadRequest`/`handler.InternalError` 原直接 `c.JSON(http.StatusBadRequest/StatusInternalServerError, response.Response{...})`：硬编 HTTP 400/500 **绕过响应模式系统**（ModeBusiness 下所有失败响应本应 HTTP 200，错误经 body code 表达），且不写 `RequestID`（对比 `response.writeResp` 在 mode.go:73 写入）——与 `response` 体系不一致、丢失链路追踪。这正是"handler 绕过 response 模式系统"反模式。修复：
+- `BadRequest` 委托 `response.FailWithCode(c, CodeFail, msg)`，`InternalError` 委托 `response.ServerError(c, msg)`——复用 `writeResp` 路径，遵循当前 `Mode` 并写入 `RequestID`。
+- 无 API 签名变更；`net/http` 导入随之移除。行为变更见下方升级说明。
+
+#### H4b：`middleware/ratelimit.go` CustomRateLimit goroutine 泄漏（middleware/ratelimit.go）
+
+`CustomRateLimit` 每次调用 `NewRateLimiter`（启动一个 cleanup goroutine）但创建的 limiter 无任何句柄，`StopRateLimiters` 仅停止 `loginLimiter`/`apiLimiter`/`uploadLimiter` 不感知自定义限流器 → cleanup goroutine 永久泄漏。修复：
+- 新增包级 `customLimiters []*RateLimiter` 登记表（受 `limitersMu` 保护）；`CustomRateLimit` 创建后登记入表。
+- `StopRateLimiters` / `InitRateLimiters` 经 `drainCustomLimiters()` 取出并停止已登记的自定义限流器，释放 cleanup goroutine。
+- 无 API 签名变更；无行为变更（仅修复 goroutine 泄漏，限流语义不变）。`StopRateLimiters` 现可正确停止所有自定义限流器（与 H4a 报告建议一致）。
+
+#### H4c：`middleware/ratelimit.go` RedisRateLimiter fail-open + 裸断言（middleware/ratelimit.go）
+
+`RedisRateLimiter.Allow` 原有两个缺陷（H4c）：
+- **H4c-1 fail-open**：Redis 错误时 `return true, err`（放行），中间件层 `err != nil → c.Next()` 同样放行——**含登录防爆破场景静默失效**（Redis 抖动窗口限流失效，攻击者可借机爆破）。无 fail-closed 选项。
+- **H4c-2 裸断言**：`result.(int64)` 无 comma-ok，Redis 返回非 int64 时 panic（当前 Lua 脚本恒返整数不会触发，属脆弱性）。
+
+修复：
+- **H4c-1**：`RedisRateLimiter` 新增 `failClosed` 字段（零值 false=兼容默认 fail-open）。`Allow` 在 Redis 未启用/错误/断言失败时按策略决定：fail-closed 返 `(false, err)` 拒绝，fail-open 返 `(true, err)` 放行（兼容旧行为）。中间件层抽取 `redisLimitDecision`——不再无条件 fail-open，按 `allowed` 值决定：fail-closed 故障拒绝返 **503**（`CodeServiceUnavailable`，区别于真实超限的 429），fail-open 故障放行。
+- **H4c-2**：`result.(int64)` 改 comma-ok，断言失败返 `ErrRedisRateLimiterUnexpectedResult`（按 failClosed 策略拒绝/放行）而非 panic。
+- 新增构造函数 `NewRedisRateLimiterFailClosed`、切换方法 `SetFailClosed`、中间件 `RedisRateLimitFailClosed`/`CustomRedisRateLimitFailClosed`、导出错误 `ErrRedisRateLimiterUnavailable`/`ErrRedisRateLimiterUnexpectedResult`。
+- **`LoginRedisRateLimit` 改 fail-closed**（行为变更，见升级说明）：登录防爆破场景 Redis 故障时拒绝，防限流静默失效。
+- 无 API 签名变更（既有函数签名不变）；`RedisRateLimiter` 新增未导出 `failClosed` 字段。
+
+
+
+`Allow` 每次放行都 `v.lastSeen = time.Now()`，重置分支 `time.Since(lastSeen) > window` 对持续客户端永不成立 → count 单调累加，稳态客户端（低于 rate）被误限流，须静默满 window 才解锁（算例：rate=10/min、9 req/min 客户端也会被误限）。修复：
+- `visitor.lastSeen` 改名 `windowStart`，语义改为"当前固定窗口起点"，仅在新窗口开始时设置，放行时不变更。
+- `Allow` 窗口过期时重置 count + 新 windowStart；放行 count++ 不更新 windowStart；超限拒绝。
+- 新增 `nowFunc` 字段 + `SetNowFunc` 导出方法（默认 time.Now，测试可注入可控时钟，避免真实 Sleep flaky）。
+- 注：固定窗口允许窗口边界突发（2×rate），如需平滑用 Redis 版滑动窗口。H4b（CustomRateLimit goroutine 泄漏）/H4c（Redis fail-open + 裸断言）属独立缺陷，后续跟进。
+
+#### C9b：`jwt/jwt.go` 刷新令牌撤销失败仍签发（jwt/jwt.go）
+
+`RefreshToken` 原丢弃 `tokenBlacklist.Add` 错误仍 `return GenerateToken(...)`，Redis 抖动时旧 token 未拉黑、新旧 token 双有效，形成会话固定窗口。叠加 C9a：`Add`/`IsBlacklisted` 在 `client==nil` 时静默 `return nil`/`false`，黑名单失效无信号。修复：
+- **C9b**：`RefreshToken` 对 `Add` 错误 `return "", fmt.Errorf(...)`，fail-closed 不签发新 token。
+- **C9a**：`Add` 无 Redis 时返 `ErrBlacklistUnavailable`（新增导出错误），让 `RefreshToken`/`InvalidateToken`/`InvalidateTokenByID` 感知黑名单不可用并 fail-closed；`IsBlacklisted` 无 Redis 仍返 false（验证侧 fail-open 是无 Redis 部署固有局限，文档约束安全场景必须启用 Redis）。
+
+#### H1：`utils/random.go` 不安全 RNG 且文档反向推荐（utils/random.go）
+
+`randPool` 用 `math/rand` + `time.Now().UnixNano()` 播种，`RandString`/`RandDigit`/`RandInt`/`RandInt64` 取自该池，非密码学安全、可预测（`-race` 下并发同纳秒取池实例甚至生成相同序列）。GUIDE.md 原主动推荐 `RandString(16)` 用于 token、`RandDigit(6)` 用于 OTP 验证码，使可预测性可被实际利用。修复：
+- 新增 `RandStringSecure(n) (string, error)` / `RandDigitSecure(n) (string, error)`，基于 `crypto/rand` + `big.Int` 索引（拒绝采样无偏），不可预测；`n>1<<20` 返 `ErrRandInvalidLength` 保护熵池。
+- `RandString`/`RandDigit` 加安全警示注释（禁止用于 token/OTP/重置码/会话 ID）；保留用于非安全场景（测试数据、随机展示等）。
+- GUIDE.md token/OTP 示例改用 Secure 版本并标注错误处理；高分函数表区分"随机（安全/非安全）"；移除"sync.Pool 性能"误导宣传，改为并列说明。
+- gosec G404（randPool 的 math/rand）加 `#nosec` 留痕（非安全函数，安全场景用 Secure 版本）。
+
+#### H2：`utils/http.go` 默认关闭 TLS 校验（utils/http.go）
+
+`DefaultHTTPClientConfig.SkipTLSVerify` 原为 `true`，`NewHTTPClient()` → `HTTPGet`/`HTTPPost`/`HTTPPostJSON` 经 `DefaultHTTPClient()` 全部默认 `InsecureSkipVerify: true`，可被中间人攻击（MITM）。改为默认 `false`（校验 TLS）；自签证书场景需显式 `SetSkipTLS(true)` 或配置 `SkipTLSVerify: true`。`SetSkipTLS` 注释补充安全警示。gosec G402 加 `#nosec` 留痕（默认 false，opt-in 跳过）。
+
+#### H8：路由/注册中心全局单例无锁 + Apply 不幂等 + metrics 依赖调用顺序 + 三个 `/health` 行为不一（router/router.go, router/metrics.go, handler/handler.go, app.go）
+
+- **H8a 全局注册中心无锁 + 无 nil 守卫**：包级 `globalRegistry` 原为裸 `*Registry`，`Init` 写、`Use`/`RegisterModule`/`RegisterVersion`/`Apply` 等全局 helper 读存在数据竞争；且 `Init` 之前调用任意全局 helper 触发晦涩的 nil 解引用 panic。改为 `atomic.Pointer[Registry]`，读写均经 `Load()`/`Store()`；新增 `ensureRegistry()`，未初始化时以明确信息 panic（`router: 全局注册中心未初始化，请先调用 router.Init(engine)`），把 nil 解引用转成可定位的初始化顺序错误。
+- **H8b Apply 不幂等**：`Registry.Apply` 原无幂等位，二次调用重复 `engine.Use` 装入全局中间件并触发 Gin 重复路由 panic。新增 `applied` 标记，二次及以后 `Apply` 直接返回，中间件与路由仅装入一次。
+- **H8c metrics 依赖调用顺序**：`RegisterMetricsRoute` 原用 `r.Use(middleware.Metrics())`，Gin `engine.Use` 仅对其后注册的路由生效，先于其注册的路由不被采集（依赖调用顺序）。改为：`RegisterMetricsRoute` 仅注册 `/metrics` 暴露端点；采集中间件经新增 `Registry.SetMetricsMiddleware` 在 `Apply` 内作首个全局中间件装入，覆盖所有经注册中心注册的业务路由，不依赖注册顺序。`/metrics` 自身与 `/health` 等基础路由直接挂 engine、不经采集中间件，不被自采集（保留原意图）。
+- **H8d 三个 `/health` 行为/响应体不一**：`RegisterHealthRoute`（可 503）、`defaultModule`（恒 200 `{"status":"ok"}`）、`handler.HealthCheck`（恒 200 经 `response.Success` 包成 `{code,msg,data}` 信封）三处 schema/行为各异。抽取统一 `healthHandler(checks)`，`RegisterHealthRoute`/`RegisterReadinessRoute`/`defaultModule` 均委托之；`handler.HealthCheck` 响应体收敛为 `{"status":"ok"}`（不再走 response 业务信封），便于 K8s 探针直读。
+- **H8d 收尾：defaultModule 与 Register* 并存重复路由 panic（footgun）**：`defaultModule`（经 `WithModules` 注册 `/health`+`/swagger/*any`）与 `RegisterHealthRoute`/`RegisterSwaggerRoutes`（经 `WithDefaultRoutes` 注册同名路由）并存时触发 Gin `handlers are already registered` panic。新增 `registerGETOnce(r, path, h)` 幂等注册辅助，`RegisterHealthRoute`/`RegisterLivenessRoute`/`RegisterReadinessRoute`/`RegisterSwaggerRoutes`/`RegisterMetricsRoute`/`defaultModule` 全部经之：(GET, path) 已存在则静默跳过，首次注册胜出。`*gin.Engine` 经 `Routes()` 精确预检（不吞 panic，真正不同的路由冲突仍按 gin 原语义 panic）；`*gin.RouterGroup`（gin 未暴露 engine，无法预检）用 recover 兜底，仅吞 gin 重复路由 panic（`already registered` / `conflicts with existing wildcard`），最坏情况退化为原行为。
+- **Breaking ⚠️**：`handler.HealthCheck` 响应体由 `{code,msg,data:{status:"ok"}}` 改为 `{"status":"ok"}`，与 `router.RegisterHealthRoute` 同 schema。直接断言旧信封字段的下游需改断言 `status` 字段。需依赖探活（mysql/redis 失败 503）时改用 `router.RegisterHealthRoute(checks...)`。
+- **Changed**：框架基础路由注册（health/livez/readyz/swagger/metrics/defaultModule）改为幂等，重复注册静默跳过（首次胜出）——消除并存组合的 panic footgun，非破坏性（原本重复注册即 panic，现安全跳过）。
+- **Added**：`router.Registry.SetMetricsMiddleware`、`router.registerGETOnce`/`ensureRegistry`/`healthHandler`（未导出）。无配置/migration 变更。
+
+#### C3：`sse/sse.go` 断连泄漏 goroutine + 算力（AI 主场景，sse/sse.go）
+
+- **C3b 写/Flush 错误被吞**：`WriteEvent`/`WriteMessage` 原丢弃 `fmt.Fprintf` 错误且恒 `return nil`，导致 `StreamText` 等的 `if err := WriteJSON(...); err != nil` 守卫只对 marshal 失败生效、对客户端断连永不触发 → 消费循环不退出 + 上游 LLM 流持续运行直到进程结束。改为传播 `fmt.Fprintf` 写错误。
+- **C3a 循环无 ctx.Done**：`Stream`/`StreamText`/`StreamChunks`/`StreamWithID` 的 `for range ch` 改 `for { select { case <-ctx.Done(): return ctx.Err(); case v,ok:=<-ch: ... } }`，客户端断连即退出。`SSEWriter` 加 `ctx` 字段（NewSSEWriter 存 `c.Request.Context()`），并对 nil ctx 回退 `context.Background()` 防御。
+- **C3c 手设 chunked 头**：删除 `Transfer-Encoding: chunked`（HTTP/1.1 冗余、HTTP/2 非法），交由 server 自动分帧。
+- 生产者契约文档化：`StreamText` 注释说明生产者应监听 `c.Request.Context()`，取消时停止上游 LLM 流（框架无法单方面停止生产者）。
+
+#### C7：`middleware/cors.go` 通配符后缀绕过 + 开发态任意 Origin 回显（middleware/cors.go）
+
+- **C7a 通配后缀绕过**：`*.example.com` 原用 `strings.HasSuffix(origin, domain)` 未锚定 host 边界，`https://notexample.com`、`https://evil-example.com` 被接受。改用 `net/url` 解析 origin 的 host，要求 host 以 `.domain` 结尾（真实子域边界）且不等于 apex 自身。抽取 `matchOrigin` 函数（精确匹配 + 通配子域，大小写不敏感、支持端口与 FQDN 尾点）。
+- **C7b 开发态任意 Origin 回显**：开发态原无条件回显任意 Origin，若同时 `AllowCredentials=true` 构成凭据型反射。改仅对 localhost/127.0.0.1/::1 回显（`isLocalhostOrigin`），杜绝任意站点携凭证访问。
+- **C7 收尾（信息泄露收敛）**：未匹配 origin 时不再发送 `Access-Control-Allow-Methods`/`Allow-Headers`/`Expose-Headers`/`Max-Age`，避免向未授权 origin 暴露 API 允许的方法/头清单。这些头现仅在 origin 匹配时随 `Allow-Origin` 一并发送。
+
+#### C1：`cache/lock.go` 分布式锁 panic/泄漏/裸断言（cache/lock.go）
+
+- **C1a `WithLockAutoExtend` send-on-closed panic + 锁泄漏**：续期改"父关停 + 子 ack"双 channel（`close(stop)` + `<-finished`），消除旧 `done <- struct{}{}` 向已关闭 channel send 的 panic。`Unlock` 用 `context.WithTimeout(context.Background(), 5s)` 派生超时，避免原 ctx 已取消致解锁失败再泄漏。`fn()` panic 路径加 `defer` 兜底，保证 panic 时也停止续期 goroutine 并释放锁（独立复审发现 CRITICAL）。
+- **C1a 一致性（HIGH）**：`WithLock` 的 `defer Unlock` 同改 Background 超时 ctx + defer 兜底，与 `WithLockAutoExtend` 一致。
+- **C1b 裸类型断言**：新增 `toInt64(v)` 辅助函数（comma-ok），`NewLock`/`Unlock`/`ExtendLock` 三处 `result.(int64)` 改用之，断言失败返 `ErrLockUnexpectedResult` 而非 panic。新增导出错误 `ErrLockUnexpectedResult`。
+- **C1c `TryLock` 忽略 ctx**：`time.Sleep` 改 `select { ctx.Done()/time.After }`，响应取消。
+- **C1d 无 fencing token**：`LockToken` 文档化设计局限（需 Redis INCR + 下游校验，框架无法单方面保证），不引入破坏性数据结构变更。
+
+#### C2：`ws` Hub 死锁 + send-on-closed panic + 半开连接泄漏（ws/ws.go）
+
+- **C2a 广播死锁**：`Hub.Run` 的 broadcast 分支原在 `conn.Send` 失败时 `h.unregister <- conn`（向自身消费的 channel 发送，无接收者）→ 永久阻塞、整个 Hub 卡死。改持写锁单次遍历，失败连接行内 `delete + conn.Close()`，去掉 channel 回环。`Send` 改非阻塞投递（缓冲满返回 `ErrSendBufferFull`），避免持写锁期间因慢消费者/已死连接阻塞最长 `pongWait` 导致 Hub stall（C2a-residual）。
+- **C2b send-on-closed panic**：`Close()` 不再 `close(c.send)`，仅 `close(c.closeChan)` + `c.conn.Close()`；`Send` 前置 `IsClosed()` 快速失败 + select 兜底。消除 `Close` 与并发 `Send` 的 send-on-closed panic。
+- **C2c 半开连接泄漏**：`Handle` 读循环前置 `SetReadDeadline(pongWait)` + `SetPongHandler`（重置读 deadline）；`writePump` 每次写前 `SetWriteDeadline(writeWait)`、ping 周期 `pingPeriod = pongWait*9/10`；写失败主动 `Close` 触发读循环退出，加速半开连接回收。新增常量 `pongWait=60s`/`pingPeriod=54s`/`writeWait=10s` 与导出错误 `ErrSendBufferFull`。
+
+#### C5：`compress` Zip-Slip + 解压炸弹（compress/compress.go）
+
+- **C5a Zip-Slip**：`unzipFile` 改用 `filepath.Join` + 前缀锚定（`absDst+sep`），拒绝条目名含 `..` 逃逸、绝对路径、以分隔符开头；拒绝符号链接条目（`ModeSymlink`）防经软链二次穿越。修复前 `file.Name` 可含 `../`，`os.Create` 覆盖任意文件。
+- **C5b 解压炸弹**：`GzipDecompress` 由 `io.ReadAll` 改 `io.LimitReader`；`GzipDecompressFile`/`Unzip` 由 `io.Copy` 改 `io.CopyN` 单条目封顶 + Unzip 累计封顶。新增 `DecompressOptions{MaxBytes, MaxTotalBytes}`（0=默认，-1=不限）与 `*WithOptions` 变体；默认单流/单条目 100MB、Unzip 累计 1GB。
+
+#### C4：`storage` 路径穿越 + 无上传校验 + Get OOM（storage/storage.go）
+
+- **C4a 路径穿越**：Local 的 `Delete/Get/Exists/Upload/UploadFromBytes` 的相对路径全经新增 `safeJoin` 前缀锚定（`rootAbs+sep`），拒绝绝对路径/NUL/`..` 逃逸，杜绝任意文件删/读/探测与任意目录写。OSS 的 `Delete/Get/Exists/Upload/UploadFromBytes` 全经新增 `sanitizeObjectKey` 拒绝含 `..`/绝对路径/空/NUL 的 key。
+- **C4b 上传校验**：新增可配置 `UploadPolicy{MaxSizeBytes, AllowedExts, AllowedMIMEs}`（嵌入 `local`/`oss` 配置）。`AllowedMIMEs` 非空时用 `http.DetectContentType` 嗅探前 512B（取主类型比较）并拼回头部。零值不限（兼容下游）。
+- **C4c Get 读封顶**：Local `Get` 由 `os.ReadFile` 改为 `io.LimitReader` 封顶，OSS `Get` 同理；默认上限 100MB（`max_read_bytes`：0=默认，-1=不限，正数=该值），防全量读入内存 OOM。
+- **HIGH（跨平台）**：OSS object key 拼接由 `filepath.Join`（Windows 产 `\`）改 `path.Join` + `sanitizeObjectKey` 归一化 `\`→`/`，保证 Windows/Linux 部署 key 一致。
+- 附：`MkdirAll` 权限 0755→0750（gosec G301）。
+
+### 升级说明 🛠️
+
+- **H6 行为变更（非破坏性，正向修复）**：
+  - `BaseRepo` 读操作（`FindByID`/`FindAll`/`FindPage`/`FindWhere`/`Count`/`Exists`/...）默认路由到**从库**（原全部走构造时捕获的主库），支持 `database.UseMaster(ctx)`/`UseReplica(ctx)` 显式路由。未配置从库时仍走主库（`Replica()` 无从库回退主库）。
+  - `BaseRepo` 写操作（`Create`/`Update`/`Delete`/`*Batch`/`Restore`/...）显式走**主库**，即便 ctx 标记 `UseReplica` 也不写到从库。
+  - `FindPage*` 的 count+list 现包进单事务（每页一次 BEGIN/COMMIT）以保证 total/items 快照一致。高频分页接口会有极小额外往返开销；若不可接受可自行用 `QueryBuilder.Page`（轻量、不包事务）。
+  - 跨层/跨 repo 事务 join：外层 `database.TransactionWithContext`（或任意 `*gorm.DB` 事务）中，用 `database.WithTx(ctx, tx)` 注入 ctx 后传给 `BaseRepo` 方法即可参与同一事务。
+  - 新增 `BaseRepo.UpdateFields`（局部更新，推荐替代 `Update` 的全列覆写）；`Update`（`Save`）行为不变但文档化其全列覆写语义。
+  - `QueryBuilder` 标注为单次使用、非并发安全；终结方法现克隆不污染构建器，`Count`/`Page` 的 count 剥离残留 Limit/Offset。
+  - 无 API 签名/配置/migration 变更；下游 `NewBaseRepo[T](database.GetDB())` 用法完全兼容。
+- **C8 行为变更（非破坏性）**：panic 响应的 HTTP 状态由 200（ModeBusiness）改为 500，body 不变（`code:500` + msg + `request_id`）。ModeREST 行为不变。下游若按"panic 返 200"做适配（极罕见）需注意。已知局限：若 handler 在 panic 前已 flush 部分响应，HTTP 状态无法再改写（HTTP 固有局限，非本次引入）。
+- **C6 行为变更**：API 模式 CSRF token 改为单次消费（每次成功 POST 后需重新 `GenerateAPIToken`）+ 30min TTL；`DoubleSubmitCookie` 的 cookie `HttpOnly` 由 true 改 false。原 API 模式整体不可用，故无真实回归。
+- **C4 行为变更（非破坏性）**：
+  - 含 `..`/绝对路径的 `Delete/Get/Exists` 路径现被拒绝（`ErrPathTraversal`），合法相对路径不受影响。
+  - `Get` 默认读取上限 100MB，超限返回错误；需读大文件请配置 `storage.local.max_read_bytes: -1`（不限）或具体值。OSS 同理（`storage.oss.max_read_bytes`）。
+  - 上传目录权限 0755→0750（仅 owner/group 可访问）。
+  - 新增可选配置 `storage.local.upload` / `storage.oss.upload`（`max_size_bytes`/`allowed_exts`/`allowed_mime_types`），零值不限制以兼容现有下游；生产环境建议显式配置。
+  - 安全约束：本地存储根目录应为框架独占，不与用户可控内容混用（防符号链接二次穿越）。
+- **C5 行为变更（非破坏性）**：
+  - `Unzip` 现默认拒绝含 `..`/绝对路径的条目（`ErrPathTraversal`）与符号链接条目（`ErrSymlinkEntry`），合法归档不受影响。
+  - `GzipDecompress`/`GzipDecompressFile`/`Unzip` 默认解压上限：单流/单条目 100MB、Unzip 累计 1GB，超限返回 `ErrDecompressLimit`。需解压更大文件用 `*WithOptions` 变体设 `MaxBytes: -1`（不限）或具体值。
+  - 原函数签名保留；新增 `GzipDecompressWithOptions`/`GzipDecompressFileWithOptions`/`UnzipWithOptions`。
+- **C2 行为变更（非破坏性）**：
+  - `Connection.Send` 改为非阻塞投递：发送缓冲满时返回 `ErrSendBufferFull`（新导出错误）而非阻塞等待。原阻塞语义的下游需改为重试或关闭连接。
+  - `Hub` 广播对发送失败（含缓冲满/已关闭）的连接行内移除并关闭——慢消费者会被踢除（ws 广播 best-effort 语义）。
+  - WebSocket 连接现启用读写超时与 ping/pong 心跳：半开连接在 `pongWait`（60s）内退出，不再永久阻塞 goroutine。
+  - 公共 API 签名不变；`Connection.send` 不再被 close（内部行为）。
+- **C1 行为变更（非破坏性）**：
+  - `WithLockAutoExtend`/`WithLock` 的解锁改用独立 `context.Background()` 超时（5s），原 ctx 已取消也能解锁（语义：取消业务 ≠ 继续独占锁）。
+  - `WithLockAutoExtend` fn panic 时仍释放锁（defer 兜底）。
+  - `TryLock` 重试等待响应 ctx 取消。
+  - 新增导出错误 `ErrLockUnexpectedResult`（Lua 返回非 int64）。
+- **C7 行为变更（非破坏性，收紧）**：
+  - `*.example.com` 通配不再匹配 `notexample.com`/`evil-example.com` 等后缀相同但非真实子域的域名；apex `example.com` 不由通配覆盖，需显式配置。
+  - 开发态 CORS 兜底仅对 localhost/127.0.0.1/::1 回显 Origin，不再回显任意 Origin。原本依赖开发态回显任意域名的下游需改用显式白名单。
+  - 未匹配 origin 的响应不再携带 `Access-Control-Allow-Methods`/`Allow-Headers`/`Expose-Headers`/`Max-Age`（信息泄露收敛）；匹配时正常发送。
+- **C3 行为变更（非破坏性）**：
+  - `StreamText`/`StreamChunks`/`StreamWithID`/`Stream` 在客户端断连（`c.Request.Context()` 取消）时返回 `context.Canceled` 而非永久阻塞。
+  - `WriteEvent`/`WriteMessage` 现可能返回写错误（旧实现恒 nil）；下游若忽略返回值不受影响。
+  - 响应不再手设 `Transfer-Encoding: chunked`。
+  - 公共 API 签名不变；`SSEWriter` 新增私有 `ctx` 字段（外部字面量构造需走 `NewSSEWriter`）。
+- **H2 行为变更（可能影响下游）**：`utils` HTTP 客户端默认**校验 TLS**（`DefaultHTTPClientConfig.SkipTLSVerify` 由 `true` 改 `false`）。`HTTPGet`/`HTTPPost`/`HTTPPostJSON`/`NewHTTPClient()` 不再默认跳过证书校验。下游访问**自签证书**的内网/开发服务会因证书校验失败报错，需显式 `client.SetSkipTLS(true)` 或 `NewHTTPClientWithConfig(HTTPClientConfig{SkipTLSVerify: true})`。生产环境应保持默认校验。
+- **H1 行为变更（Breaking，删除函数）**：
+  - **删除** `utils.RandString` / `RandDigit`（math/rand 版本）。字符串随机的用途几乎都是安全场景（token/OTP/验证码/会话 ID），保留 math/rand 版本会诱导误用（H1 的根因正是 GUIDE 推荐 RandString 做 token）。下游迁移：
+    - token/OTP/验证码/会话 ID → `RandStringSecure` / `RandDigitSecure`（crypto/rand）。
+    - 非安全场景需高性能随机串 → 直接用标准库 `math/rand`。
+  - **保留** `RandInt` / `RandInt64`（范围随机，有明确非安全场景：负载均衡/游戏/A-B 分桶），加非安全警示注释。
+  - 新增 `RandStringSecure` / `RandDigitSecure`（基于 `crypto/rand`，返 `(string, error)`）与 `ErrRandInvalidLength`。
+  - 新增 `RandIntSecure` / `RandInt64Secure`（基于 `crypto/rand` + `big.Int` 拒绝采样无偏，返 `(T, error)`），用于安全 nonce 范围、防猜抽奖、密钥分桶等。
+  - GUIDE 示例改用 Secure 版本。
+- **C9b 行为变更（可能影响下游）**：
+  - `jwt.RefreshToken` 在旧 token 撤销失败（Redis 不可用/抖动）时**不再签发新 token**（fail-closed），返回错误。原行为是丢弃错误仍签发，致新旧 token 双有效。
+  - `jwt.InvalidateToken`/`InvalidateTokenByID`/`TokenBlacklist.Add` 在无 Redis 时返回 `ErrBlacklistUnavailable`（新增导出错误），不再静默成功。
+  - `IsBlacklisted` 无 Redis 仍返 false（验证侧 fail-open，无 Redis 部署固有局限——安全敏感场景必须启用 Redis）。
+  - 签名不变；新增 `ErrBlacklistUnavailable`。
+- **H4a 行为变更（非破坏性）**：内存限流器 `RateLimiter` 改固定窗口语义，稳态客户端（低于 rate 的持续请求）不再被误限流。`Allow`/`NewRateLimiter`/`Stop` 签名不变；新增 `SetNowFunc`（测试用可控时钟）。
+- **H5 行为变更（非破坏性）**：`handler.BadRequest`/`handler.InternalError` 不再硬编 HTTP 400/500，改为遵循当前响应模式（委托 `response` 体系）：默认 `ModeBusiness` 下两者均返回 HTTP 200（错误经 body `code` 表达，与 `response.Fail*` 一致）；`ModeREST` 下 `InternalError` 返回 500（`CodeServerError` 映射），`BadRequest` 返回 200（`CodeFail` 属业务失败不映射 HTTP 错误，与 `response.Fail` 一致）。两者现写入 `RequestID`。下游若依赖 `handler.BadRequest` 恒返 400 需改用 `response.Custom(c, 400, code, msg, nil)` 或业务自定义 4xxxx 错误码。
+- **H4c 行为变更（可能影响下游）**：
+  - **`LoginRedisRateLimit` 改 fail-closed**：Redis 故障/未启用时由放行改为拒绝（HTTP 503，`CodeServiceUnavailable`）。登录防爆破场景下 Redis 故障不再静默放行（原 fail-open 致限流失效）。下游登录接口须确保 Redis 可用，否则登录会在 Redis 故障时不可用（安全语义：宁拒勿放）。
+  - 其余 Redis 限流中间件（`RedisRateLimit`/`APIRedisRateLimit`/`UploadRedisRateLimit`/`CustomRedisRateLimit`/`RedisRateLimitWithIdentifier`）保持 fail-open（兼容默认）。
+  - 新增 fail-closed 变体：`RedisRateLimitFailClosed`/`CustomRedisRateLimitFailClosed`/`NewRedisRateLimiterFailClosed`/`SetFailClosed`，供安全敏感场景选用。
+  - 新增导出错误 `ErrRedisRateLimiterUnavailable`/`ErrRedisRateLimiterUnexpectedResult`。
+  - 无既有 API 签名变更。
+- 无 API 签名变更、无 migration。新增测试依赖 `github.com/alicebob/miniredis/v2`。
+
+---
+
 ## [1.1.1] - 2026-06-23
 
 > 本版本为 v1.1.0 的补丁发布：补 ServerConfig.Host 字段、统一面向用户文案为中文、修正 README 过时/错误描述。

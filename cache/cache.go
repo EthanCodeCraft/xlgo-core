@@ -28,25 +28,31 @@ type CacheService interface {
 	Exists(ctx context.Context, key string) bool
 }
 
-// redisCache Redis 缓存实现
-type redisCache struct {
-	client *redis.Client
+// redisCache Redis 缓存实现。
+//
+// 不在构造时快照 redis.Client（M12 修复：原 NewRedisCache 构造时取 database.GetRedis()，
+// 若在 database.InitRedis 之前构造则永久 nil、即使后续 Redis 就绪也是 no-op）。
+// 改为每次操作实时取 database.GetRedis()，使"先构造后 Init Redis"的顺序也能正确工作。
+type redisCache struct{}
+
+// client 返回当前 Redis 客户端（实时取，未初始化则 nil）。
+func (c *redisCache) client() *redis.Client {
+	return database.GetRedis()
 }
 
 // NewRedisCache 创建 Redis 缓存实例
 func NewRedisCache() CacheService {
-	return &redisCache{
-		client: database.GetRedis(),
-	}
+	return &redisCache{}
 }
 
 // Get 获取缓存值
 func (c *redisCache) Get(ctx context.Context, key string, dest any) bool {
-	if c.client == nil {
+	cli := c.client()
+	if cli == nil {
 		return false
 	}
 
-	val, err := c.client.Get(ctx, key).Result()
+	val, err := cli.Get(ctx, key).Result()
 	if err != nil {
 		if err != redis.Nil {
 			logger.Warn("缓存获取失败", zap.String("key", key), zap.Error(err))
@@ -64,7 +70,8 @@ func (c *redisCache) Get(ctx context.Context, key string, dest any) bool {
 
 // Set 设置缓存值
 func (c *redisCache) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
-	if c.client == nil {
+	cli := c.client()
+	if cli == nil {
 		return nil // Redis 未启用，跳过缓存
 	}
 
@@ -74,7 +81,7 @@ func (c *redisCache) Set(ctx context.Context, key string, value any, ttl time.Du
 		return err
 	}
 
-	if err := c.client.Set(ctx, key, data, ttl).Err(); err != nil {
+	if err := cli.Set(ctx, key, data, ttl).Err(); err != nil {
 		logger.Warn("缓存设置失败", zap.String("key", key), zap.Error(err))
 		return err
 	}
@@ -84,11 +91,12 @@ func (c *redisCache) Set(ctx context.Context, key string, value any, ttl time.Du
 
 // Delete 删除缓存
 func (c *redisCache) Delete(ctx context.Context, key string) error {
-	if c.client == nil {
+	cli := c.client()
+	if cli == nil {
 		return nil
 	}
 
-	if err := c.client.Del(ctx, key).Err(); err != nil {
+	if err := cli.Del(ctx, key).Err(); err != nil {
 		logger.Warn("缓存删除失败", zap.String("key", key), zap.Error(err))
 		return err
 	}
@@ -98,7 +106,8 @@ func (c *redisCache) Delete(ctx context.Context, key string) error {
 
 // DeleteByPattern 按模式删除缓存（使用 SCAN 避免阻塞 Redis）
 func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error {
-	if c.client == nil {
+	cli := c.client()
+	if cli == nil {
 		return nil
 	}
 
@@ -107,7 +116,7 @@ func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error 
 
 	for {
 		// 使用 SCAN 命令迭代查找匹配的键
-		keys, nextCursor, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		keys, nextCursor, err := cli.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
 			logger.Warn("缓存键扫描失败", zap.String("pattern", pattern), zap.Error(err))
 			return err
@@ -115,7 +124,7 @@ func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error 
 
 		// 删除找到的键
 		if len(keys) > 0 {
-			if err := c.client.Del(ctx, keys...).Err(); err != nil {
+			if err := cli.Del(ctx, keys...).Err(); err != nil {
 				logger.Warn("缓存批量删除失败", zap.Strings("keys", keys), zap.Error(err))
 				return err
 			}
@@ -140,11 +149,12 @@ func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error 
 
 // Exists 检查缓存是否存在
 func (c *redisCache) Exists(ctx context.Context, key string) bool {
-	if c.client == nil {
+	cli := c.client()
+	if cli == nil {
 		return false
 	}
 
-	return c.client.Exists(ctx, key).Val() > 0
+	return cli.Exists(ctx, key).Val() > 0
 }
 
 // CacheManager 缓存管理器（#10）。照 database.Manager 模式：

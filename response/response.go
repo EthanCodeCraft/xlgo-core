@@ -2,6 +2,7 @@ package response
 
 import (
 	"net/http"
+	"net/url"
 
 	"github.com/EthanCodeCraft/xlgo-core/utils"
 	"github.com/gin-gonic/gin"
@@ -88,10 +89,41 @@ func Page(c *gin.Context, items any, total int64, page, pageSize int) {
 	})
 }
 
+// contentDisposition 生成 RFC 5987 兼容的 Content-Disposition 值（M6 修复）。
+// 同时给出 ASCII filename（向后兼容旧客户端）与 filename*（UTF-8 百分号编码，支持中文等非 ASCII），
+// 避免直接拼接导致中文文件名乱码。
+func contentDisposition(filename string) string {
+	ascii := asciiFallbackName(filename)
+	enc := url.PathEscape(filename)
+	// PathEscape 把空格编码为 %20（符合 RFC 5987），无需额外处理。
+	return "attachment; filename=\"" + ascii + "\"; filename*=UTF-8''" + enc
+}
+
+// asciiFallbackName 生成仅含 ASCII 的回退文件名：非 ASCII 字符替换为下划线，
+// 空文件名回退为 "download"。
+func asciiFallbackName(filename string) string {
+	if filename == "" {
+		return "download"
+	}
+	b := make([]byte, 0, len(filename))
+	for i := 0; i < len(filename); i++ {
+		c := filename[i]
+		if c >= 0x20 && c < 0x7f && c != '"' && c != '\\' {
+			b = append(b, c)
+		} else {
+			b = append(b, '_')
+		}
+	}
+	if len(b) == 0 {
+		return "download"
+	}
+	return string(b)
+}
+
 // Download 文件下载响应
 func Download(c *gin.Context, filename string, data []byte) {
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Disposition", contentDisposition(filename))
 	c.Header("Content-Length", utils.ToString(len(data)))
 	c.Data(http.StatusOK, "application/octet-stream", data)
 }
@@ -99,7 +131,7 @@ func Download(c *gin.Context, filename string, data []byte) {
 // DownloadWithContentType 文件下载（自定义Content-Type）
 func DownloadWithContentType(c *gin.Context, filename string, contentType string, data []byte) {
 	c.Header("Content-Type", contentType)
-	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Disposition", contentDisposition(filename))
 	c.Header("Content-Length", utils.ToString(len(data)))
 	c.Data(http.StatusOK, contentType, data)
 }

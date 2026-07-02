@@ -24,7 +24,9 @@ type HTTPClient struct {
 	headers   map[string]string
 	cookies   map[string]string
 	skipTLS   bool
-	once      sync.Once
+	// maxRespBodySize 响应体读取上限（字节），0 表示用默认 32MB，-1 表示不限。
+	// 防止恶意/异常服务端返回超大响应打爆内存（C5/N5）。
+	maxRespBodySize int64
 }
 
 // UploadFile 上传文件信息
@@ -40,7 +42,10 @@ type HTTPClientConfig struct {
 	IdleConnTimeout    time.Duration // 空闲连接超时时间
 	MaxConnsPerHost    int           // 每个主机最大连接数
 	MaxIdleConnsPerHost int           // 每个主机最大空闲连接数
-	SkipTLSVerify      bool          // 是否跳过 TLS 验证
+	SkipTLSVerify      bool          // 是否跳过 TLS 验证（默认 false 校验 TLS；自签证书场景需显式设 true）
+	// MaxResponseBodySize 响应体读取上限（字节）。0 = 默认 32MB，-1 = 不限制。
+	// 防止异常服务端返回超大响应打爆内存（C5/N5）。
+	MaxResponseBodySize int64
 }
 
 // DefaultHTTPClientConfig 默认配置
@@ -50,7 +55,8 @@ var DefaultHTTPClientConfig = HTTPClientConfig{
 	IdleConnTimeout:     90 * time.Second,
 	MaxConnsPerHost:     10,
 	MaxIdleConnsPerHost: 10,
-	SkipTLSVerify:       true, // 开发环境默认跳过
+	SkipTLSVerify:       false, // H2 修复：默认校验 TLS，防 MITM；自签证书需显式 SetSkipTLS(true)
+	MaxResponseBodySize: 32 * 1024 * 1024,
 }
 
 // NewHTTPClient 创建 HTTP 客户端
@@ -63,6 +69,8 @@ func NewHTTPClient() *HTTPClient {
 func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 	// Transport 在初始化时创建，连接池可复用
 	transport := &http.Transport{
+		// #nosec G402 -- InsecureSkipVerify 仅在调用方显式设 cfg.SkipTLSVerify=true 时启用，
+		// 默认 false 校验 TLS（H2 修复）。自签证书场景需 opt-in。
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.SkipTLSVerify,
 		},
@@ -79,12 +87,13 @@ func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 	}
 
 	return &HTTPClient{
-		client:    client,
-		transport: transport,
-		timeout:   cfg.Timeout,
-		headers:   make(map[string]string),
-		cookies:   make(map[string]string),
-		skipTLS:   cfg.SkipTLSVerify,
+		client:          client,
+		transport:       transport,
+		timeout:         cfg.Timeout,
+		headers:         make(map[string]string),
+		cookies:         make(map[string]string),
+		skipTLS:         cfg.SkipTLSVerify,
+		maxRespBodySize: cfg.MaxResponseBodySize,
 	}
 }
 
@@ -115,10 +124,12 @@ func (c *HTTPClient) SetCookie(key, value string) *HTTPClient {
 	return c
 }
 
-// SetSkipTLS 设置是否跳过 TLS 验证
-// 注意: 修改 TLS 配置需要重新创建 Transport
+// SetSkipTLS 设置是否跳过 TLS 验证。
+// 注意: 修改 TLS 配置需要重新创建 Transport。跳过 TLS 校验会暴露于 MITM 攻击，
+// 仅在受控环境（如自签证书的内网服务）且明确风险时启用，生产环境应保持 false。
 func (c *HTTPClient) SetSkipTLS(skip bool) *HTTPClient {
 	c.skipTLS = skip
+	// #nosec G402 -- skip 由调用方显式传入，opt-in 跳过 TLS 校验（默认 false）。
 	c.transport.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: skip,
 	}
@@ -211,15 +222,18 @@ func (c *HTTPClient) Upload(urlStr string, files []UploadFile, params map[string
 		if err != nil {
 			return nil, err
 		}
-		defer file.Close()
 
 		part, err := writer.CreateFormFile(f.FieldName, filepath.Base(f.FilePath))
 		if err != nil {
+			file.Close()
 			return nil, err
 		}
 		if _, err = io.Copy(part, file); err != nil {
+			file.Close()
 			return nil, err
 		}
+		// 显式关闭，避免循环内 defer 累积 FD（N5/C5）。
+		file.Close()
 	}
 
 	for k, v := range params {
@@ -307,7 +321,25 @@ func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("http error: %d %s", resp.StatusCode, resp.Status)
 	}
 
-	return io.ReadAll(resp.Body)
+	// 响应体读取封顶，防异常服务端返回超大响应打爆内存（C5/N5）。
+	// maxRespBodySize: 0=默认 32MB，-1=不限。
+	limit := c.maxRespBodySize
+	if limit == 0 {
+		limit = 32 * 1024 * 1024
+	}
+	var reader io.Reader = resp.Body
+	if limit > 0 {
+		// 多读 1 字节用于判断是否超限。
+		reader = io.LimitReader(resp.Body, limit+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	if limit > 0 && int64(len(data)) > limit {
+		return nil, fmt.Errorf("response body exceeds limit %d bytes", limit)
+	}
+	return data, nil
 }
 
 // DoWithResponse 执行请求并返回完整响应

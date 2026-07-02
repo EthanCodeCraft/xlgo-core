@@ -51,8 +51,11 @@ func DefaultIfBlank(s, def string) string {
 	return s
 }
 
-// IsEmpty 检查任意类型是否为空值
-// 支持: string, []T, map[K]V, nil, 零值
+// IsEmpty 检查任意类型是否为空值。
+//
+// 实际支持（N4 文档修正）：nil、空 string、空 []byte。
+// 注意：通用 []T / map[K]V 走 default 分支恒返回 false（不为空）——若需对任意 slice/map
+// 判空，请用 len() 显式判断。文档原称支持 slice/map 与实现不符，已修正。
 func IsEmpty(v any) bool {
 	if v == nil {
 		return true

@@ -1,11 +1,14 @@
 package jwt_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/jwt"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 )
 
 func setupTestConfig() {
@@ -108,25 +111,27 @@ func TestRefreshToken(t *testing.T) {
 	// 生成 token
 	token, _ := jwt.GenerateToken(1, "testuser", "admin", "super_admin")
 
-	// 刷新 token
-	newToken, err := jwt.RefreshToken(token)
-	if err != nil {
-		t.Fatalf("RefreshToken error: %v", err)
+	// 无 Redis 时 RefreshToken 必须 fail-closed（C9b 修复：旧 token 撤销失败不签发新 token）
+	_, err := jwt.RefreshToken(token)
+	if !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Errorf("RefreshToken without Redis should fail with ErrBlacklistUnavailable, got %v", err)
 	}
+}
 
-	if newToken == "" {
-		t.Error("RefreshToken should return non-empty token")
-	}
-
-	// 新 token 应可解析
-	claims, err := jwt.ParseToken(newToken)
-	if err != nil {
-		t.Fatalf("ParseToken new token error: %v", err)
-	}
-
-	if claims.Username != "testuser" {
-		t.Error("RefreshToken claims should match original")
-	}
+// setupMiniRedis 启动 miniredis 并注入到 jwt 包级 tokenBlacklist（经 SetDefaultJWTManager）。
+// 测试结束 cleanup 还原为无 Redis 的默认 Manager，避免污染后续测试（-shuffle 下尤其关键）。
+func setupMiniRedis(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() {
+		_ = client.Close()
+		// 还原包级 tokenBlacklist 为无 Redis 默认 Manager，避免残留指向已关闭 miniredis 的 client。
+		jwt.SetDefaultJWTManager(jwt.NewJWTManager())
+	})
+	// 用注入 Redis 的 Manager 替换默认，使包级 tokenBlacklist 指向 miniredis。
+	jwt.SetDefaultJWTManager(jwt.NewJWTManagerWithRedis(client))
+	return mr
 }
 
 func TestClaimsStructure(t *testing.T) {
@@ -169,13 +174,13 @@ func TestErrorDefinitions(t *testing.T) {
 func TestTokenBlacklist(t *testing.T) {
 	tb := jwt.TokenBlacklist{}
 
-	// 无 Redis 时，Add 应返回 nil
+	// 无 Redis 时，Add 应返回 ErrBlacklistUnavailable（C9a 修复：fail-closed）
 	err := tb.Add("test-token", time.Now().Add(time.Hour))
-	if err != nil {
-		t.Errorf("TokenBlacklist.Add without Redis should return nil, got %v", err)
+	if !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Errorf("TokenBlacklist.Add without Redis should return ErrBlacklistUnavailable, got %v", err)
 	}
 
-	// 无 Redis 时，IsBlacklisted 应返回 false
+	// 无 Redis 时，IsBlacklisted 仍返回 false（验证侧 fail-open 是无 Redis 部署的固有局限）
 	if tb.IsBlacklisted("test-token") {
 		t.Error("TokenBlacklist.IsBlacklisted without Redis should return false")
 	}
@@ -186,10 +191,10 @@ func TestInvalidateToken(t *testing.T) {
 
 	token, _ := jwt.GenerateToken(1, "test", "admin", "admin")
 
-	// 无 Redis 时应返回 nil
+	// 无 Redis 时应返回 ErrBlacklistUnavailable（C9a 修复：fail-closed，不再静默成功）
 	err := jwt.InvalidateToken(token)
-	if err != nil {
-		t.Errorf("InvalidateToken without Redis should return nil, got %v", err)
+	if !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Errorf("InvalidateToken without Redis should return ErrBlacklistUnavailable, got %v", err)
 	}
 }
 
@@ -215,3 +220,95 @@ func splitToken(token string) []string {
 	result = append(result, token[start:])
 	return result
 }
+
+// ===== C9b 回归：刷新令牌撤销闭环 =====
+
+// 回归 C9b：RefreshToken 成功后，旧 token 必须被拉黑（ParseToken 返 ErrTokenRevoked），
+// 新 token 可用。旧实现丢弃 Add 错误仍签发新 token，旧 token 仍有效（双有效）。
+func TestRefreshTokenRevokesOldToken(t *testing.T) {
+	setupTestConfig()
+	setupMiniRedis(t)
+
+	token, _ := jwt.GenerateToken(1, "testuser", "admin", "super_admin")
+
+	// 刷新
+	newToken, err := jwt.RefreshToken(token)
+	if err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	if newToken == "" {
+		t.Fatal("RefreshToken should return non-empty token")
+	}
+
+	// 新 token 可解析
+	newClaims, err := jwt.ParseToken(newToken)
+	if err != nil {
+		t.Fatalf("ParseToken new token: %v", err)
+	}
+	if newClaims.Username != "testuser" {
+		t.Error("new token claims should match original")
+	}
+
+	// 旧 token 必须已被拉黑（C9b 核心）
+	_, err = jwt.ParseToken(token)
+	if !errors.Is(err, jwt.ErrTokenRevoked) {
+		t.Errorf("old token after refresh err = %v, want ErrTokenRevoked (C9b: old must be blacklisted)", err)
+	}
+}
+
+// 回归 C9b：Redis 抖动（Add 失败）时 RefreshToken 必须 fail-closed，不签发新 token。
+// 旧实现丢弃 Add 错误仍签发新 token → 旧 token 未拉黑、新旧双有效。
+func TestRefreshTokenFailsOnRedisError(t *testing.T) {
+	setupTestConfig()
+	mr := setupMiniRedis(t)
+
+	token, _ := jwt.GenerateToken(1, "testuser", "admin", "super_admin")
+
+	// 模拟 Redis 抖动：关闭 miniredis，使 Add 的 Set 失败。
+	mr.Close()
+
+	_, err := jwt.RefreshToken(token)
+	if err == nil {
+		t.Fatal("RefreshToken should fail when Redis unavailable (C9b: must not issue new token)")
+	}
+	// 不应是 ErrBlacklistUnavailable（那是无 Redis 路径），而是 Add 的 Set 错误包装。
+	// 关键：未签发新 token，旧 token 未被拉黑（因 Add 失败）。
+}
+
+// 回归 C9a/b：InvalidateToken 闭环——登出后 token 被拉黑、ParseToken 返 ErrTokenRevoked。
+func TestInvalidateTokenRevokesToken(t *testing.T) {
+	setupTestConfig()
+	setupMiniRedis(t)
+
+	token, _ := jwt.GenerateToken(1, "test", "admin", "admin")
+
+	// 登出前可解析
+	if _, err := jwt.ParseToken(token); err != nil {
+		t.Fatalf("ParseToken before invalidate: %v", err)
+	}
+
+	// 登出（拉黑）
+	if err := jwt.InvalidateToken(token); err != nil {
+		t.Fatalf("InvalidateToken: %v", err)
+	}
+
+	// 登出后必须被拉黑
+	_, err := jwt.ParseToken(token)
+	if !errors.Is(err, jwt.ErrTokenRevoked) {
+		t.Errorf("ParseToken after invalidate err = %v, want ErrTokenRevoked", err)
+	}
+}
+
+// 回归 C9a：无 Redis 时 InvalidateTokenByID 返 ErrBlacklistUnavailable（fail-closed）。
+func TestInvalidateTokenByIDNoRedis(t *testing.T) {
+	setupTestConfig()
+	// 不 setupMiniRedis → tokenBlacklist 指向无 Redis 的 Manager
+	jwt.SetDefaultJWTManager(jwt.NewJWTManager())
+	t.Cleanup(func() { jwt.SetDefaultJWTManager(jwt.NewJWTManager()) }) // 还原基线
+
+	err := jwt.InvalidateTokenByID("some-jti", time.Now().Add(time.Hour))
+	if !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Errorf("InvalidateTokenByID without Redis err = %v, want ErrBlacklistUnavailable", err)
+	}
+}
+

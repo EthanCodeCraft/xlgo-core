@@ -60,14 +60,17 @@ func EndOfDay(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 999999999, t.Location())
 }
 
-// StartOfWeek 返回指定时间当周的开始时间（周一为第一天）
+// StartOfWeek 返回指定时间当周的开始时间（周一为第一天，00:00:00）。
+//
+// 用日历日回退而非 t.Add(-N*24h)，避免 DST 切换日 24h ≠ 1 个日历日导致落错日（M4）。
 func StartOfWeek(t time.Time) time.Time {
 	weekday := int(t.Weekday())
 	if weekday == 0 {
-		weekday = 7
+		weekday = 7 // 周日归为 7，使周一为第一天
 	}
-	d := time.Duration(weekday-1) * 24 * time.Hour
-	return StartOfDay(t.Add(-d))
+	// 回退到本周周一的日历日，再取当日 00:00:00（保留原时区）。
+	monday := time.Date(t.Year(), t.Month(), t.Day()-(weekday-1), 0, 0, 0, 0, t.Location())
+	return StartOfDay(monday)
 }
 
 // StartOfMonth 返回指定时间当月的开始时间
@@ -86,7 +89,10 @@ func GetDateInt(t time.Time) int {
 	return ret
 }
 
-// ParseDateInt 将 yyyyMMdd 格式的整数转为时间
+// ParseDateInt 将 yyyyMMdd 格式的整数转为时间（当日 00:00:00，本地时区）。
+//
+// 注意：非法输入（如 month=13、day=32）会被 time.Date 静默规范化（溢出进位），
+// 调用方需自行保证输入合法或在使用前校验（M4）。
 func ParseDateInt(date int) time.Time {
 	year := date / 10000
 	month := (date % 10000) / 100

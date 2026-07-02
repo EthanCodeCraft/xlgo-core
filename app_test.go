@@ -241,3 +241,39 @@ func TestAppWithConfigPathDrivesManager(t *testing.T) {
 		t.Fatalf("expected GetInt(server.port)=18092, got %d", config.GetInt("server.port"))
 	}
 }
+
+// TestAppMetricsInstrumentsRegistryRoutes_H8c 端到端验证 H8c：经注册中心注册的业务路由
+// 被指标中间件采集，不依赖 RegisterMetricsRoute 的调用顺序。修复前 RegisterMetricsRoute
+// 用 r.Use 仅采集其后注册的路由；修复后采集中间件在 Apply 内作首个全局中间件装入。
+func TestAppMetricsInstrumentsRegistryRoutes_H8c(t *testing.T) {
+	app := xlgo.New(
+		xlgo.WithConfig(testConfig(18093)),
+		xlgo.WithMetricsRoute(),
+		xlgo.WithModules(router.ModuleFunc(func(r *gin.RouterGroup) {
+			r.GET("/h8c-biz", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"ok": true}) })
+		})),
+	)
+	if err := app.Init(); err != nil {
+		t.Fatalf("Init error: %v", err)
+	}
+
+	r := app.GetRouter()
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/h8c-biz", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("/h8c-biz status = %d, want 200", w.Code)
+		}
+	}
+
+	// 拉取 /metrics，断言 /h8c-biz 路由被采集（route 标签存在）。
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `route="/h8c-biz"`) {
+		t.Fatalf("metrics output should contain route=\"/h8c-biz\" series, got:\n%s", body)
+	}
+}

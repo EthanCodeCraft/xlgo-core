@@ -377,6 +377,35 @@ func TestValidateUsername(t *testing.T) {
 	}
 }
 
+// TestIDCardChecksum_M5：18 位身份证须校验校验位（修复前仅查长度+格式）。
+func TestIDCardChecksum_M5(t *testing.T) {
+	validation.InitValidator()
+
+	type TestIDCard struct {
+		ID string `json:"id" binding:"idcard"`
+	}
+	tests := []struct {
+		id    string
+		valid bool
+	}{
+		{"11010519491231002X", true},  // 合法（校验位正确）
+		{"110101199003078478", true},  // 合法（校验位正确）
+		{"110101199003078475", false}, // 校验位错误（末位改坏）
+		{"11010119900307847X", false}, // 18 位但校验位错
+		{"123456789012345", true},     // 15 位旧号段仅查格式
+		{"123456789012345678", false}, // 18 位但校验位错
+		{"123", false},                // 长度不符
+	}
+	for _, tt := range tests {
+		u := TestIDCard{ID: tt.id}
+		errs := validation.ValidateStruct(u)
+		valid := errs == nil
+		if valid != tt.valid {
+			t.Errorf("IDCard %s: valid=%v, want %v", tt.id, valid, tt.valid)
+		}
+	}
+}
+
 // ===== Benchmarks =====
 
 func BenchmarkHashPassword(b *testing.B) {

@@ -2,8 +2,11 @@ package config
 
 import (
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -225,6 +228,9 @@ type DatabaseConfig struct {
 	Password string `mapstructure:"password"`
 	// Name 数据库名
 	Name string `mapstructure:"name"`
+	// Timezone 连接时区。MySQL 用作 loc 参数、Postgres 用作 TimeZone 参数。
+	// 空时 MySQL 默认 "Local"、Postgres 默认 "Asia/Shanghai"（向后兼容，M9）。
+	Timezone string `mapstructure:"timezone"`
 	// CustomDSN 自定义连接字符串，设置后优先于由 Host/Port 等字段生成的 DSN
 	CustomDSN string `mapstructure:"dsn"`
 	// MaxIdleConns 最大空闲连接数
@@ -253,16 +259,28 @@ func (c *DatabaseConfig) DSN() string {
 	return c.MySQLDSN()
 }
 
-// MySQLDSN 返回 MySQL 连接字符串
+// MySQLDSN 返回 MySQL 连接字符串。
+// 密码经 url.QueryEscape 转义，避免含 @/:/空格 等特殊字符破坏 DSN（M9）。
+// loc 由 Timezone 配置，空则默认 "Local"（向后兼容）。
 func (c *DatabaseConfig) MySQLDSN() string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
-		c.User, c.Password, c.Host, c.Port, c.Name)
+	loc := c.Timezone
+	if loc == "" {
+		loc = "Local"
+	}
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=%s",
+		c.User, url.QueryEscape(c.Password), c.Host, c.Port, c.Name, url.QueryEscape(loc))
 }
 
-// PostgresDSN 返回 PostgreSQL 连接字符串
+// PostgresDSN 返回 PostgreSQL 连接字符串。
+// 密码经单引号转义（内嵌单引号翻倍），避免含空格/引号/反斜杠破坏 key=value DSN（M9）。
+// TimeZone 由 Timezone 配置，空则默认 "Asia/Shanghai"（向后兼容）。
 func (c *DatabaseConfig) PostgresDSN() string {
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable TimeZone=Asia/Shanghai",
-		c.Host, c.Port, c.User, c.Password, c.Name)
+	tz := c.Timezone
+	if tz == "" {
+		tz = "Asia/Shanghai"
+	}
+	return fmt.Sprintf("host=%s port=%d user=%s password='%s' dbname=%s sslmode=disable TimeZone=%s",
+		c.Host, c.Port, c.User, strings.ReplaceAll(c.Password, "'", "''"), c.Name, tz)
 }
 
 // RedisConfig Redis 配置
@@ -304,10 +322,26 @@ type StorageConfig struct {
 	OSS    OSSStorageConfig   `mapstructure:"oss"`
 }
 
+// UploadPolicy 上传安全策略（C4b）。零值表示不限制，向后兼容；
+// 生产环境强烈建议显式配置 MaxSizeBytes 与 AllowedExts / AllowedMIMEs。
+type UploadPolicy struct {
+	// MaxSizeBytes 单文件大小上限（字节）。0 = 不限制。
+	MaxSizeBytes int64 `mapstructure:"max_size_bytes"`
+	// AllowedExts 允许的扩展名白名单（小写、含点，如 ".jpg"）。空 = 不限制。
+	AllowedExts []string `mapstructure:"allowed_exts"`
+	// AllowedMIMEs 允许的 MIME 类型白名单（小写，如 "image/jpeg"）。
+	// 非空时用 http.DetectContentType 嗅探文件前 512 字节校验。空 = 不嗅探。
+	AllowedMIMEs []string `mapstructure:"allowed_mime_types"`
+}
+
 // LocalStorageConfig 本地存储配置
 type LocalStorageConfig struct {
 	Path    string `mapstructure:"path"`
 	BaseURL string `mapstructure:"base_url"`
+	// Upload 上传安全策略（可选，零值不限制）。
+	Upload UploadPolicy `mapstructure:"upload"`
+	// MaxReadBytes Get 读取单文件上限（字节）。0 = 默认 100MB，-1 = 不限制。
+	MaxReadBytes int64 `mapstructure:"max_read_bytes"`
 }
 
 // OSSStorageConfig OSS 存储配置
@@ -317,6 +351,10 @@ type OSSStorageConfig struct {
 	AccessKeyID     string `mapstructure:"access_key_id"`
 	AccessKeySecret string `mapstructure:"access_key_secret"`
 	BaseURL         string `mapstructure:"base_url"`
+	// Upload 上传安全策略（可选，零值不限制）。
+	Upload UploadPolicy `mapstructure:"upload"`
+	// MaxReadBytes Get 读取单文件上限（字节）。0 = 默认 100MB，-1 = 不限制。
+	MaxReadBytes int64 `mapstructure:"max_read_bytes"`
 }
 
 // LogConfig 日志配置
@@ -394,9 +432,20 @@ type Manager struct {
 	v         *viper.Viper
 	cfg       *Config
 	callbacks []func(*Config)
+	// watcher 是自管的 fsnotify 监听器（C10d）。nil 表示未启用文件监听。
+	// 由 StartWatcher 创建、StopWatcher 关闭，避免依赖 viper 内部无法停止的 watcher。
+	watcher *fsnotify.Watcher
+	// watchDone 在监听 goroutine 退出时被 close，供 StopWatcher 等待退出确认。
+	watchDone chan struct{}
 }
 
-var defaultManager = NewManager("")
+// defaultManager 是包级默认管理器（C10a）。改用 atomic.Pointer 保护读写，
+// 消除原裸指针置换与请求 goroutine 无锁读之间的数据竞争。
+var defaultManager atomic.Pointer[Manager]
+
+func init() {
+	defaultManager.Store(NewManager(""))
+}
 
 // NewManager 创建配置管理器
 func NewManager(configPath string) *Manager {
@@ -441,7 +490,12 @@ func (m *Manager) Load() (*Config, error) {
 	m.cfg = &cfg
 	m.mu.Unlock()
 
-	return &cfg, nil
+	// 防御性拷贝（C10c）：返回独立副本，避免调用方与框架内部 m.cfg 共享同一可变指针。
+	// 调用方修改返回值的标量字段不影响 Get() 等读取路径。
+	// 注意：这是浅拷贝——切片字段（如 CORSConfig.AllowedOrigins）仍与 m.cfg 共享底层数组，
+	// 调用方不得修改切片元素（约定配置对象为只读）。需要完全独立可变副本时自行深拷贝。
+	out := cfg
+	return &out, nil
 }
 
 // LoadWithWatch 加载配置文件并启用热更新
@@ -469,44 +523,112 @@ func (m *Manager) RegisterCallback(cb func(*Config)) {
 	m.callbacks = append(m.callbacks, cb)
 }
 
-// StartWatcher 启动配置文件监听
+// StartWatcher 启动配置文件监听。使用自管的 fsnotify.Watcher（监听配置文件
+// 所在目录以兼容编辑器改写/k8s ConfigMap 原子替换），文件变更时去抖后重新加载。
+// 幂等：重复调用不会创建多个监听 goroutine。
 func (m *Manager) StartWatcher() error {
 	if m == nil {
 		return ErrConfigNotLoaded
 	}
 
-	m.mu.RLock()
-	v := m.v
-	m.mu.RUnlock()
-	if v == nil {
+	m.mu.Lock()
+	if m.watcher != nil {
+		// 已在监听，幂等返回
+		m.mu.Unlock()
+		return nil
+	}
+	if m.v == nil || m.path == "" {
+		m.mu.Unlock()
 		return ErrConfigNotLoaded
 	}
-
-	v.WatchConfig()
-	v.OnConfigChange(func(e fsnotify.Event) {
-		var newCfg Config
-		if err := unmarshalConfig(v, &newCfg); err != nil {
-			return
-		}
-
-		m.mu.Lock()
-		m.cfg = &newCfg
-		cbs := make([]func(*Config), len(m.callbacks))
-		copy(cbs, m.callbacks)
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
 		m.mu.Unlock()
+		return fmt.Errorf("创建文件监听失败: %w", err)
+	}
+	// 监听父目录而非文件本身：vim/k8s 等通过"写临时文件 + rename"替换配置，
+	// 直接监听文件会在 rename 后丢失。监听目录并按文件名过滤更稳健。
+	dir := filepath.Dir(m.path)
+	if err := w.Add(dir); err != nil {
+		m.mu.Unlock()
+		_ = w.Close()
+		return fmt.Errorf("监听配置目录失败: %w", err)
+	}
+	m.watcher = w
+	m.watchDone = make(chan struct{})
+	target := filepath.Base(m.path)
+	done := m.watchDone
+	m.mu.Unlock()
 
-		for _, cb := range cbs {
-			cb(&newCfg)
-		}
-	})
-
+	go m.watchLoop(w, target, done)
 	return nil
 }
 
-// StopWatcher 停止配置文件监听
-func (m *Manager) StopWatcher() {}
+// watchLoop 是文件监听 goroutine 主体。文件变更经去抖后调用 reload；
+// watcher 被 Close（Events 通道关闭）时退出并 close done。
+// done 由 StartWatcher 在锁内捕获传入，避免本 goroutine 读取 m.watchDone 字段
+// 与 StopWatcher 写入竞争。
+func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct{}) {
+	defer close(done)
+	const debounce = 200 * time.Millisecond
+	var timer *time.Timer
+	for {
+		select {
+		case ev, ok := <-w.Events:
+			if !ok {
+				return
+			}
+			if filepath.Base(ev.Name) != target {
+				continue
+			}
+			if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Write) &&
+				!ev.Has(fsnotify.Remove) && !ev.Has(fsnotify.Rename) {
+				continue
+			}
+			// 去抖：合并编辑器/工具的连续写事件，仅最后一次触发重载。
+			if timer != nil {
+				timer.Stop()
+			}
+			timer = time.AfterFunc(debounce, func() {
+				// reload 内部对非法配置保留旧配置（C10b），错误被忽略——
+				// 监听路径无法向上传播错误，保留旧配置即正确语义。
+				_ = m.reload()
+			})
+		case _, ok := <-w.Errors:
+			if !ok {
+				return
+			}
+			// 非致命错误：继续监听。
+		}
+	}
+}
 
-// Get 获取配置
+// StopWatcher 停止配置文件监听并释放 watcher（C10d）。幂等。
+// 关闭 fsnotify watcher → Events 通道关闭 → watchLoop 退出 → 等待 watchDone。
+func (m *Manager) StopWatcher() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	w := m.watcher
+	done := m.watchDone
+	m.watcher = nil
+	m.watchDone = nil
+	m.mu.Unlock()
+	if w == nil {
+		return
+	}
+	_ = w.Close()
+	if done != nil {
+		<-done
+	}
+}
+
+// Get 获取配置。
+//
+// 返回的是 Manager 内部持有的配置指针（共享），调用方**必须视为只读**：
+// 修改返回值的标量或切片元素会污染全局配置并与其他读取 goroutine 竞争。
+// 需要可变副本时用 Load()（返回防御性拷贝）或自行深拷贝。
 func (m *Manager) Get() *Config {
 	if m == nil {
 		return nil
@@ -539,29 +661,38 @@ func (m *Manager) Set(cfg *Config) {
 	}
 }
 
-// Reload 重新加载配置文件
+// Reload 重新加载配置文件。读取、解析、校验（C10b）任一步失败均保留旧配置并返回错误；
+// 仅当新配置通过 Validate 后才替换 m.cfg 并触发回调。
 func (m *Manager) Reload() error {
 	if m == nil {
 		return ErrConfigNotLoaded
 	}
+	return m.reload()
+}
 
-	m.mu.RLock()
+// reload 是 Reload 与文件监听共享的重载实现。全程持写锁以串行化对 viper 的
+// ReadInConfig 访问（viper 非完全并发安全），并在替换前强制 Validate（C10b）。
+func (m *Manager) reload() error {
+	m.mu.Lock()
 	v := m.v
-	m.mu.RUnlock()
 	if v == nil {
+		m.mu.Unlock()
 		return ErrConfigNotLoaded
 	}
-
 	if err := v.ReadInConfig(); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("读取配置文件失败: %w", err)
 	}
-
 	var newCfg Config
 	if err := unmarshalConfig(v, &newCfg); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("解析配置文件失败: %w", err)
 	}
-
-	m.mu.Lock()
+	if err := newCfg.Validate(); err != nil {
+		// 非法配置保留旧配置，不得静默发布（C10b）
+		m.mu.Unlock()
+		return err
+	}
 	m.cfg = &newCfg
 	cbs := make([]func(*Config), len(m.callbacks))
 	copy(cbs, m.callbacks)
@@ -570,67 +701,70 @@ func (m *Manager) Reload() error {
 	for _, cb := range cbs {
 		cb(&newCfg)
 	}
-
 	return nil
 }
 
 // Load 加载配置文件
 func Load(configPath string) (*Config, error) {
-	defaultManager = NewManager(configPath)
-	return defaultManager.Load()
+	m := NewManager(configPath)
+	defaultManager.Store(m)
+	return m.Load()
 }
 
 // LoadWithWatch 加载配置文件并启用热更新
 func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
-	defaultManager = NewManager(configPath)
-	return defaultManager.LoadWithWatch(onChange)
+	m := NewManager(configPath)
+	defaultManager.Store(m)
+	return m.LoadWithWatch(onChange)
 }
 
 // RegisterCallback 注册配置变更回调
 func RegisterCallback(cb func(*Config)) {
-	defaultManager.RegisterCallback(cb)
+	defaultManager.Load().RegisterCallback(cb)
 }
 
 // StartWatcher 启动配置文件监听
 func StartWatcher() error {
-	return defaultManager.StartWatcher()
+	return defaultManager.Load().StartWatcher()
 }
 
 // StopWatcher 停止配置文件监听
 func StopWatcher() {
-	defaultManager.StopWatcher()
+	defaultManager.Load().StopWatcher()
 }
 
 // Get 获取全局配置
 func Get() *Config {
-	return defaultManager.Get()
+	return defaultManager.Load().Get()
 }
 
 // GetViper 获取 viper 实例（用于扩展配置）
 func GetViper() *viper.Viper {
-	return defaultManager.GetViper()
+	return defaultManager.Load().GetViper()
 }
 
 // Set 手动设置配置（用于测试或动态修改）
 func Set(cfg *Config) {
-	defaultManager.Set(cfg)
+	defaultManager.Load().Set(cfg)
 }
 
 // Reload 重新加载配置文件
 func Reload() error {
-	return defaultManager.Reload()
+	return defaultManager.Load().Reload()
 }
 
 // SetDefaultManager 替换全局默认配置管理器。
 // 主要供应用层（如 App）在持有自己的 Manager 时使用，
 // 使 config.Get / config.GetString 等便捷函数仍然能取到正确的配置。
 // 传入 nil 表示重置为空管理器。
+//
+// C10a：经 atomic.Pointer.Store 原子置换，消除与并发读取（Get 等）的数据竞争。
 func SetDefaultManager(m *Manager) {
 	if m == nil {
-		defaultManager = NewManager("")
+		defaultManager.Store(NewManager(""))
 		return
 	}
-	defaultManager = m
+	defaultManager.Store(m)
 }
 
 // GetString 获取字符串配置

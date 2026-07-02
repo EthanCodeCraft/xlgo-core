@@ -393,13 +393,23 @@ import "github.com/EthanCodeCraft/xlgo-core/repository"
 // 创建仓库
 userRepo := repository.NewBaseRepo[model.User](database.GetDB())
 
+// 连接路由（v1.1.1+ 修复 H6c）：
+//   - 读操作（FindByID/FindAll/FindPage/FindWhere/Count/Exists/...）默认路由到从库，
+//     支持 database.UseMaster(ctx)/UseReplica(ctx) 显式路由；未配置从库时回退主库。
+//   - 写操作（Create/Update/Delete/*Batch/Restore/...）始终走主库，不路由到只读从库。
+//   - DefaultManager 未初始化（如单测注入 sqlite）时回退到 NewBaseRepo 传入的 db。
+
 // 基础 CRUD
 user, err := userRepo.FindByID(ctx, 1)
 users, err := userRepo.FindAll(ctx)
 users, err := userRepo.FindByIDs(ctx, []uint{1, 2, 3})
 err := userRepo.Create(ctx, &user)
-err := userRepo.Update(ctx, &user)
-err := userRepo.Delete(ctx, 1)
+err := userRepo.Update(ctx, &user) // Save 全列覆写（含零值），见下方 UpdateFields
+err := userRepo.Delete(ctx, 1)     // T 含 gorm.Model 时软删除，否则硬删除
+
+// 局部更新（推荐，H6a）：避免 Save 全列覆写丢失更新/零值不可辨
+err := userRepo.UpdateFields(ctx, &model.User{Name: "new"}, "id = ?", id) // struct 仅更新非零字段
+err := userRepo.UpdateFields(ctx, map[string]any{"status": 0}, "id = ?", id) // map 可显式置零
 
 // 统计数量
 count, err := userRepo.Count(ctx)
@@ -442,7 +452,7 @@ err := userRepo.RestoreBatch(ctx, []uint{1, 2})
 // 查询已删除的记录
 deletedUsers, err := userRepo.FindDeleted(ctx)
 
-// 链式查询（灵活构建）
+// 链式查询（灵活构建；QueryBuilder 为单次使用、非并发安全）
 users, err := userRepo.NewQueryBuilder().
     Where("status = ?", 1).
     Where("role = ?", "admin").
@@ -464,6 +474,15 @@ err := userRepo.WithTransaction(ctx, func(txRepo *repository.BaseRepo[model.User
     }
     // 更新关联数据
     return txRepo.Update(ctx, &profile)
+})
+
+// 跨层/跨 repo 事务 join（H6c）：把外层事务注入 ctx 后传给任意 repo 方法
+err := database.TransactionWithContext(ctx, func(tx *gorm.DB) error {
+    ctx2 := database.WithTx(ctx, tx)
+    if err := userRepo.Create(ctx2, &user); err != nil {
+        return err
+    }
+    return otherRepo.Update(ctx2, &other) // 同一事务
 })
 ```
 
@@ -886,13 +905,14 @@ r.Use(middleware.APIRateLimit())                                  // 每分钟10
 r.Use(middleware.CustomRateLimit(50, time.Minute)) // 每分钟50次
 
 // Redis 分布式限流（多实例共享）
-r.Use(middleware.RedisRateLimit("api_limit", 100))        // 每分钟100次
-r.Use(middleware.LoginRedisRateLimit())                    // 登录限流
-r.Use(middleware.APIRedisRateLimit())                      // API限流
-r.Use(middleware.UploadRedisRateLimit())                   // 上传限流
+r.Use(middleware.RedisRateLimit("api_limit", 100))        // 每分钟100次（fail-open：Redis 故障时放行）
+r.Use(middleware.LoginRedisRateLimit())                    // 登录限流（fail-closed：Redis 故障时拒绝，防爆破）
+r.Use(middleware.APIRedisRateLimit())                      // API限流（fail-open）
+r.Use(middleware.UploadRedisRateLimit())                   // 上传限流（fail-open）
 
 // 自定义 Redis 限流
-r.Use(middleware.CustomRedisRateLimit("custom", 50, time.Minute))
+r.Use(middleware.CustomRedisRateLimit("custom", 50, time.Minute))                 // fail-open
+r.Use(middleware.CustomRedisRateLimitFailClosed("sensitive", 50, time.Minute))    // fail-closed（安全场景）
 
 // 自定义标识限流（如按用户ID）
 r.Use(middleware.RedisRateLimitWithIdentifier("user_limit", 100, func(c *gin.Context) string {
@@ -902,6 +922,11 @@ r.Use(middleware.RedisRateLimitWithIdentifier("user_limit", 100, func(c *gin.Con
 // 停止限流器（应用关闭时）
 defer middleware.StopRateLimiters()
 ```
+
+> **fail-open vs fail-closed（H4c）**：Redis 限流器在 Redis 故障时有两种策略——
+> - **fail-open**（`RedisRateLimit`/`APIRedisRateLimit`/`UploadRedisRateLimit`/`CustomRedisRateLimit`，默认）：Redis 故障时放行，避免影响业务，但限流静默失效。
+> - **fail-closed**（`RedisRateLimitFailClosed`/`LoginRedisRateLimit`/`CustomRedisRateLimitFailClosed`）：Redis 故障时拒绝（HTTP 503），防限流静默失效。**安全敏感场景（登录防爆破、敏感操作）必须用 fail-closed**。
+> `RedisRateLimiter` 可经 `NewRedisRateLimiterFailClosed` 构造或 `SetFailClosed(true)` 切换策略。
 
 **内存限流 vs Redis 限流：**
 - 内存限流：单实例使用，简单高效
@@ -1201,18 +1226,31 @@ if storage.Exists(path) {
 
 ### 11.1 随机数生成
 
+**安全选型**：字符串随机（token/OTP/验证码/会话 ID/nonce）用 `RandStringSecure`/`RandDigitSecure`
+（基于 `crypto/rand`，不可预测）。`RandString`/`RandDigit`（math/rand 版本）已移除——
+字符串随机的用途几乎都是安全场景，保留 math/rand 版本会诱导误用。
+
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/utils"
 
-// 随机字符串（16位）
-token := utils.RandString(16)
+// 安全场景：token、会话 ID、API key（crypto/rand，不可预测）
+token, err := utils.RandStringSecure(32)
+if err != nil {
+    // 处理 crypto/rand 失败（极罕见，通常仅系统熵池耗尽）
+}
 
-// 随机数字（6位验证码）
-code := utils.RandDigit(6)
+// 安全场景：6 位 OTP 验证码、密码重置码（crypto/rand）
+code, err := utils.RandDigitSecure(6)
 
-// 范围随机数
+// 安全场景：安全 nonce 范围、防猜抽奖、密钥分桶（crypto/rand 无偏）
+idx, err := utils.RandIntSecure(0, 1000)
+
+// 范围随机数（非密码学安全，仅用于负载均衡/游戏/A-B 分桶等非安全场景）
 n := utils.RandInt(1, 100)
 ```
+
+> 非安全场景需要高性能随机串时，直接用标准库 `math/rand` 即可，框架不再提供
+> 易误用的 `RandString`/`RandDigit`。
 
 ### 11.2 字符串处理
 
@@ -1394,7 +1432,8 @@ if utils.UUIDValid(uuid) { }
 
 | 分类 | 高分函数（⭐⭐⭐⭐⭐） | 说明 |
 |------|---------------------|------|
-| **随机** | `RandString/RandDigit` | sync.Pool 优化性能 |
+| **随机（安全）** | `RandStringSecure/RandDigitSecure/RandIntSecure/RandInt64Secure` | crypto/rand，token/OTP/nonce 用 |
+| **随机（范围）** | `RandInt/RandInt64` | math/rand，负载均衡/游戏等非安全场景 |
 | **字符串** | `IsBlank/DefaultIfBlank/StrLen` | 空值处理、Unicode支持 |
 | **时间** | `FormatDateTime/StartOfDay/EndOfMonth` | 标准格式、边界计算 |
 | **转换** | `ToIntDefault/CalcPageCount/CalcOffset` | 安全转换、分页计算 |
@@ -1409,7 +1448,7 @@ if utils.UUIDValid(uuid) { }
 
 | 改进 | 说明 |
 |------|------|
-| 性能优化 | `RandString/RandDigit` 使用 sync.Pool 复用随机源 |
+| 性能优化 | `RandString/RandDigit` 使用 sync.Pool 复用随机源（非安全场景）；安全场景用 `RandStringSecure/RandDigitSecure`（crypto/rand） |
 | 类型安全 | 移除使用反射的函数，保持类型安全 |
 | 式调用 | `HTTPClient` 和 `URLBuilder` 支持链式调用 |
 | 零依赖 | 仅依赖 `google/uuid`，其余使用标准库 |
@@ -1527,10 +1566,17 @@ trace.Init(trace.Config{
     ServiceName:   "my-service",
     Endpoint:      "localhost:4318",
     ExporterType:  "otlp-http",
+    // Insecure:    true, // 明文 collector（localhost:4318 等本地 collector 默认无 TLS，需显式开启）
     SampleRatio:   1.0,
+    // Propagator:  "w3c", // 可选 "w3c"(默认) / "b3" / "jaeger"(映射 W3C)
 })
 defer trace.Close(ctx)
 ```
+
+> **导出器类型**：`otlp-http` / `otlp-grpc` / `stdout`（写标准输出，便于调试）。未知类型 `Init` 返错。
+> **Insecure**：默认 `false`（TLS）；对无 TLS 的本地 collector（如 `localhost:4318`）需显式置 `true`，否则握手失败。
+> **传播器**：`w3c`（默认，W3C TraceContext + Baggage）/ `b3`（同时支持单头与多头，兼容旧 B3 客户端）/ `jaeger`（映射为 W3C TraceContext——现代 Jaeger agent 透传 W3C；纯 Jaeger thrift 头协议请用 `b3`）。未知类型 `Init` 返错。
+> **未 Init 也安全**：未调用 `Init` 或 `Init(Enabled:false)` 时为 Noop tracer，`Middleware`/`StartSpan` 等不 panic。
 
 ### 14.2 使用中间件
 

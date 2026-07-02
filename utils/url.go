@@ -28,10 +28,11 @@ func (b *URLBuilder) AddQuery(key, value string) *URLBuilder {
 	return b
 }
 
-// AddQueries 批量添加查询参数
+// AddQueries 批量添加查询参数（追加，同 key 多值共存，M2 修复：原实现用 Set 会覆盖）。
+// params 为 nil 时无操作（遍历 nil map 安全，不 panic）。
 func (b *URLBuilder) AddQueries(params map[string]string) *URLBuilder {
 	for k, v := range params {
-		b.query.Set(k, v)
+		b.query.Add(k, v)
 	}
 	return b
 }

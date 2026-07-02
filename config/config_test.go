@@ -3,6 +3,7 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -101,7 +102,7 @@ func TestDatabaseConfigPostgresDSN(t *testing.T) {
 	}
 
 	dsn := db.DSN()
-	expected := "host=localhost port=5432 user=postgres password=password dbname=testdb sslmode=disable TimeZone=Asia/Shanghai"
+	expected := "host=localhost port=5432 user=postgres password='password' dbname=testdb sslmode=disable TimeZone=Asia/Shanghai"
 	if dsn != expected {
 		t.Errorf("Postgres DSN = %s, want %s", dsn, expected)
 	}
@@ -109,6 +110,48 @@ func TestDatabaseConfigPostgresDSN(t *testing.T) {
 	// 显式 MySQL DSN 不受 Driver 影响
 	if db.MySQLDSN() == "" {
 		t.Error("MySQLDSN should not be empty")
+	}
+}
+
+// TestDatabaseConfigDSNPasswordEscape_M9：含特殊字符的密码须被转义，不破坏 DSN。
+func TestDatabaseConfigDSNPasswordEscape_M9(t *testing.T) {
+	// MySQL：密码含 @/:/空格 → url.QueryEscape
+	mysql := config.DatabaseConfig{
+		Driver:   config.DriverMySQL,
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "p@ss w:ord",
+		Name:     "testdb",
+	}
+	mdsn := mysql.MySQLDSN()
+	// 密码段应被转义，@ 不应与 DSN 的 @ 分隔符混淆
+	if !strings.Contains(mdsn, "root:p%40ss+w%3Aord@tcp") {
+		t.Errorf("MySQL DSN password not escaped: %s", mdsn)
+	}
+
+	// Postgres：密码含单引号 → 翻倍转义
+	pg := config.DatabaseConfig{
+		Driver:   config.DriverPostgres,
+		Host:     "localhost",
+		Port:     5432,
+		User:     "postgres",
+		Password: "p'ord",
+		Name:     "testdb",
+	}
+	pdsn := pg.PostgresDSN()
+	if !strings.Contains(pdsn, "password='p''ord'") {
+		t.Errorf("Postgres DSN password not escaped: %s", pdsn)
+	}
+
+	// Timezone 可配置
+	pg2 := config.DatabaseConfig{Driver: config.DriverPostgres, Host: "h", Port: 5432, User: "u", Password: "p", Name: "n", Timezone: "UTC"}
+	if !strings.Contains(pg2.PostgresDSN(), "TimeZone=UTC") {
+		t.Errorf("Postgres DSN should honor Timezone=UTC: %s", pg2.PostgresDSN())
+	}
+	mysql2 := config.DatabaseConfig{Driver: config.DriverMySQL, Host: "h", Port: 3306, User: "u", Password: "p", Name: "n", Timezone: "UTC"}
+	if !strings.Contains(mysql2.MySQLDSN(), "loc=UTC") {
+		t.Errorf("MySQL DSN should honor Timezone=UTC: %s", mysql2.MySQLDSN())
 	}
 }
 

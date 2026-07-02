@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
 
@@ -15,18 +16,71 @@ import (
 )
 
 var (
-	// Logger 全局通用日志实例。Init 之前为 Nop，调用安全。
+	// 内部 atomic 存储——四个 logger 的真实源（H7 修复）。
+	// 所有包级函数（Info/Debug/.../APILog/DBLog/Sync）经 atomic Load 读取，
+	// 使请求 goroutine 不与 Init/Close 重新装配全局变量竞争。
+	// 原实现用 m.mu（实例锁）保护包级全局变量，锁与被保护对象作用域错配，
+	// 读侧无锁裸读 → 热重载 re-Init/Close 与请求日志存在数据竞争。
+	loggerPtr atomic.Pointer[zap.Logger]
+	sugarPtr  atomic.Pointer[zap.SugaredLogger]
+	apiLogPtr atomic.Pointer[zap.Logger]
+	dbLogPtr  atomic.Pointer[zap.Logger]
+
+	// Logger 全局通用日志实例（兼容别名）。Init 之前为 Nop，调用安全。
+	//
+	// 兼容性说明（H7）：此导出变量由 Init/Close 在 m.mu 下同步维护，但直接读它
+	// 在 re-Init/Close 期间非并发安全；框架内部读路径已改走 atomic（currentLogger）。
+	// 并发安全访问请用包级 Info/Debug/Warn/Error/... 函数，不要直接读此变量。
 	Logger = zap.NewNop()
-	sugar  = Logger.Sugar()
-	apiLog = zap.NewNop()
-	dbLog  = zap.NewNop()
 
 	// fileWriters 持有所有 lumberjack 实例引用，
 	// Close() 调用时显式释放文件句柄。
 	// 必要性：lumberjack 不依赖 GC 关闭文件，进程长跑或测试场景下
 	// 不显式关闭会持有句柄导致 Windows 上无法删除日志目录。
+	// 仅在 m.mu 下访问（Init/Close/closeFileWriters），无读侧竞争。
 	fileWriters []*lumberjack.Logger
 )
+
+func init() {
+	// 初始化 atomic 存储为 Nop，保证包级函数在任何时刻 Load 均非 nil。
+	nop := zap.NewNop()
+	loggerPtr.Store(nop)
+	sugarPtr.Store(nop.Sugar())
+	apiLogPtr.Store(nop)
+	dbLogPtr.Store(nop)
+}
+
+// currentLogger 返回通用 logger 的 atomic 快照（永不 nil）。
+func currentLogger() *zap.Logger {
+	if l := loggerPtr.Load(); l != nil {
+		return l
+	}
+	return zap.NewNop() // 防御：init 后不可达
+}
+
+// currentSugar 返回 sugared logger 的 atomic 快照（永不 nil）。
+func currentSugar() *zap.SugaredLogger {
+	if s := sugarPtr.Load(); s != nil {
+		return s
+	}
+	return zap.NewNop().Sugar() // 防御：init 后不可达
+}
+
+// currentAPILog 返回 API logger 的 atomic 快照（永不 nil）。
+func currentAPILog() *zap.Logger {
+	if l := apiLogPtr.Load(); l != nil {
+		return l
+	}
+	return zap.NewNop()
+}
+
+// currentDBLog 返回 DB logger 的 atomic 快照（永不 nil）。
+func currentDBLog() *zap.Logger {
+	if l := dbLogPtr.Load(); l != nil {
+		return l
+	}
+	return zap.NewNop()
+}
 
 // LogManager 日志管理器（#10）。照 database.Manager 模式：
 // 实例化 + DefaultLogger 全局默认 + 包级 facade 代理。
@@ -34,6 +88,9 @@ var (
 type LogManager struct {
 	mu  sync.Mutex
 	cfg *config.Config
+	// level 是所有 core 共享的 AtomicLevel，支持运行期 SetLevel 热切换（M19）。
+	// Init 前为 nil，SetLevel 守卫之。
+	level zap.AtomicLevel
 }
 
 // DefaultLogger 默认日志管理器，包级 facade 代理到它。
@@ -41,6 +98,34 @@ var DefaultLogger = NewLogManager()
 
 // NewLogManager 创建日志管理器实例。
 func NewLogManager() *LogManager { return &LogManager{} }
+
+// SetLevel 运行期热切换日志级别（M19）。需先 Init；未 Init 时返回 false。
+// 影响所有 core（app/api/db/console）——它们共享同一 AtomicLevel。
+func (m *LogManager) SetLevel(l zapcore.Level) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.level == (zap.AtomicLevel{}) {
+		return false
+	}
+	m.level.SetLevel(l)
+	return true
+}
+
+// GetLevel 返回当前日志级别（未 Init 返回 InfoLevel）。
+func (m *LogManager) GetLevel() zapcore.Level {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.level == (zap.AtomicLevel{}) {
+		return zapcore.InfoLevel
+	}
+	return m.level.Level()
+}
+
+// SetLevel 包级 facade：运行期热切换默认日志级别（M19）。未 Init 时无操作返回 false。
+func SetLevel(l zapcore.Level) bool { return DefaultLogger.SetLevel(l) }
+
+// GetLevel 包级 facade：返回默认日志当前级别。
+func GetLevel() zapcore.Level { return DefaultLogger.GetLevel() }
 
 // SetDefaultLogManager 提升指定 LogManager 为全局默认。
 func SetDefaultLogManager(m *LogManager) {
@@ -64,8 +149,8 @@ func (m *LogManager) Init(cfg *config.Config) error {
 		return errors.New("logger: 配置为空")
 	}
 
-	// 确保日志目录存在
-	if err := os.MkdirAll(cfg.Log.Dir, 0o755); err != nil {
+	// 确保日志目录存在（0750：owner+group 可访问，与 storage 目录权限一致）
+	if err := os.MkdirAll(cfg.Log.Dir, 0o750); err != nil {
 		return err
 	}
 
@@ -85,11 +170,13 @@ func (m *LogManager) Init(cfg *config.Config) error {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 
-	// 根据运行模式设置日志级别
-	level := zapcore.DebugLevel
+	// 根据运行模式设置日志级别（M19：用 AtomicLevel 支持运行期 SetLevel 热切换）
+	level := zap.NewAtomicLevelAt(zapcore.DebugLevel)
 	if cfg.IsProduction() {
-		level = zapcore.InfoLevel
+		level = zap.NewAtomicLevelAt(zapcore.InfoLevel)
 	}
+	// 记录到 manager，供 SetLevel/GetLevel 热切换（H7：在 m.mu 下写入）。
+	m.level = level
 
 	jsonEncoder := zapcore.NewJSONEncoder(encoderConfig)
 	consoleEncoder := zapcore.NewConsoleEncoder(encoderConfig)
@@ -122,11 +209,14 @@ func (m *LogManager) Init(cfg *config.Config) error {
 	defer m.mu.Unlock()
 	// 全部构造成功后再原子替换全局变量，避免半初始化状态。
 	// 同时关闭旧 writer 释放句柄（重复 Init 场景，主要服务于测试）。
+	// H7：四个 logger 经 atomic.Pointer Store，读侧（请求 goroutine）无锁原子 load；
+	// fileWriters 仅在 m.mu 下访问。Logger 兼容别名同步维护。
 	closeFileWriters()
+	loggerPtr.Store(newLogger)
+	sugarPtr.Store(newLogger.Sugar())
+	apiLogPtr.Store(newAPILog)
+	dbLogPtr.Store(newDBLog)
 	Logger = newLogger
-	sugar = Logger.Sugar()
-	apiLog = newAPILog
-	dbLog = newDBLog
 	fileWriters = []*lumberjack.Logger{appWriter, apiWriter, dbWriter}
 	m.cfg = cfg
 
@@ -166,7 +256,7 @@ func closeFileWriters() {
 // 这里把这类错误识别并忽略，只返回真实的写入失败。
 func (m *LogManager) Sync() error {
 	var errs []error
-	for _, l := range []*zap.Logger{Logger, apiLog, dbLog} {
+	for _, l := range []*zap.Logger{currentLogger(), currentAPILog(), currentDBLog()} {
 		if l == nil {
 			continue
 		}
@@ -193,10 +283,13 @@ func (m *LogManager) Close() error {
 	m.mu.Lock()
 	closeFileWriters()
 
-	Logger = zap.NewNop()
-	sugar = Logger.Sugar()
-	apiLog = zap.NewNop()
-	dbLog = zap.NewNop()
+	// H7：重置为 Nop 经 atomic Store，与读侧一致；Logger 兼容别名同步。
+	nop := zap.NewNop()
+	loggerPtr.Store(nop)
+	sugarPtr.Store(nop.Sugar())
+	apiLogPtr.Store(nop)
+	dbLogPtr.Store(nop)
+	Logger = nop
 	m.mu.Unlock()
 
 	return syncErr
@@ -228,60 +321,60 @@ func isHarmlessSyncError(err error) bool {
 
 // Debug 调试日志
 func Debug(msg string, fields ...zap.Field) {
-	Logger.Debug(msg, fields...)
+	currentLogger().Debug(msg, fields...)
 }
 
 // Info 信息日志
 func Info(msg string, fields ...zap.Field) {
-	Logger.Info(msg, fields...)
+	currentLogger().Info(msg, fields...)
 }
 
 // Warn 警告日志
 func Warn(msg string, fields ...zap.Field) {
-	Logger.Warn(msg, fields...)
+	currentLogger().Warn(msg, fields...)
 }
 
 // Error 错误日志
 func Error(msg string, fields ...zap.Field) {
-	Logger.Error(msg, fields...)
+	currentLogger().Error(msg, fields...)
 }
 
 // Fatal 致命错误日志（仅供应用层使用，框架内部禁止调用）
 func Fatal(msg string, fields ...zap.Field) {
-	Logger.Fatal(msg, fields...)
+	currentLogger().Fatal(msg, fields...)
 }
 
 // Debugf 格式化调试日志
 func Debugf(template string, args ...any) {
-	sugar.Debugf(template, args...)
+	currentSugar().Debugf(template, args...)
 }
 
 // Infof 格式化信息日志
 func Infof(template string, args ...any) {
-	sugar.Infof(template, args...)
+	currentSugar().Infof(template, args...)
 }
 
 // Warnf 格式化警告日志
 func Warnf(template string, args ...any) {
-	sugar.Warnf(template, args...)
+	currentSugar().Warnf(template, args...)
 }
 
 // Errorf 格式化错误日志
 func Errorf(template string, args ...any) {
-	sugar.Errorf(template, args...)
+	currentSugar().Errorf(template, args...)
 }
 
 // Fatalf 格式化致命错误日志（仅供应用层使用，框架内部禁止调用）
 func Fatalf(template string, args ...any) {
-	sugar.Fatalf(template, args...)
+	currentSugar().Fatalf(template, args...)
 }
 
 // APILog 返回 API 专用日志器（写 logs/api.log + console）
 func APILog() *zap.Logger {
-	return apiLog
+	return currentAPILog()
 }
 
 // DBLog 返回数据库专用日志器（写 logs/database.log + console）
 func DBLog() *zap.Logger {
-	return dbLog
+	return currentDBLog()
 }

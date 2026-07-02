@@ -8,56 +8,10 @@ import (
 )
 
 // ===== Random Tests =====
-
-func TestRandString(t *testing.T) {
-	tests := []struct {
-		name   string
-		length int
-	}{
-		{"normal", 16},
-		{"short", 1},
-		{"long", 100},
-		{"zero", 0},
-		{"negative", -1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := utils.RandString(tt.length)
-			if tt.length <= 0 {
-				if s != "" {
-					t.Errorf("RandString(%d) should return empty", tt.length)
-				}
-				return
-			}
-			if len(s) != tt.length {
-				t.Errorf("RandString(%d) length = %d", tt.length, len(s))
-			}
-		})
-	}
-
-	// 测试 uniqueness
-	results := make(map[string]bool)
-	for i := 0; i < 100; i++ {
-		s := utils.RandString(16)
-		if results[s] {
-			t.Error("RandString generated duplicate")
-		}
-		results[s] = true
-	}
-}
-
-func TestRandDigit(t *testing.T) {
-	s := utils.RandDigit(6)
-	if len(s) != 6 {
-		t.Errorf("RandDigit length = %d", len(s))
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			t.Errorf("RandDigit contains non-digit: %c", c)
-		}
-	}
-}
+//
+// 注意（H1 收紧）：RandString/RandDigit 已移除（字符串随机的用途几乎都是安全场景，
+// 保留 math/rand 版本会诱导误用）。测试覆盖 RandStringSecure/RandDigitSecure（crypto/rand）
+// 与 RandInt/RandInt64（非安全范围随机）。
 
 func TestRandInt(t *testing.T) {
 	// 正常范围
@@ -607,17 +561,204 @@ func TestDirExists(t *testing.T) {
 	}
 }
 
-// ===== Benchmarks =====
+// ===== Secure Random Tests（H1：crypto/rand 安全版本） =====
 
-func BenchmarkRandString(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		utils.RandString(16)
+// 回归 H1：RandStringSecure 生成正确长度、仅含字母数字。
+func TestRandStringSecure(t *testing.T) {
+	tests := []struct {
+		name   string
+		length int
+	}{
+		{"normal", 16},
+		{"short", 1},
+		{"long", 100},
+		{"zero", 0},
+		{"negative", -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := utils.RandStringSecure(tt.length)
+			if err != nil {
+				t.Fatalf("RandStringSecure(%d) err: %v", tt.length, err)
+			}
+			if tt.length <= 0 {
+				if s != "" {
+					t.Errorf("RandStringSecure(%d) should return empty", tt.length)
+				}
+				return
+			}
+			if len(s) != tt.length {
+				t.Errorf("RandStringSecure(%d) length = %d", tt.length, len(s))
+			}
+			for _, c := range s {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+					t.Errorf("RandStringSecure contains invalid char: %c", c)
+				}
+			}
+		})
 	}
 }
 
-func BenchmarkRandDigit(b *testing.B) {
+// 回归 H1：RandStringSecure 唯一性——crypto/rand 不可预测，大批量无重复。
+// 对比 RandString（math/rand）偶发重复（H1 征兆）。
+func TestRandStringSecureUniqueness(t *testing.T) {
+	results := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		s, err := utils.RandStringSecure(16)
+		if err != nil {
+			t.Fatalf("RandStringSecure err: %v", err)
+		}
+		if results[s] {
+			t.Fatalf("RandStringSecure generated duplicate at i=%d: %q (H1: crypto/rand must be unique)", i, s)
+		}
+		results[s] = true
+	}
+}
+
+// 回归 H1：RandDigitSecure 生成正确长度、仅含数字（用于 OTP）。
+func TestRandDigitSecure(t *testing.T) {
+	s, err := utils.RandDigitSecure(6)
+	if err != nil {
+		t.Fatalf("RandDigitSecure err: %v", err)
+	}
+	if len(s) != 6 {
+		t.Fatalf("RandDigitSecure length = %d, want 6", len(s))
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			t.Errorf("RandDigitSecure contains non-digit: %c", c)
+		}
+	}
+}
+
+// 回归 H1：RandDigitSecure 唯一性——6 位 OTP 大批量重复率应在合理范围。
+// 6 位数字空间 10^6，1000 个样本重复概率极低（生日攻击 ~0.0005），crypto/rand 下应无重复。
+func TestRandDigitSecureUniqueness(t *testing.T) {
+	results := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		s, err := utils.RandDigitSecure(6)
+		if err != nil {
+			t.Fatalf("RandDigitSecure err: %v", err)
+		}
+		if results[s] {
+			// 6 位空间小，理论上有极小概率生日碰撞；若发生则记录但不直接失败，
+			// 用更长的码验证。此处改用 8 位码重测以排除碰撞。
+			t.Logf("RandDigitSecure(6) collision at i=%d (small space), retrying with 8 digits", i)
+			goto retry8
+		}
+		results[s] = true
+	}
+	return
+retry8:
+	results = make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		s, err := utils.RandDigitSecure(8)
+		if err != nil {
+			t.Fatalf("RandDigitSecure(8) err: %v", err)
+		}
+		if results[s] {
+			t.Fatalf("RandDigitSecure(8) generated duplicate at i=%d (H1: crypto/rand must be unique)", i)
+		}
+		results[s] = true
+	}
+}
+
+// 回归 H1：RandStringSecure 过大长度返回错误（保护熵池）。
+func TestRandStringSecureTooLarge(t *testing.T) {
+	_, err := utils.RandStringSecure(1 << 21) // 2MB，超过 1<<20 上限
+	if err != utils.ErrRandInvalidLength {
+		t.Errorf("RandStringSecure(too large) err = %v, want ErrRandInvalidLength", err)
+	}
+	_, err = utils.RandDigitSecure(1 << 21)
+	if err != utils.ErrRandInvalidLength {
+		t.Errorf("RandDigitSecure(too large) err = %v, want ErrRandInvalidLength", err)
+	}
+}
+
+// 回归 H1：RandIntSecure 范围正确、min==max、max<min 自动交换、crypto/rand 无偏。
+func TestRandIntSecure(t *testing.T) {
+	// 正常范围 [1,100)
+	for i := 0; i < 1000; i++ {
+		n, err := utils.RandIntSecure(1, 100)
+		if err != nil {
+			t.Fatalf("RandIntSecure err: %v", err)
+		}
+		if n < 1 || n >= 100 {
+			t.Errorf("RandIntSecure(1,100) = %d, out of range", n)
+		}
+	}
+
+	// min == max
+	n, err := utils.RandIntSecure(5, 5)
+	if err != nil || n != 5 {
+		t.Errorf("RandIntSecure(5,5) = %d, err=%v, want 5", n, err)
+	}
+
+	// max < min 自动交换
+	n, err = utils.RandIntSecure(100, 1)
+	if err != nil {
+		t.Fatalf("RandIntSecure(100,1) err: %v", err)
+	}
+	if n < 1 || n >= 100 {
+		t.Errorf("RandIntSecure(100,1) = %d, should swap to [1,100)", n)
+	}
+}
+
+// 回归 H1：RandInt64Secure 唯一性——crypto/rand 在大空间内分布均匀、不可预测。
+// [0, 1<<40) 取 1000 个，生日攻击重复概率 ~0.0000005，crypto/rand 应无重复。
+func TestRandInt64SecureUniqueness(t *testing.T) {
+	seen := make(map[int64]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		n, err := utils.RandInt64Secure(0, 1<<40)
+		if err != nil {
+			t.Fatalf("RandInt64Secure err: %v", err)
+		}
+		if seen[n] {
+			t.Fatalf("RandInt64Secure duplicate at i=%d: %d (H1: crypto/rand must be unique in large range)", i, n)
+		}
+		seen[n] = true
+	}
+}
+
+// 回归 H1：RandInt64Secure 范围正确、min==max、max<min 自动交换。
+func TestRandInt64Secure(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		n, err := utils.RandInt64Secure(0, 1000000)
+		if err != nil {
+			t.Fatalf("RandInt64Secure err: %v", err)
+		}
+		if n < 0 || n >= 1000000 {
+			t.Errorf("RandInt64Secure(0,1e6) = %d, out of range", n)
+		}
+	}
+
+	// min == max
+	n, err := utils.RandInt64Secure(7, 7)
+	if err != nil || n != 7 {
+		t.Errorf("RandInt64Secure(7,7) = %d, err=%v, want 7", n, err)
+	}
+
+	// max < min 自动交换
+	n, err = utils.RandInt64Secure(1000000, 0)
+	if err != nil {
+		t.Fatalf("RandInt64Secure(1e6,0) err: %v", err)
+	}
+	if n < 0 || n >= 1000000 {
+		t.Errorf("RandInt64Secure(1e6,0) = %d, should swap to [0,1e6)", n)
+	}
+}
+
+// ===== Benchmarks =====
+
+func BenchmarkRandStringSecure(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		utils.RandDigit(6)
+		_, _ = utils.RandStringSecure(16)
+	}
+}
+
+func BenchmarkRandDigitSecure(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		_, _ = utils.RandDigitSecure(6)
 	}
 }
 

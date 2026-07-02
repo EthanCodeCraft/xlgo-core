@@ -91,3 +91,16 @@ func TestFailWithErrorREST(t *testing.T) {
 		t.Errorf("FailWithError(ErrUnauthorized) status = %d, want 401", w.Code)
 	}
 }
+
+// TestDataAlreadyExistsMapsConflict_B7：CodeDataAlreadyExists 应映射 409（与 CodeDataConflict 一致）。
+func TestDataAlreadyExistsMapsConflict_B7(t *testing.T) {
+	withMode(t, response.ModeREST)
+	r := setupTestRouter()
+	r.GET("/dup", func(c *gin.Context) { response.FailWithError(c, response.ErrDataAlreadyExists) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/dup", nil))
+	if w.Code != 409 {
+		t.Errorf("ErrDataAlreadyExists status = %d, want 409", w.Code)
+	}
+}

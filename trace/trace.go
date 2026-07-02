@@ -4,14 +4,19 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -31,6 +36,9 @@ type Config struct {
 	ExporterType string
 	// Endpoint OTLP 导出器地址
 	Endpoint string
+	// Insecure 是否使用明文（无 TLS）连接 collector。
+	// 默认 false（TLS）；对 localhost:4318 等明文 collector 需显式置 true（C13c）。
+	Insecure bool
 	// SampleRatio 采样比例 (0.0-1.0)
 	SampleRatio float64
 	// Enabled 是否启用
@@ -51,26 +59,57 @@ var DefaultConfig = Config{
 	Propagator:     "w3c",
 }
 
-// TracerProvider 全局 TracerProvider
-var tracerProvider *sdktrace.TracerProvider
+// tracerProviderPtr 全局 TracerProvider（atomic，C13a）。
+// Init 之前/Close 之后均为 Noop，保证任何时刻 Load 非 nil，请求期不 panic。
+var tracerProviderPtr atomic.Pointer[sdktrace.TracerProvider]
 
-// Tracer 全局 Tracer
-var tracer trace.Tracer
+// tracerPtr 全局 Tracer（atomic，C13a）。Init 之前为 Noop，调用安全。
+var tracerPtr atomic.Pointer[trace.Tracer]
+
+// closeOnce 保证 Close 只真正 Shutdown 一次（M18），重复调用安全返回 nil。
+var closeOnce sync.Once
+var closeErr error
+
+func init() {
+	// 初始化为 Noop，保证包级函数在任何时刻（未 Init / 已 Close）Load 均非 nil（C13a）。
+	noopProvider := trace.NewNoopTracerProvider()
+	noopTracer := noopProvider.Tracer("xlgo")
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+	tracerProviderPtr.Store(tp)
+	tracerPtr.Store(&noopTracer)
+}
+
+// getTracer 返回全局 Tracer 的 atomic 快照（永不 nil）。
+func getTracer() trace.Tracer {
+	return *tracerPtr.Load()
+}
+
+// TracerProvider 全局 TracerProvider（导出供高级用法；返回当前快照）。
+func TracerProvider() *sdktrace.TracerProvider {
+	return tracerProviderPtr.Load()
+}
 
 // Init 初始化链路追踪
 func Init(cfg Config) error {
 	if !cfg.Enabled {
 		// 设置 Noop Tracer
-		otel.SetTracerProvider(trace.NewNoopTracerProvider())
-		tracer = otel.Tracer(cfg.ServiceName)
+		noopProvider := trace.NewNoopTracerProvider()
+		otel.SetTracerProvider(noopProvider)
+		noopTracer := noopProvider.Tracer(cfg.ServiceName)
+		tracerPtr.Store(&noopTracer)
+		// 不替换 tracerProviderPtr（保留兜底 NeverSample provider），无 exporter 需关闭。
 		return nil
 	}
 
 	// 创建资源
+	// 注意：不传 semconv.SchemaURL 与 resource.Default() 混用——
+	// resource.Default() 在不同 OTel 版本可能使用与 semconv v1.24.0 不同的 schema URL，
+	// resource.Merge 对冲突的 SchemaURL 直接报错。这里用空 schema URL 的属性集合并，
+	// 避免版本漂移导致的初始化失败。
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
+			"",
 			semconv.ServiceName(cfg.ServiceName),
 			semconv.ServiceVersion(cfg.ServiceVersion),
 			attribute.String("environment", cfg.Environment),
@@ -87,21 +126,31 @@ func Init(cfg Config) error {
 	}
 
 	// 创建 TracerProvider
-	tracerProvider = sdktrace.NewTracerProvider(
+	newProvider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(cfg.SampleRatio)),
 	)
 
 	// 设置全局 TracerProvider
-	otel.SetTracerProvider(tracerProvider)
+	otel.SetTracerProvider(newProvider)
 
-	// 设置传播器
-	propagator := createPropagator(cfg.Propagator)
-	otel.SetTextMapPropagator(propagator)
+	// 设置传播器（非法类型返错，C13e 不再静默回落）
+	prop, err := createPropagator(cfg.Propagator)
+	if err != nil {
+		// 传播器非法：回滚已创建的 provider，避免泄漏。
+		_ = newProvider.Shutdown(context.Background())
+		return err
+	}
+	otel.SetTextMapPropagator(prop)
 
-	// 创建 Tracer
-	tracer = otel.Tracer(cfg.ServiceName)
+	// 原子替换：先建新 provider，成功后再 Store，并关闭旧 provider（若持有 exporter）。
+	oldProvider := tracerProviderPtr.Swap(newProvider)
+	tracer := newProvider.Tracer(cfg.ServiceName)
+	tracerPtr.Store(&tracer)
+	if oldProvider != nil {
+		_ = oldProvider.Shutdown(context.Background())
+	}
 
 	return nil
 }
@@ -110,39 +159,65 @@ func Init(cfg Config) error {
 func createExporter(cfg Config) (sdktrace.SpanExporter, error) {
 	switch cfg.ExporterType {
 	case "otlp-http":
-		client := otlptracehttp.NewClient(
-			otlptracehttp.WithEndpoint(cfg.Endpoint),
-		)
+		opts := []otlptracehttp.Option{otlptracehttp.WithEndpoint(cfg.Endpoint)}
+		if cfg.Insecure {
+			opts = append(opts, otlptracehttp.WithInsecure()) // C13c
+		}
+		client := otlptracehttp.NewClient(opts...)
 		return otlptrace.New(context.Background(), client)
 	case "otlp-grpc":
-		client := otlptracegrpc.NewClient(
-			otlptracegrpc.WithEndpoint(cfg.Endpoint),
-		)
+		opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(cfg.Endpoint)}
+		if cfg.Insecure {
+			opts = append(opts, otlptracegrpc.WithInsecure()) // C13c
+		}
+		client := otlptracegrpc.NewClient(opts...)
 		return otlptrace.New(context.Background(), client)
+	case "stdout":
+		return stdouttrace.New(
+			stdouttrace.WithWriter(os.Stdout),
+			stdouttrace.WithPrettyPrint(),
+		)
 	default:
-		return nil, nil
+		// C13b：未知导出器返错，不再返回 nil 喂 WithBatcher(nil)。
+		return nil, fmt.Errorf("不支持的导出器类型: %s", cfg.ExporterType)
 	}
 }
 
-// createPropagator 创建传播器
-func createPropagator(propagatorType string) propagation.TextMapPropagator {
+// createPropagator 创建传播器（C13e：实现 b3，jaeger 映射 W3C，未知返错）。
+func createPropagator(propagatorType string) (propagation.TextMapPropagator, error) {
 	switch propagatorType {
-	case "w3c":
+	case "w3c", "":
 		return propagation.NewCompositeTextMapPropagator(
 			propagation.TraceContext{},
 			propagation.Baggage{},
-		)
+		), nil
+	case "b3":
+		// 同时支持多头与单头注入/抽取，兼容旧 B3 客户端。
+		return b3.New(b3.WithInjectEncoding(b3.B3MultipleHeader | b3.B3SingleHeader)), nil
+	case "jaeger":
+		// 现代 Jaeger agent 透传 W3C TraceContext；纯 Jaeger thrift 头协议需下游用 b3。
+		// 不引入不稳定的 jaegerremix 模块，jaeger 视为 W3C 别名。
+		return propagation.TraceContext{}, nil
 	default:
-		return propagation.TraceContext{}
+		return nil, fmt.Errorf("不支持的传播器类型: %s", propagatorType)
 	}
 }
 
-// Close 关闭链路追踪
+// Close 关闭链路追踪（幂等，M18：sync.Once 保证只 Shutdown 一次，重复调用安全）。
 func Close(ctx context.Context) error {
-	if tracerProvider != nil {
-		return tracerProvider.Shutdown(ctx)
-	}
-	return nil
+	closeOnce.Do(func() {
+		// 取出当前 provider 并 Shutdown；Store 回兜底 NeverSample provider，
+		// 防 Close 后再用已关闭 provider（C13a）。
+		tp := tracerProviderPtr.Load()
+		fallback := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+		tracerProviderPtr.Store(fallback)
+		noopTracer := trace.NewNoopTracerProvider().Tracer("xlgo")
+		tracerPtr.Store(&noopTracer)
+		if tp != nil {
+			closeErr = tp.Shutdown(ctx)
+		}
+	})
+	return closeErr
 }
 
 // Middleware Gin 中间件
@@ -157,7 +232,7 @@ func Middleware(serviceName string) gin.HandlerFunc {
 			spanName = c.Request.Method + " " + c.Request.URL.Path
 		}
 
-		ctx, span := tracer.Start(ctx, spanName,
+		ctx, span := getTracer().Start(ctx, spanName,
 			trace.WithSpanKind(trace.SpanKindServer),
 			trace.WithAttributes(
 				semconv.HTTPRequestMethodKey.String(c.Request.Method),
@@ -168,7 +243,9 @@ func Middleware(serviceName string) gin.HandlerFunc {
 			),
 		)
 
-		// 将 context 存入 Gin Context
+		// C13d：更新 c.Request，使下游 c.Request.Context() 含 span；
+		// 同时保留 c.Set("otel_ctx", ctx) 兼容既有 GetContext 用法。
+		c.Request = c.Request.WithContext(ctx)
 		c.Set("otel_ctx", ctx)
 
 		// 将 TraceID 添加到响应头
@@ -184,9 +261,9 @@ func Middleware(serviceName string) gin.HandlerFunc {
 
 		if status >= 400 {
 			span.SetStatus(codes.Error, http.StatusText(status))
-		} else {
-			span.SetStatus(codes.Ok, "")
 		}
+		// 成功路径不显式设 codes.Ok（M18）：OTel 规范中 Span 状态默认 UNSET，
+		// 仅在错误时设 Error；显式设 Ok 会掩盖下游子 Span 的真实错误状态。
 
 		// 结束 Span
 		span.End()
@@ -194,9 +271,13 @@ func Middleware(serviceName string) gin.HandlerFunc {
 }
 
 // GetContext 从 Gin Context 获取 OpenTelemetry Context
+//
+// C13：裸断言改 comma-ok，防 "otel_ctx" 被外部置为非 context 值时 panic。
 func GetContext(c *gin.Context) context.Context {
-	if ctx, exists := c.Get("otel_ctx"); exists {
-		return ctx.(context.Context)
+	if v, exists := c.Get("otel_ctx"); exists {
+		if ctx, ok := v.(context.Context); ok {
+			return ctx
+		}
 	}
 	return c.Request.Context()
 }
@@ -214,7 +295,7 @@ func GetTraceID(c *gin.Context) string {
 // StartSpan 创建子 Span
 func StartSpan(c *gin.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	ctx := GetContext(c)
-	return tracer.Start(ctx, name,
+	return getTracer().Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(attrs...),
 	)
@@ -222,7 +303,7 @@ func StartSpan(c *gin.Context, name string, attrs ...attribute.KeyValue) (contex
 
 // StartSpanFromContext 从 Context 创建 Span
 func StartSpanFromContext(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
-	return tracer.Start(ctx, name,
+	return getTracer().Start(ctx, name,
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(attrs...),
 	)
@@ -251,7 +332,7 @@ func AddAttributes(c *gin.Context, attrs ...attribute.KeyValue) {
 
 // GetTracer 获取全局 Tracer
 func GetTracer() trace.Tracer {
-	return tracer
+	return getTracer()
 }
 
 // SetAttribute 设置单个属性
