@@ -21,7 +21,7 @@ type h6User struct {
 }
 
 func init() {
-	// 注册 SQLite 方言，供路由测试通过 database.DefaultManager 初始化主从库使用。
+	// 注册 SQLite 方言，供路由测试通过 database 包级 facade（InitDB 等，代理到 DefaultManager）初始化主从库使用。
 	database.RegisterDialect(database.DialectSpec{
 		Name:      "sqlite",
 		Aliases:   []string{"sqlite3"},

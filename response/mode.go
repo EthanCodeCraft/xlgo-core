@@ -28,6 +28,30 @@ func SetMode(m Mode) { currentMode.Store(int32(m)) }
 // GetMode 返回当前响应模式。
 func GetMode() Mode { return Mode(currentMode.Load()) }
 
+// exposeDetail 控制是否把 Error.Detail 写入发给客户端的响应体（P1 #15）。
+// 默认 true（保持存量行为：直接使用 response 包的项目不受影响）。
+// App 在 Init 时按环境设置：生产环境置为 false，避免调用方误把内部错误（SQL 报错、
+// 堆栈上下文等）塞进 Detail 而泄露给客户端；开发环境保持 true 便于排查。
+// 1 表示暴露，0 表示隐藏。
+var exposeDetail atomic.Int32
+
+func init() {
+	exposeDetail.Store(1) // 默认暴露，保持存量行为
+}
+
+// SetExposeDetail 设置是否向客户端暴露 Error.Detail（P1 #15）。
+// 生产环境建议置为 false，防止内部错误细节泄露。并发安全。
+func SetExposeDetail(expose bool) {
+	if expose {
+		exposeDetail.Store(1)
+	} else {
+		exposeDetail.Store(0)
+	}
+}
+
+// detailExposed 返回当前是否暴露 Detail。
+func detailExposed() bool { return exposeDetail.Load() == 1 }
+
 // statusForCode 按业务码推断 HTTP status（用于 ModeREST）。
 // 已知框架错误码显式映射；用户/文件/数据模块的业务错误码（1xxxx~3xxxx）
 // 属业务语义而非 HTTP 错误，保持 200；操作失败类（4xxxx）映射 400。

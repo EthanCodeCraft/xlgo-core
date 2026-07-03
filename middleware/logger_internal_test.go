@@ -201,6 +201,33 @@ func TestBodyLogWriter_WriteStringBounded(t *testing.T) {
 	}
 }
 
+// TestFilterSensitiveQuery P1 #14：query 中的敏感参数值必须脱敏，非敏感原样保留。
+func TestFilterSensitiveQuery(t *testing.T) {
+	cases := []struct {
+		name     string
+		in       string
+		contains string // 期望结果包含
+		absent   string // 期望结果不含（敏感原值）
+	}{
+		{"empty", "", "", ""},
+		{"no sensitive", "page=1&size=20", "page=1", ""},
+		{"access_token redacted", "access_token=supersecret123&page=1", "FILTERED", "supersecret123"},
+		{"password redacted", "user=alice&password=hunter2", "FILTERED", "hunter2"},
+		{"case insensitive key", "Token=abc.def.ghi", "FILTERED", "abc.def.ghi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterSensitiveQuery(tc.in)
+			if tc.contains != "" && !strings.Contains(got, tc.contains) {
+				t.Errorf("filterSensitiveQuery(%q) = %q, want contains %q", tc.in, got, tc.contains)
+			}
+			if tc.absent != "" && strings.Contains(got, tc.absent) {
+				t.Errorf("filterSensitiveQuery(%q) = %q, must NOT contain sensitive value %q", tc.in, got, tc.absent)
+			}
+		})
+	}
+}
+
 // TestLoggerWithConfig_NormalizesMaxBodyLength MaxBodyLength<=0 时归一化为默认值，
 // 确保响应侧捕获缓冲区仍有上限（H3 复审 MEDIUM：消除请求/响应侧 maxLen<=0 不对称）。
 func TestLoggerWithConfig_NormalizesMaxBodyLength(t *testing.T) {

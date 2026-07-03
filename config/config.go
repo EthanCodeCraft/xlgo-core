@@ -21,16 +21,55 @@ var (
 
 // Config 全局配置结构体
 type Config struct {
-	App      AppConfig       `mapstructure:"app"`
-	Server   ServerConfig    `mapstructure:"server"`
-	Database DatabaseConfig  `mapstructure:"database"`
-	Redis    RedisConfig     `mapstructure:"redis"`
-	JWT      JWTConfig       `mapstructure:"jwt"`
-	SMS      SMSConfig       `mapstructure:"sms"`
-	Storage  StorageConfig   `mapstructure:"storage"`
-	Upload   UploadConfig    `mapstructure:"upload"`
-	Log      LogConfig       `mapstructure:"log"`
-	CORS     CORSConfig      `mapstructure:"cors"`
+	App      AppConfig      `mapstructure:"app"`
+	Server   ServerConfig   `mapstructure:"server"`
+	Database DatabaseConfig `mapstructure:"database"`
+	Redis    RedisConfig    `mapstructure:"redis"`
+	JWT      JWTConfig      `mapstructure:"jwt"`
+	SMS      SMSConfig      `mapstructure:"sms"`
+	Storage  StorageConfig  `mapstructure:"storage"`
+	Upload   UploadConfig   `mapstructure:"upload"`
+	Log      LogConfig      `mapstructure:"log"`
+	CORS     CORSConfig     `mapstructure:"cors"`
+}
+
+// Clone 返回 Config 的深拷贝（M-G 修复）。
+//
+// 标量字段与子结构体经结构体值拷贝独立；所有切片字段（CORS 的 4 个列表、Upload 的 2 个
+// 类型白名单、Storage.Local/OSS 上传策略的扩展名/MIME 白名单）深拷贝底层数组，使返回值
+// 可被调用方安全修改（含 append/sort/改元素）而不污染框架内部配置、不与其他读者竞态。
+//
+// 用于需要可变配置副本的场景。热路径的 Get() 为零分配仍返回内部只读指针——需要改配置时
+// 用 Clone() 或 Load()（Load 内部已返回 Clone）。
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	cp := *c // 浅拷贝：标量与子结构体独立，切片字段仍共享底层数组（下方逐个深拷贝）
+	// CORS
+	cp.CORS.AllowedOrigins = cloneStrings(c.CORS.AllowedOrigins)
+	cp.CORS.AllowedMethods = cloneStrings(c.CORS.AllowedMethods)
+	cp.CORS.AllowedHeaders = cloneStrings(c.CORS.AllowedHeaders)
+	cp.CORS.ExposedHeaders = cloneStrings(c.CORS.ExposedHeaders)
+	// Upload
+	cp.Upload.AllowedImageTypes = cloneStrings(c.Upload.AllowedImageTypes)
+	cp.Upload.AllowedVideoTypes = cloneStrings(c.Upload.AllowedVideoTypes)
+	// Storage.Local.Upload / Storage.OSS.Upload
+	cp.Storage.Local.Upload.AllowedExts = cloneStrings(c.Storage.Local.Upload.AllowedExts)
+	cp.Storage.Local.Upload.AllowedMIMEs = cloneStrings(c.Storage.Local.Upload.AllowedMIMEs)
+	cp.Storage.OSS.Upload.AllowedExts = cloneStrings(c.Storage.OSS.Upload.AllowedExts)
+	cp.Storage.OSS.Upload.AllowedMIMEs = cloneStrings(c.Storage.OSS.Upload.AllowedMIMEs)
+	return &cp
+}
+
+// cloneStrings 返回字符串切片的深拷贝（nil 保持 nil 语义，避免把 nil 变成空切片）。
+func cloneStrings(s []string) []string {
+	if s == nil {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	return out
 }
 
 // AppConfig 应用配置
@@ -302,7 +341,7 @@ type JWTConfig struct {
 	Expire        time.Duration `mapstructure:"expire"`         // 过期时间，如 "24h"（time.Duration）
 	RefreshExpire time.Duration `mapstructure:"refresh_expire"` // 刷新 token 过期时间，如 "168h"
 	Issuer        string        `mapstructure:"issuer"`         // 签发者
-	Algorithm     string        `mapstructure:"algorithm"`      // 签名算法：HS256(默认)/RS256
+	Algorithm     string        `mapstructure:"algorithm"`      // 签名算法：HS256(默认)/HS384/HS512；非 HMAC 算法（如 RS256）会被 jwt.signingMethod 拒绝（ErrUnsupportedAlgorithm）
 }
 
 // SMSConfig 短信配置
@@ -490,12 +529,11 @@ func (m *Manager) Load() (*Config, error) {
 	m.cfg = &cfg
 	m.mu.Unlock()
 
-	// 防御性拷贝（C10c）：返回独立副本，避免调用方与框架内部 m.cfg 共享同一可变指针。
-	// 调用方修改返回值的标量字段不影响 Get() 等读取路径。
-	// 注意：这是浅拷贝——切片字段（如 CORSConfig.AllowedOrigins）仍与 m.cfg 共享底层数组，
-	// 调用方不得修改切片元素（约定配置对象为只读）。需要完全独立可变副本时自行深拷贝。
-	out := cfg
-	return &out, nil
+	// M-G 修复：返回深拷贝（Clone），标量与切片字段均独立，调用方可安全修改。
+	// 原"防御性拷贝"为浅拷贝（out := cfg）——切片字段（CORS.AllowedOrigins 等）仍与
+	// 内部 m.cfg 共享底层数组，调用方 append/sort/改元素会污染全局并与其他读者竞态。
+	// 内部 m.cfg 保留独立的 &cfg，不受返回值修改影响。
+	return cfg.Clone(), nil
 }
 
 // LoadWithWatch 加载配置文件并启用热更新
@@ -572,6 +610,13 @@ func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct
 	defer close(done)
 	const debounce = 200 * time.Millisecond
 	var timer *time.Timer
+	// P1 #16：退出时停掉未触发的去抖 timer，避免 StopWatcher 之后 AfterFunc 仍
+	// reload() 一个调用方认为已停止的 manager。
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
 	for {
 		select {
 		case ev, ok := <-w.Events:
@@ -627,8 +672,12 @@ func (m *Manager) StopWatcher() {
 // Get 获取配置。
 //
 // 返回的是 Manager 内部持有的配置指针（共享），调用方**必须视为只读**：
-// 修改返回值的标量或切片元素会污染全局配置并与其他读取 goroutine 竞争。
-// 需要可变副本时用 Load()（返回防御性拷贝）或自行深拷贝。
+// 修改返回值的标量或切片元素会污染全局配置并与其他读取 goroutine 竞态。需要可变副本时
+// 用 Clone()（返回深拷贝）或 Load()（重载并返回深拷贝）。
+//
+// M-G：热路径（jwt 鉴权等每请求调用）保持返回内部指针以零分配，可变副本走 Clone()。
+// 框架自身的 reload 创建新 Config 并替换 m.cfg 指针，不改写旧 Config 对象，故 Get()
+// 返回的旧指针在 reload 后仍指向一致的（旧）快照，reload 不引入对旧快照的竞态。
 func (m *Manager) Get() *Config {
 	if m == nil {
 		return nil
@@ -698,14 +747,24 @@ func (m *Manager) reload() error {
 	copy(cbs, m.callbacks)
 	m.mu.Unlock()
 
+	// M-G：回调传入 newCfg 的深拷贝，避免回调修改切片字段与 Get() 读者（持有 &newCfg）竞态。
+	// 回调为 onChange 通知语义，应观察而非改写配置；改写副本不影响内部 m.cfg。
 	for _, cb := range cbs {
-		cb(&newCfg)
+		cb(newCfg.Clone())
 	}
 	return nil
 }
 
+// pkgLoadMu 串行化包级 Load/LoadWithWatch 对 defaultManager 的"停旧 watcher → 建新 → 置换"
+// 序列（P1 #8）。原实现该序列非原子：两个 goroutine 并发调用可能都读到 old、都 StopWatcher、
+// 都 Store，遗留一个已 StartWatcher 的 manager 无引用可停（goroutine 泄漏）。
+var pkgLoadMu sync.Mutex
+
 // Load 加载配置文件（C3.5 修复：替换前停止旧 Manager 的 watcher，防止 goroutine 泄漏）。
+// P1 #8：全程持 pkgLoadMu 串行化，消除与并发 Load/LoadWithWatch 的 TOCTOU。
 func Load(configPath string) (*Config, error) {
+	pkgLoadMu.Lock()
+	defer pkgLoadMu.Unlock()
 	if old := defaultManager.Load(); old != nil {
 		old.StopWatcher()
 	}
@@ -719,13 +778,22 @@ func Load(configPath string) (*Config, error) {
 }
 
 // LoadWithWatch 加载配置文件并启用热更新（C3.5 修复：替换前停止旧 watcher）。
+// P1 #8：全程持 pkgLoadMu 串行化，且新 manager 在其 watcher 成功启动后才置换为默认；
+// 启动失败则停掉半启动的 watcher 并不置换，避免遗留孤儿 watcher。
 func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
+	pkgLoadMu.Lock()
+	defer pkgLoadMu.Unlock()
 	if old := defaultManager.Load(); old != nil {
 		old.StopWatcher()
 	}
 	m := NewManager(configPath)
+	cfg, err := m.LoadWithWatch(onChange)
+	if err != nil {
+		m.StopWatcher() // 清理可能已半启动的 watcher，避免孤儿 goroutine
+		return nil, err
+	}
 	defaultManager.Store(m)
-	return m.LoadWithWatch(onChange)
+	return cfg, nil
 }
 
 // RegisterCallback 注册配置变更回调

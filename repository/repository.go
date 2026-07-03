@@ -190,8 +190,12 @@ func (r *BaseRepo[T]) FindWhere(ctx context.Context, query string, args ...any) 
 	return models, err
 }
 
-// FindWhereOrdered 条件查询并排序
-func (r *BaseRepo[T]) FindWhereOrdered(ctx context.Context, query string, args []any, order string) ([]T, error) {
+// FindWhereOrdered 条件查询并排序。
+//
+// H-15 修复（breaking）：签名由 (ctx, query, args []any, order) 改为
+// (ctx, order, query string, args ...any)，与 FindWhere 等同类方法统一为变长 args。
+// Go 语法要求变长参数必须为最后一个，故 order 前置于 query。
+func (r *BaseRepo[T]) FindWhereOrdered(ctx context.Context, order, query string, args ...any) ([]T, error) {
 	var models []T
 	err := r.readConn(ctx).Where(query, args...).Order(order).Find(&models).Error
 	return models, err
@@ -291,8 +295,12 @@ func (r *BaseRepo[T]) FindPageWhere(ctx context.Context, page, pageSize int, que
 	return &PageResult[T]{Items: models, Total: total, Page: page, PageSize: pageSize}, nil
 }
 
-// FindPageWhereOrdered 条件分页查询并排序（count+list 单事务，H6d）
-func (r *BaseRepo[T]) FindPageWhereOrdered(ctx context.Context, page, pageSize int, query string, args []any, order string) (*PageResult[T], error) {
+// FindPageWhereOrdered 条件分页查询并排序（count+list 单事务，H6d）。
+//
+// H-15 修复（breaking）：签名由 (ctx, page, pageSize, query, args []any, order) 改为
+// (ctx, page, pageSize, order, query string, args ...any)，与 FindPageWhere 统一为变长 args。
+// Go 语法要求变长参数必须为最后一个，故 order 前置于 query。
+func (r *BaseRepo[T]) FindPageWhereOrdered(ctx context.Context, page, pageSize int, order, query string, args ...any) (*PageResult[T], error) {
 	var models []T
 	var total int64
 	offset := pageOffset(page, pageSize)

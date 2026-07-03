@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -138,29 +139,11 @@ func StrLen(s string) int {
 	return utf8.RuneCountInString(s)
 }
 
-// EqualsIgnoreCase 不区分大小写比较字符串
+// EqualsIgnoreCase 不区分大小写比较字符串。
+//
+// L-C 修复：改用 strings.EqualFold（标准库 Unicode 大小写折叠）。原实现仅做 ASCII
+// 字节级折叠（'A'-'Z' → +32），对非 ASCII 字符（如 "É" vs "é"）误判为不等。
+// EqualFold 同时更快（无逐字节循环开销）。
 func EqualsIgnoreCase(a, b string) bool {
-	if a == b {
-		return true
-	}
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca := a[i]
-		cb := b[i]
-		if ca != cb {
-			// 转小写比较
-			if ca >= 'A' && ca <= 'Z' {
-				ca += 32
-			}
-			if cb >= 'A' && cb <= 'Z' {
-				cb += 32
-			}
-			if ca != cb {
-				return false
-			}
-		}
-	}
-	return true
+	return strings.EqualFold(a, b)
 }

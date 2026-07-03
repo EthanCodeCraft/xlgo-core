@@ -39,21 +39,28 @@ func main() {
 
 	command := os.Args[1]
 
+	// P1 #21：命令执行失败时以非零码退出，便于 `xlgo new x && cd x` 等脚本/CI 正确中断。
 	switch command {
 	case "new":
 		if len(os.Args) < 3 {
-			fmt.Println("用法: xlgo new <项目名>")
-			return
+			fmt.Fprintln(os.Stderr, "用法: xlgo new <项目名>")
+			os.Exit(2)
 		}
-		createProject(os.Args[2])
+		if err := createProject(os.Args[2]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %s\n", err)
+			os.Exit(1)
+		}
 
 	case "make":
 		if len(os.Args) < 4 {
-			fmt.Println("用法: xlgo make <类型> <名称>")
-			fmt.Println("类型: handler, repository, model, service")
-			return
+			fmt.Fprintln(os.Stderr, "用法: xlgo make <类型> <名称>")
+			fmt.Fprintln(os.Stderr, "类型: handler, repository, model, service")
+			os.Exit(2)
 		}
-		makeFile(os.Args[2], os.Args[3])
+		if err := makeFile(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %s\n", err)
+			os.Exit(1)
+		}
 
 	case "version":
 		fmt.Printf("xlgo v%s\n", xlgo.Version)

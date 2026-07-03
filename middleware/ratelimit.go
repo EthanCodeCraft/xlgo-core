@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/database"
@@ -153,7 +154,7 @@ type RedisRateLimiter struct {
 	keyPrefix   string        // 键名前缀
 	rate        int           // 每分钟允许的请求数
 	window      time.Duration // 时间窗口
-	failClosed  bool          // H4c: Redis 错误/断言失败时是否拒绝（true=安全型 fail-closed，false=兼容默认 fail-open 放行）
+	failClosed  atomic.Bool   // H4c/H-6: Redis 错误/断言失败时是否拒绝（true=安全型 fail-closed）。atomic 以支持运行期 SetFailClosed 并发安全切换。
 }
 
 // slidingWindowLua 滑动窗口限流 Lua 脚本
@@ -184,28 +185,29 @@ end
 // 安全敏感场景（如登录防爆破）应使用 NewRedisRateLimiterFailClosed，Redis 故障时拒绝以防限流失效。
 func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
 	return &RedisRateLimiter{
-		keyPrefix:  keyPrefix,
-		rate:       rate,
-		window:     window,
-		failClosed: false,
+		keyPrefix: keyPrefix,
+		rate:      rate,
+		window:    window,
+		// failClosed 零值 false（fail-open，兼容默认）
 	}
 }
 
 // NewRedisRateLimiterFailClosed 创建安全型 Redis 分布式限流器（fail-closed）：
 // Redis 不可用/错误/返回非预期类型时拒绝请求，避免限流静默失效（防爆破场景必备）。
 func NewRedisRateLimiterFailClosed(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
-	return &RedisRateLimiter{
-		keyPrefix:  keyPrefix,
-		rate:       rate,
-		window:     window,
-		failClosed: true,
+	rl := &RedisRateLimiter{
+		keyPrefix: keyPrefix,
+		rate:      rate,
+		window:    window,
 	}
+	rl.failClosed.Store(true)
+	return rl
 }
 
 // SetFailClosed 设置 Redis 故障时的策略：true=拒绝（安全型），false=放行（兼容默认）。
-// 供已创建的限流器切换策略。
+// 供已创建的限流器切换策略。并发安全（atomic.Store），可与并发 Allow 调用共存。
 func (rl *RedisRateLimiter) SetFailClosed(failClosed bool) {
-	rl.failClosed = failClosed
+	rl.failClosed.Store(failClosed)
 }
 
 // Allow 检查是否允许请求。
@@ -219,8 +221,11 @@ func (rl *RedisRateLimiter) SetFailClosed(failClosed bool) {
 // Redis 未启用（database.GetRedis() == nil）时：fail-closed 返 (false, ErrRedisRateLimiterUnavailable)，
 // fail-open 返 (true, nil)（兼容旧行为）。安全场景必须确保 Redis 已启用。
 func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool, error) {
-	if database.GetRedis() == nil {
-		if rl.failClosed {
+	// M-C 修复：GetRedis() 仅取一次复用。原实现 nil 检查与 Eval 各调一次 GetRedis()，
+	// 两次之间若 CloseRedis，第二次返回 nil → nil.Eval panic。
+	rdb := database.GetRedis()
+	if rdb == nil {
+		if rl.failClosed.Load() {
 			return false, ErrRedisRateLimiterUnavailable
 		}
 		return true, nil
@@ -230,9 +235,9 @@ func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool,
 	now := float64(time.Now().UnixMilli())
 	windowMs := float64(rl.window.Milliseconds())
 
-	result, err := database.GetRedis().Eval(ctx, slidingWindowLua, []string{key}, now, windowMs, rl.rate).Result()
+	result, err := rdb.Eval(ctx, slidingWindowLua, []string{key}, now, windowMs, rl.rate).Result()
 	if err != nil {
-		if rl.failClosed {
+		if rl.failClosed.Load() {
 			return false, err
 		}
 		return true, err // 出错时允许请求，避免影响业务（兼容旧行为）
@@ -241,7 +246,7 @@ func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool,
 	// H4c: comma-ok 断言，避免 Redis 返回非 int64 时 panic。
 	count, ok := result.(int64)
 	if !ok {
-		if rl.failClosed {
+		if rl.failClosed.Load() {
 			return false, ErrRedisRateLimiterUnexpectedResult
 		}
 		return true, ErrRedisRateLimiterUnexpectedResult
@@ -251,7 +256,9 @@ func (rl *RedisRateLimiter) Allow(ctx context.Context, identifier string) (bool,
 
 // GetCount 获取当前窗口内的请求数
 func (rl *RedisRateLimiter) GetCount(ctx context.Context, identifier string) (int64, error) {
-	if database.GetRedis() == nil {
+	// M-C 修复：GetRedis() 取一次复用（原三次调用存在 nil-deref 窗口）。
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return 0, nil
 	}
 
@@ -260,18 +267,20 @@ func (rl *RedisRateLimiter) GetCount(ctx context.Context, identifier string) (in
 	windowStart := now - rl.window.Milliseconds()
 
 	// 移除旧记录并获取当前计数
-	database.GetRedis().ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart))
-	return database.GetRedis().ZCard(ctx, key).Result()
+	rdb.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart))
+	return rdb.ZCard(ctx, key).Result()
 }
 
 // Reset 重置限流计数
 func (rl *RedisRateLimiter) Reset(ctx context.Context, identifier string) error {
-	if database.GetRedis() == nil {
+	// M-C 修复：GetRedis() 取一次复用（原两次调用存在 nil-deref 窗口）。
+	rdb := database.GetRedis()
+	if rdb == nil {
 		return nil
 	}
 
 	key := rl.keyPrefix + ":" + identifier
-	return database.GetRedis().Del(ctx, key).Err()
+	return rdb.Del(ctx, key).Err()
 }
 
 // ===== 全局限速器 =====
@@ -280,14 +289,9 @@ var (
 	loginLimiter   *RateLimiter
 	apiLimiter     *RateLimiter
 	uploadLimiter  *RateLimiter
-	redisLimiters  map[string]*RedisRateLimiter
 	customLimiters []*RateLimiter // H4b: CustomRateLimit 创建的限流器登记表，供 StopRateLimiters/InitRateLimiters 统一停止，避免 cleanup goroutine 泄漏
 	limitersMu     sync.Mutex
 )
-
-func init() {
-	redisLimiters = make(map[string]*RedisRateLimiter)
-}
 
 // drainCustomLimiters 取出已登记的自定义限流器并清空登记表。调用方须持有 limitersMu。
 func drainCustomLimiters() []*RateLimiter {

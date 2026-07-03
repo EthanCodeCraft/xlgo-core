@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"io"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -84,7 +85,7 @@ func LoggerWithConfig(cfg LoggerConfig) gin.HandlerFunc {
 			zap.Int("status", c.Writer.Status()),
 			zap.String("method", c.Request.Method),
 			zap.String("path", path),
-			zap.String("query", c.Request.URL.RawQuery),
+			zap.String("query", filterSensitiveQuery(c.Request.URL.RawQuery)),
 			zap.String("ip", c.ClientIP()),
 			zap.Duration("latency", latency),
 			zap.String("user-agent", c.Request.UserAgent()),
@@ -216,6 +217,38 @@ var sensitiveFieldsRE = regexp.MustCompile(
 // 对非 JSON 输入原样返回。
 func filterSensitiveFields(body []byte) string {
 	return sensitiveFieldsRE.ReplaceAllString(string(body), `"$1":"[FILTERED]"`)
+}
+
+// sensitiveQueryKeys 需要在访问日志中脱敏的 query 参数名（小写匹配，P1 #14）。
+// 与 sensitiveFieldsRE 覆盖的字段保持一致。
+var sensitiveQueryKeys = map[string]struct{}{
+	"password": {}, "passwd": {}, "pwd": {}, "token": {},
+	"access_token": {}, "refresh_token": {}, "secret": {},
+	"api_key": {}, "apikey": {}, "credit_card": {}, "card_number": {},
+}
+
+// filterSensitiveQuery 脱敏 query 字符串中的敏感参数值（P1 #14）：
+// 如 ?access_token=xxx 会被记为 access_token=%5BFILTERED%5D，防止令牌等随访问日志落盘。
+// 无敏感键时原样返回（不重排）；解析失败时整体标记以免原文泄露。
+func filterSensitiveQuery(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "[redacted: unparsable query]"
+	}
+	changed := false
+	for k := range values {
+		if _, ok := sensitiveQueryKeys[strings.ToLower(k)]; ok {
+			values[k] = []string{"[FILTERED]"}
+			changed = true
+		}
+	}
+	if !changed {
+		return rawQuery
+	}
+	return values.Encode()
 }
 
 // LoggerForAPI API 专用日志中间件（更详细）

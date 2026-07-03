@@ -9,11 +9,16 @@ import (
 )
 
 // Response 统一响应结构
+//
+// M-38/M-39 修复（breaking）：Data/RequestID 去掉 omitempty，让 data 与 request_id
+// 字段在所有响应中恒存在（失败时 data=null、未装 RequestID 中间件时 request_id=""）。
+// 原实现用 omitempty 导致失败响应无 data 字段、空切片被 omit、未装中间件时无 request_id，
+// 破坏"统一响应结构"契约，下游严格按 schema 解析会出错。
 type Response struct {
 	Code      int    `json:"code"`
 	Msg       string `json:"msg"`
-	Data      any    `json:"data,omitempty"`
-	RequestID string `json:"request_id,omitempty"` // 请求追踪ID
+	Data      any    `json:"data"`
+	RequestID string `json:"request_id"` // 请求追踪ID
 }
 
 // PageData 分页数据结构

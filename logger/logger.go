@@ -28,9 +28,9 @@ var (
 
 	// Logger 全局通用日志实例（兼容别名）。Init 之前为 Nop，调用安全。
 	//
-	// 兼容性说明（H7）：此导出变量由 Init/Close 在 m.mu 下同步维护，但直接读它
-	// 在 re-Init/Close 期间非并发安全；框架内部读路径已改走 atomic（currentLogger）。
-	// 并发安全访问请用包级 Info/Debug/Warn/Error/... 函数，不要直接读此变量。
+	// Deprecated: 此导出变量由 Init/Close 在 m.mu 下同步维护，但直接读它在 re-Init/Close
+	// 期间非并发安全（L-E）。请改用包级函数 Info/Debug/Warn/Error/...（经 atomic 读取，
+	// 并发安全）。保留仅为向后兼容，未来大版本可能移除。
 	Logger = zap.NewNop()
 
 	// fileWriters 持有所有 lumberjack 实例引用，

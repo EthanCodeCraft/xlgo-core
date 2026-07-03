@@ -197,26 +197,26 @@ func TestC11ManagerCloseResetsState(t *testing.T) {
 func TestC11PackageCloseClosesReplicas(t *testing.T) {
 	// 保存并恢复 DefaultManager 状态，避免污染其他用例
 	defer func() {
-		DefaultManager.mu.Lock()
-		DefaultManager.master = nil
-		DefaultManager.replicas = nil
-		DefaultManager.resetReplicaHealth()
-		DefaultManager.healthy.Store(false)
-		DefaultManager.mu.Unlock()
+		DefaultManager.Load().mu.Lock()
+		DefaultManager.Load().master = nil
+		DefaultManager.Load().replicas = nil
+		DefaultManager.Load().resetReplicaHealth()
+		DefaultManager.Load().healthy.Store(false)
+		DefaultManager.Load().mu.Unlock()
 	}()
 
-	DefaultManager.mu.Lock()
-	DefaultManager.master = sentinelDB()
-	DefaultManager.replicas = []*gorm.DB{sentinelDB(), sentinelDB()}
-	DefaultManager.mu.Unlock()
+	DefaultManager.Load().mu.Lock()
+	DefaultManager.Load().master = sentinelDB()
+	DefaultManager.Load().replicas = []*gorm.DB{sentinelDB(), sentinelDB()}
+	DefaultManager.Load().mu.Unlock()
 
-	// 包级 Close → CloseAll → DefaultManager.Close()，应同时清空 master 与 replicas
+	// 包级 Close → CloseAll → DefaultManager.Load().Close()，应同时清空 master 与 replicas
 	_ = Close()
 
-	DefaultManager.mu.Lock()
-	master := DefaultManager.master
-	repl := DefaultManager.replicas
-	DefaultManager.mu.Unlock()
+	DefaultManager.Load().mu.Lock()
+	master := DefaultManager.Load().master
+	repl := DefaultManager.Load().replicas
+	DefaultManager.Load().mu.Unlock()
 
 	if master != nil {
 		t.Fatal("C11f: expected master nil after package Close")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -12,23 +13,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
-
-// redisClient 内部 Redis 客户端引用（由 RedisManager.Init/Close 同步维护）。
-//
-// 已废弃对外暴露：所有外部代码请使用 GetRedis() 或持有 *RedisManager 实例。
-// 测试如需注入 mock Redis，请用 SetDefaultRedisManager 替换 DefaultRedis。
-//
-// 仅包内 Init/Close 在持有 m.mu 时写入；外部直接读取存在竞态风险。
-var redisClient *redis.Client
-
-// SetTestRedisClient 供测试注入 miniredis 等 mock 客户端。
-// 返回旧客户端引用以便测试清理时恢复。生产代码严禁调用。
-// 注意：仅在测试环境单 goroutine 使用，不持有锁保护。
-func SetTestRedisClient(c *redis.Client) *redis.Client {
-	old := redisClient
-	redisClient = c
-	return old
-}
 
 // RedisManager Redis 连接管理器（#10）。照 database.Manager 模式：
 // 实例化 + DefaultRedis 全局默认 + 包级 facade 代理，支持多实例与测试注入。
@@ -39,16 +23,25 @@ type RedisManager struct {
 }
 
 // DefaultRedis 默认 Redis 管理器，包级 facade 代理到它。
-var DefaultRedis = NewRedisManager()
+//
+// C-1/H-4 修复：改用 atomic.Pointer 保护读写，消除原裸指针置换（SetDefaultRedisManager）
+// 与请求 goroutine 无锁读（GetRedis 等 facade）之间的数据竞争。与 config.defaultManager
+// 对齐。类型由 *RedisManager 变更为 atomic.Pointer[RedisManager]（breaking：下游若直接
+// 调用 DefaultRedis.Init 等方法需改用 InitRedis 等 facade，或 DefaultRedis.Load().Init）。
+var DefaultRedis atomic.Pointer[RedisManager]
+
+func init() {
+	DefaultRedis.Store(NewRedisManager())
+}
 
 // NewRedisManager 创建 Redis 管理器实例。
 func NewRedisManager() *RedisManager { return &RedisManager{} }
 
 // SetDefaultRedisManager 提升指定 RedisManager 为全局默认，后续包级 facade 走它。
-// 用于多实例场景或测试注入 mock。
+// 用于多实例场景或测试注入 mock。并发安全（atomic.Store）。
 func SetDefaultRedisManager(m *RedisManager) {
 	if m != nil {
-		DefaultRedis = m
+		DefaultRedis.Store(m)
 	}
 }
 
@@ -75,7 +68,6 @@ func (m *RedisManager) Init(cfg *config.Config) error {
 
 	m.cfg = cfg
 	m.client = client
-	redisClient = client // 内部同步
 	logger.Info("Redis 连接成功", zap.String("addr", cfg.Redis.Addr()))
 	return nil
 }
@@ -90,7 +82,6 @@ func (m *RedisManager) Close() error {
 	}
 	err := m.client.Close()
 	m.client = nil
-	redisClient = nil
 	return err
 }
 
@@ -99,6 +90,16 @@ func (m *RedisManager) Client() *redis.Client {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.client
+}
+
+// setClientForTest 仅测试用：在持锁下替换 manager 的 client，返回旧 client。
+// 供 SetTestRedisClient 注入 miniredis 等 mock，消除原包级 redisClient 双源真相。
+func (m *RedisManager) setClientForTest(c *redis.Client) *redis.Client {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old := m.client
+	m.client = c
+	return old
 }
 
 // HealthCheck Redis 健康检查。
@@ -116,24 +117,37 @@ func (m *RedisManager) HealthCheck(ctx context.Context) error {
 
 // InitRedis 初始化 Redis 连接
 func InitRedis(cfg *config.Config) error {
-	return DefaultRedis.Init(cfg)
+	return DefaultRedis.Load().Init(cfg)
 }
 
 // CloseRedis 关闭 Redis 连接
 func CloseRedis() error {
-	return DefaultRedis.Close()
+	return DefaultRedis.Load().Close()
 }
 
 // HealthCheckRedis Redis 健康检查
 func HealthCheckRedis(ctx context.Context) error {
-	return DefaultRedis.HealthCheck(ctx)
+	return DefaultRedis.Load().HealthCheck(ctx)
 }
 
-// GetRedis 获取 Redis 客户端。
-// 优先返回 DefaultRedis 实例化的客户端；若未初始化则回退到内部客户端（测试注入路径）。
+// GetRedis 获取 Redis 客户端（未初始化返回 nil）。
+//
+// H-4 修复：单源——仅从 DefaultRedis.Load().Client() 取，废弃原包级 redisClient
+// 回退路径（其在 manager 替换后会返回 stale client，且无锁读存在竞态）。
+// 测试注入的 mock client 经 SetTestRedisClient 直接设在当前 manager 上，闭环一致。
 func GetRedis() *redis.Client {
-	if c := DefaultRedis.Client(); c != nil {
-		return c
-	}
-	return redisClient
+	return DefaultRedis.Load().Client()
+}
+
+// SetTestRedisClient 供测试注入 miniredis 等 mock 客户端。
+// 返回旧客户端引用以便测试清理时恢复。生产代码严禁调用。
+//
+// H-4 修复：改为在当前默认 manager 上持锁替换 client（setClientForTest），
+// 不再写独立的包级 redisClient 变量，消除双源真相与无锁写竞态。
+//
+// 约束：操作 DefaultRedis.Load() 返回的当前默认 manager。测试应避免在调用本函数
+// 的同时并发 SetDefaultRedisManager 替换默认 manager，否则注入/恢复会作用到不同
+// manager 上。典型用法为 init 阶段注入、t.Cleanup 恢复，串行执行。
+func SetTestRedisClient(c *redis.Client) *redis.Client {
+	return DefaultRedis.Load().setClientForTest(c)
 }

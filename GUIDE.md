@@ -288,7 +288,7 @@ xlgo 基于 GORM，驱动由配置 `database.driver` 决定。v1.0.2 起 GORM �
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/database"
 
-// 初始化数据库（驱动由配置决定，等价于 database.DefaultManager.InitDB(cfg)）
+// 初始化数据库（驱动由配置决定，等价于 database.DefaultManager.Load().InitDB(cfg)）
 database.InitDB(cfg)
 
 // 关闭全部连接（含从库）
@@ -431,7 +431,7 @@ result, err := userRepo.FindPageOrdered(ctx, 1, 20, "created_at DESC")
 // 条件查询
 user, err := userRepo.FindOne(ctx, "email = ?", "test@example.com")
 users, err := userRepo.FindWhere(ctx, "status = ?", 1)
-users, err := userRepo.FindWhereOrdered(ctx, "status = ?", 1, []any{}, "created_at DESC")
+users, err := userRepo.FindWhereOrdered(ctx, "created_at DESC", "status = ?", 1)
 
 // 排序查询
 users, err := userRepo.FindOrdered(ctx, "created_at DESC", 10)
@@ -596,11 +596,14 @@ err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func()
 // 续期锁（手动续期）
 cache.ExtendLock(ctx, token, 30*time.Second)
 
-// 检查锁是否被占用
+// 检查锁是否被占用（Redis 不可用时返回 ErrRedisNotReady，可经
+// errors.Is(err, cache.ErrRedisNotReady) 与"锁未占用"区分）
 locked, err := cache.IsLocked(ctx, key)
 
-// 强制释放锁（管理场景）
-cache.ForceUnlock(ctx, key)
+// 强制释放锁（管理场景；Redis 不可用时返回 ErrRedisNotReady）
+if err := cache.ForceUnlock(ctx, key); err != nil {
+    // 处理 Redis 不可用
+}
 ```
 
 **安全特性：**
@@ -698,7 +701,7 @@ if !ok {
 | `max=20`   | 最大长度                              |
 | `email`    | 邮箱格式                              |
 | `phone`    | 手机号格式                            |
-| `password` | 密码强度（至少 8 位，包含字母和数字） |
+| `password` | 密码强度（8-72 字节，需含大写+小写+数字） |
 | `url`      | URL 格式                              |
 | `ip`       | IP 地址格式                           |
 
@@ -1448,7 +1451,7 @@ if utils.UUIDValid(uuid) { }
 
 | 改进 | 说明 |
 |------|------|
-| 性能优化 | `RandString/RandDigit` 使用 sync.Pool 复用随机源（非安全场景）；安全场景用 `RandStringSecure/RandDigitSecure`（crypto/rand） |
+| 性能优化 | 非安全随机用 `RandInt/RandInt64`（math/rand，sync.Pool 复用源）；安全场景用 `RandStringSecure/RandDigitSecure/RandIntSecure`（crypto/rand + big.Int 拒绝采样无偏） |
 | 类型安全 | 移除使用反射的函数，保持类型安全 |
 | 式调用 | `HTTPClient` 和 `URLBuilder` 支持链式调用 |
 | 零依赖 | 仅依赖 `google/uuid`，其余使用标准库 |
@@ -1814,5 +1817,5 @@ func Login(c *gin.Context) {
 
 ---
 
-_文档版本: v1.0.2_
-_最后更新: 2026-06-20_
+_文档版本: v1.1.1_
+_最后更新: 2026-07-03_

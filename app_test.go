@@ -3,6 +3,7 @@ package xlgo_test
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	xlgo "github.com/EthanCodeCraft/xlgo-core"
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -275,5 +277,85 @@ func TestAppMetricsInstrumentsRegistryRoutes_H8c(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, `route="/h8c-biz"`) {
 		t.Fatalf("metrics output should contain route=\"/h8c-biz\" series, got:\n%s", body)
+	}
+}
+
+// freePort 返回一个当前空闲的 TCP 端口。
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("freePort: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// TestAppOnReadyFailureReleasesPort H-1 回归：OnReady 失败时 Run 应返回错误，
+// 且 HTTP 端口被释放（监听 goroutine 不泄漏）。
+// 修复前 OnReady 失败直接 return，监听 goroutine 仍阻塞在 ListenAndServe，
+// 端口不释放、goroutine 泄漏。
+func TestAppOnReadyFailureReleasesPort(t *testing.T) {
+	port := freePort(t)
+	app := xlgo.New(
+		xlgo.WithConfig(testConfig(port)),
+		xlgo.WithHook(xlgo.Hook{
+			Name:    "fail-on-ready",
+			OnReady: func(*xlgo.App) error { return errors.New("boom") },
+		}),
+	)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- app.Run() }()
+
+	select {
+	case err := <-errCh:
+		if err == nil || !strings.Contains(err.Error(), "boom") {
+			t.Fatalf("expected OnReady failure error, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after OnReady failure (server goroutine leaked?)")
+	}
+
+	// 端口应已释放：能重新 bind。容忍 TIME_WAIT 短暂残留。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		l, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
+		if err == nil {
+			l.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("port %d not released 3s after Run returned: %v (server goroutine leaked)", port, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestAppInitFailureCancelsGoGoroutine H-2 回归：App.Go 启动的 goroutine 在 Init 失败后
+// 应因 rootCtx cancel 而退出，不泄漏。
+// 修复前 Init 失败不 cancel rootCtx，goroutine 永久阻塞在 ctx.Done()。
+func TestAppInitFailureCancelsGoGoroutine(t *testing.T) {
+	app := xlgo.New(
+		xlgo.WithConfig(testConfig(18087)),
+		// WithMigrator 无 WithMySQL → Init 确定性失败（"未启用 MySQL"）
+		xlgo.WithMigrator(func(_ *gorm.DB) error { return nil }),
+	)
+
+	ctxDone := make(chan struct{})
+	app.Go(func(ctx context.Context) {
+		<-ctx.Done()
+		close(ctxDone)
+	})
+
+	if err := app.Init(); err == nil {
+		t.Fatal("expected Init error")
+	}
+
+	select {
+	case <-ctxDone:
+		// 好：goroutine 在 Init 失败后退出
+	case <-time.After(5 * time.Second):
+		t.Fatal("App.Go goroutine did not exit after Init failure (rootCtx not cancelled, leaked)")
 	}
 }

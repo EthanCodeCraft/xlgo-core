@@ -4,22 +4,30 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 // HTTPClient HTTP 客户端封装
 type HTTPClient struct {
+	// mu 保护 client/transport/cfg/timeout/skipTLS 的并发读写。SetSkipTLS/SetTimeout
+	// 在写锁下重建 client/transport；do/DoWithResponse/Close 在读锁下快照后无锁调用
+	// http.Client.Do（Do 自身并发安全），不持有锁发请求以避免序列化。
+	mu        sync.RWMutex
 	client    *http.Client
 	transport *http.Transport
+	cfg       HTTPClientConfig // 保留配置以便 SetSkipTLS 重建 transport
 	timeout   time.Duration
 	headers   map[string]string
 	cookies   map[string]string
@@ -46,6 +54,43 @@ type HTTPClientConfig struct {
 	// MaxResponseBodySize 响应体读取上限（字节）。0 = 默认 32MB，-1 = 不限制。
 	// 防止异常服务端返回超大响应打爆内存（C5/N5）。
 	MaxResponseBodySize int64
+	// BlockPrivateNetworks 启用 SSRF 防护（P0，默认 false 保持兼容）。启用后，连接建立时
+	// 校验解析出的目标 IP，拒绝回环/私有(RFC1918+ULA)/链路本地/元数据(169.254.169.254)/
+	// 未指定/多播等内网地址。校验在 DialContext.Control 中进行，对重定向的每一跳同样生效。
+	// 当 URL 可能来自用户输入（webhook、头像抓取等）时应开启。
+	BlockPrivateNetworks bool
+}
+
+// ErrSSRFBlocked 目标 IP 落在被拦截网段（SSRF 防护，P0）。
+var ErrSSRFBlocked = errors.New("ssrf guard: 目标 IP 属被拦截网段（回环/私有/链路本地/元数据）")
+
+// isBlockedIP 判断 IP 是否应被 SSRF 防护拦截。
+// 覆盖：回环、私有(RFC1918 + ULA fc00::/7)、链路本地(含 169.254.169.254 云元数据 / fe80::)、
+// 未指定(0.0.0.0/::)、多播。
+func isBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast()
+}
+
+// ssrfControl 是 net.Dialer.Control 回调：在 DNS 解析后、真正 dial 前校验目标 IP，
+// 命中内网段即拒绝。放在 Control 层可覆盖 DNS 重绑定与重定向的每一跳（P0）。
+func ssrfControl(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("%w: 无法解析地址 %q", ErrSSRFBlocked, address)
+	}
+	if isBlockedIP(ip) {
+		return fmt.Errorf("%w: %s", ErrSSRFBlocked, ip)
+	}
+	return nil
 }
 
 // DefaultHTTPClientConfig 默认配置
@@ -65,8 +110,31 @@ func NewHTTPClient() *HTTPClient {
 	return NewHTTPClientWithConfig(cfg)
 }
 
+// NewSSRFSafeHTTPClient 创建启用 SSRF 防护的 HTTP 客户端（P0）：拒绝连接内网目标 IP。
+// 适用于目标 URL 可能来自用户输入的场景（webhook 回调、远程图片抓取等）。
+func NewSSRFSafeHTTPClient() *HTTPClient {
+	cfg := DefaultHTTPClientConfig
+	cfg.BlockPrivateNetworks = true
+	return NewHTTPClientWithConfig(cfg)
+}
+
 // NewHTTPClientWithConfig 使用自定义配置创建 HTTP 客户端
 func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
+	transport, client := buildHTTPClientPair(cfg)
+	return &HTTPClient{
+		client:          client,
+		transport:       transport,
+		cfg:             cfg,
+		timeout:         cfg.Timeout,
+		headers:         make(map[string]string),
+		cookies:         make(map[string]string),
+		skipTLS:         cfg.SkipTLSVerify,
+		maxRespBodySize: cfg.MaxResponseBodySize,
+	}
+}
+
+// buildHTTPClientPair 按 cfg 构造 (transport, client) 对。SetSkipTLS 重建时复用。
+func buildHTTPClientPair(cfg HTTPClientConfig) (*http.Transport, *http.Client) {
 	// Transport 在初始化时创建，连接池可复用
 	transport := &http.Transport{
 		// #nosec G402 -- InsecureSkipVerify 仅在调用方显式设 cfg.SkipTLSVerify=true 时启用，
@@ -80,58 +148,130 @@ func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 		MaxIdleConnsPerHost: cfg.MaxIdleConnsPerHost,
 		DisableCompression:  false,
 	}
-
+	// SSRF 防护（P0）：启用后为拨号器装 Control 回调，连接建立时拦截内网目标 IP。
+	if cfg.BlockPrivateNetworks {
+		dialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Control:   ssrfControl,
+		}
+		transport.DialContext = dialer.DialContext
+	}
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   cfg.Timeout,
 	}
-
-	return &HTTPClient{
-		client:          client,
-		transport:       transport,
-		timeout:         cfg.Timeout,
-		headers:         make(map[string]string),
-		cookies:         make(map[string]string),
-		skipTLS:         cfg.SkipTLSVerify,
-		maxRespBodySize: cfg.MaxResponseBodySize,
-	}
+	return transport, client
 }
 
-// SetTimeout 设置超时时间
+// currentClient 在读锁下快照当前 *http.Client（H-12：与 SetSkipTLS/SetTimeout 重建无竞态）。
+func (c *HTTPClient) currentClient() *http.Client {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
+}
+
+// currentTransport 在读锁下快照当前 *http.Transport。
+func (c *HTTPClient) currentTransport() *http.Transport {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.transport
+}
+
+// SetTimeout 设置超时时间。
+// H-12 修复：在写锁下重建 *http.Client（复用 transport 保留连接池），避免与并发 Do 对
+// client.Timeout 字段的数据竞争。
 func (c *HTTPClient) SetTimeout(timeout time.Duration) *HTTPClient {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.timeout = timeout
-	c.client.Timeout = timeout
+	c.cfg.Timeout = timeout
+	_, client := buildHTTPClientPair(c.cfg)
+	// 复用旧 transport 保留连接池：新 client 用旧 transport + 新 timeout。
+	client.Transport = c.transport
+	c.client = client
 	return c
 }
 
-// SetHeader 设置请求头
+// SetHeader 设置请求头（P0：写锁保护，与并发 do/DoWithResponse 读 map 无竞态）。
 func (c *HTTPClient) SetHeader(key, value string) *HTTPClient {
+	c.mu.Lock()
 	c.headers[key] = value
+	c.mu.Unlock()
 	return c
 }
 
-// SetHeaders 批量设置请求头
+// SetHeaders 批量设置请求头（P0：写锁保护）。
 func (c *HTTPClient) SetHeaders(headers map[string]string) *HTTPClient {
+	c.mu.Lock()
 	for k, v := range headers {
 		c.headers[k] = v
 	}
+	c.mu.Unlock()
 	return c
 }
 
-// SetCookie 设置 Cookie
+// SetCookie 设置 Cookie（P0：写锁保护）。
 func (c *HTTPClient) SetCookie(key, value string) *HTTPClient {
+	c.mu.Lock()
 	c.cookies[key] = value
+	c.mu.Unlock()
 	return c
+}
+
+// snapshotHeadersCookies 在读锁下拷贝 headers/cookies，供 do/DoWithResponse 在锁外应用到请求，
+// 消除与 SetHeader/SetHeaders/SetCookie 的 map 读写竞态（P0）。
+func (c *HTTPClient) snapshotHeadersCookies() (headers, cookies map[string]string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	headers = make(map[string]string, len(c.headers))
+	for k, v := range c.headers {
+		headers[k] = v
+	}
+	cookies = make(map[string]string, len(c.cookies))
+	for k, v := range c.cookies {
+		cookies[k] = v
+	}
+	return headers, cookies
 }
 
 // SetSkipTLS 设置是否跳过 TLS 验证。
-// 注意: 修改 TLS 配置需要重新创建 Transport。跳过 TLS 校验会暴露于 MITM 攻击，
-// 仅在受控环境（如自签证书的内网服务）且明确风险时启用，生产环境应保持 false。
+// 跳过 TLS 校验会暴露于 MITM 攻击，仅在受控环境（如自签证书的内网服务）且明确风险时启用，
+// 生产环境应保持 false。
+//
+// H-12 修复：原实现直接覆盖 c.transport.TLSClientConfig 指针，与并发 Do 读取该字段
+// 存在数据竞争（-race 必采），且注释自承"需重建 Transport"却未重建。改为在写锁下用
+// 新配置重建 transport+client 并原子替换，旧 transport 释放空闲连接（保留旧 TLS 配置的
+// idle 连接不再被复用）。支持运行期并发调用与并发请求无竞态。
 func (c *HTTPClient) SetSkipTLS(skip bool) *HTTPClient {
+	c.mu.Lock()
 	c.skipTLS = skip
-	// #nosec G402 -- skip 由调用方显式传入，opt-in 跳过 TLS 校验（默认 false）。
-	c.transport.TLSClientConfig = &tls.Config{
-		InsecureSkipVerify: skip,
+	c.cfg.SkipTLSVerify = skip
+	transport, client := buildHTTPClientPair(c.cfg)
+	oldTransport := c.transport
+	c.transport = transport
+	c.client = client
+	c.mu.Unlock()
+	// 锁外释放旧 transport 的空闲连接（CloseIdleConnections 仅关 idle 连接，不影响在途请求）。
+	if oldTransport != nil {
+		oldTransport.CloseIdleConnections()
+	}
+	return c
+}
+
+// SetBlockPrivateNetworks 运行期开关 SSRF 防护（P0）。开启后连接内网 IP（回环/私有/链路本地/
+// 元数据等）会被拒绝并返回 ErrSSRFBlocked。写锁下重建 transport+client 并原子替换，
+// 与并发请求无竞态；旧 transport 的空闲连接在锁外释放。
+func (c *HTTPClient) SetBlockPrivateNetworks(block bool) *HTTPClient {
+	c.mu.Lock()
+	c.cfg.BlockPrivateNetworks = block
+	transport, client := buildHTTPClientPair(c.cfg)
+	oldTransport := c.transport
+	c.transport = transport
+	c.client = client
+	c.mu.Unlock()
+	if oldTransport != nil {
+		oldTransport.CloseIdleConnections()
 	}
 	return c
 }
@@ -299,18 +439,17 @@ func (c *HTTPClient) Request(method, urlStr string, body []byte) ([]byte, error)
 
 // do 执行请求（使用共享的 client 和 transport）
 func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
-	// 设置请求头
-	for k, v := range c.headers {
+	// P0：读锁快照 headers/cookies 后在锁外应用，与并发 Set* 无竞态。
+	headers, cookies := c.snapshotHeadersCookies()
+	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-
-	// 设置 Cookie
-	for k, v := range c.cookies {
+	for k, v := range cookies {
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	// 发送请求（使用初始化时创建的 client）
-	resp, err := c.client.Do(req)
+	// 发送请求（H-12：快照 client，与 SetSkipTLS/SetTimeout 重建无竞态）
+	resp, err := c.currentClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -342,22 +481,27 @@ func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
 	return data, nil
 }
 
-// DoWithResponse 执行请求并返回完整响应
+// DoWithResponse 执行请求并返回完整响应。
+//
+// 注意：调用方负责关闭返回的 resp.Body；且此方法不套用 maxRespBodySize 读封顶（由调用方掌控）。
 func (c *HTTPClient) DoWithResponse(req *http.Request) (*http.Response, error) {
-	for k, v := range c.headers {
+	// P0：读锁快照 headers/cookies 后在锁外应用，与并发 Set* 无竞态。
+	headers, cookies := c.snapshotHeadersCookies()
+	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-
-	for k, v := range c.cookies {
+	for k, v := range cookies {
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	return c.client.Do(req)
+	return c.currentClient().Do(req)
 }
 
 // Close 关闭客户端（释放连接池资源）
 func (c *HTTPClient) Close() {
-	c.transport.CloseIdleConnections()
+	if t := c.currentTransport(); t != nil {
+		t.CloseIdleConnections()
+	}
 }
 
 // JSONMarshal 内部 JSON 序列化函数

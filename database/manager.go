@@ -84,6 +84,20 @@ func NewManager(cfg *config.Config) *Manager {
 	return &Manager{cfg: cfg, picker: &RandomPicker{}}
 }
 
+// getCfg 在锁内读取 m.cfg（P1 #11：消除与 InitDB 写 m.cfg 的数据竞争）。
+func (m *Manager) getCfg() *config.Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg
+}
+
+// setCfg 在锁内写入 m.cfg（P1 #11）。
+func (m *Manager) setCfg(cfg *config.Config) {
+	m.mu.Lock()
+	m.cfg = cfg
+	m.mu.Unlock()
+}
+
 // SetPicker 设置从库选择策略
 func (m *Manager) SetPicker(p ReplicaPicker) {
 	if p == nil {
@@ -191,13 +205,14 @@ func (m *Manager) resetReplicaHealth() {
 func (m *Manager) StartProbing(ctx context.Context) {
 	m.initReplicaHealth()
 
+	cfg := m.getCfg() // P1 #11：锁内快照，避免与 InitDB 写 m.cfg 竞态
 	interval := 30 * time.Second
-	if m.cfg != nil && m.cfg.Database.HealthCheckInterval > 0 {
-		interval = m.cfg.Database.HealthCheckInterval
+	if cfg != nil && cfg.Database.HealthCheckInterval > 0 {
+		interval = cfg.Database.HealthCheckInterval
 	}
 	threshold := 3
-	if m.cfg != nil && m.cfg.Database.HealthCheckFailureThreshold > 0 {
-		threshold = m.cfg.Database.HealthCheckFailureThreshold
+	if cfg != nil && cfg.Database.HealthCheckFailureThreshold > 0 {
+		threshold = cfg.Database.HealthCheckFailureThreshold
 	}
 
 	ticker := time.NewTicker(interval)
@@ -290,18 +305,20 @@ func (m *Manager) FromContext(ctx context.Context) *gorm.DB {
 
 // Open 打开主库连接
 func (m *Manager) Open(ctx context.Context) error {
-	if m.cfg == nil {
+	cfg := m.getCfg() // P1 #11：锁内读取，避免与 InitDB 写竞态
+	if cfg == nil {
 		return errors.New("数据库配置未设置")
 	}
-	return m.InitDB(m.cfg)
+	return m.InitDB(cfg)
 }
 
 // OpenWithReplicas 打开主库与从库连接
 func (m *Manager) OpenWithReplicas(ctx context.Context, replicaDSNs []string) error {
-	if m.cfg == nil {
+	cfg := m.getCfg() // P1 #11：锁内读取
+	if cfg == nil {
 		return errors.New("数据库配置未设置")
 	}
-	return m.InitDBWithReplicas(m.cfg, replicaDSNs)
+	return m.InitDBWithReplicas(cfg, replicaDSNs)
 }
 
 // closeDB 关闭 gorm.DB 底层连接池。nil 或未初始化（无 ConnPool）时返回 nil，不 panic。
@@ -356,12 +373,40 @@ func (m *Manager) HealthCheck(ctx context.Context) error {
 	return sqlDB.PingContext(ctx)
 }
 
-// DefaultManager 默认数据库管理器
-var DefaultManager = &Manager{picker: &RandomPicker{}}
+// DefaultManager 默认数据库管理器，包级 facade 代理到它。
+//
+// 主线A 修复：改用 atomic.Pointer 保护读写，消除原裸指针（外部直接
+// `database.DefaultManager = ...` 赋值与请求 goroutine 经 facade 读取）之间的数据竞争。
+// 与 config.defaultManager / database.DefaultRedis / storage.DefaultStorage /
+// cache.defaultCachePtr / jwt.defaultManager 对齐——框架内包级可变全局一律 atomic.Pointer。
+//
+// 类型由 *Manager 变更为 atomic.Pointer[Manager]（breaking）：下游若直接调用
+// DefaultManager.Init/Master 等方法需改用 InitDB/GetDB 等 facade，或
+// DefaultManager.Load().Init(...)，或经 GetDefaultManager() 取实例后再调方法。
+var DefaultManager atomic.Pointer[Manager]
+
+func init() {
+	DefaultManager.Store(NewManager(nil))
+}
+
+// SetDefaultManager 提升指定 Manager 为全局默认（主线A 修复：atomic.Store，并发安全）。
+// 用于多实例场景或测试注入。nil 被忽略以防 facade Load 到 nil panic。
+func SetDefaultManager(m *Manager) {
+	if m != nil {
+		DefaultManager.Store(m)
+	}
+}
+
+// GetDefaultManager 返回全局默认 Manager（atomic 读取，并发安全）。
+// 替代直接读 DefaultManager 包级变量（类型已改为 atomic.Pointer，直接读得到的是 atomic
+// 值而非 *Manager）。需直接持有 Manager 调用其方法时用本函数或 DefaultManager.Load()。
+func GetDefaultManager() *Manager {
+	return DefaultManager.Load()
+}
 
 // InitDB 初始化数据库连接（带重试机制），驱动由配置决定
 func (m *Manager) InitDB(cfg *config.Config) error {
-	m.cfg = cfg
+	m.setCfg(cfg) // P1 #11：锁内写入，避免与 StartProbing/Open 读竞态
 
 	// GORM 日志配置
 	var gormLogLevel gormlogger.LogLevel
@@ -451,10 +496,12 @@ func isTransientDBError(err error) bool {
 		"invalid DSN",           // DSN 语法错误
 		"unknown driver",        // 驱动未注册
 		"unsupported driver",    // 驱动不支持
-		// PostgreSQL（D5 修复）
+		// PostgreSQL（D5 修复；P1 #12：移除过宽的独立 "database" 子串——它会把
+		// "the database system is starting up" 等瞬态错误误判为非瞬态而放弃重试。
+		// PG 目标库不存在的消息形如 database "x" does not exist，用 "does not exist" 精确匹配）。
 		"password authentication failed", // pg 密码错误
-		"database", "does not exist",     // pg 目标库不存在（消息含"database ... does not exist"）
-		"no pg_hba.conf entry", // pg_hba.conf 拒绝
+		"does not exist",                 // pg 目标库/角色不存在
+		"no pg_hba.conf entry",           // pg_hba.conf 拒绝
 	}
 	for _, sub := range nonTransient {
 		if strings.Contains(msg, sub) {
@@ -462,6 +509,20 @@ func isTransientDBError(err error) bool {
 		}
 	}
 	return true
+}
+
+// replicaMaxOpenConns 计算从库连接池 MaxOpenConns（H-A 修复）。
+// masterMax>0 时取 max(1, masterMax/2)（从库适当减少，但绝不截断为 0）；
+// masterMax<=0（未配置/无限）时返回 0，与主库"无限"语义一致。
+func replicaMaxOpenConns(masterMax int) int {
+	if masterMax <= 0 {
+		return 0
+	}
+	half := masterMax / 2
+	if half < 1 {
+		half = 1
+	}
+	return half
 }
 
 // InitDBWithReplicas 初始化数据库主从连接，驱动由配置决定
@@ -512,7 +573,12 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 			}
 
 			sqlDB.SetMaxIdleConns(cfg.Database.MaxIdleConns)
-			sqlDB.SetMaxOpenConns(cfg.Database.MaxOpenConns / 2) // 从库连接数可适当减少
+			// H-A 修复：从库 MaxOpenConns 适当减少，但须避免截断为 0。
+			// database/sql 中 SetMaxOpenConns(0) 表示"无限制"——原实现 MaxOpenConns/2 在
+			// 配置为 1 时得 0，反而让从库连接池无上限（与"减少"意图相反、高并发下打爆 DB）；
+			// 配置为 0（未配置/无限）时 0/2=0 恰好"无限"，与主库一致，保持语义。
+			// 现规则：MaxOpenConns>0 时取 max(1, /2)；<=0 时从库亦无限（0），与主库对齐。
+			sqlDB.SetMaxOpenConns(replicaMaxOpenConns(cfg.Database.MaxOpenConns))
 			sqlDB.SetConnMaxLifetime(time.Hour)
 
 			if err := sqlDB.Ping(); err != nil {
@@ -535,37 +601,37 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 
 // InitDB 初始化数据库连接（带重试机制），驱动由配置决定
 func InitDB(cfg *config.Config) error {
-	return DefaultManager.InitDB(cfg)
+	return DefaultManager.Load().InitDB(cfg)
 }
 
 // InitDBWithReplicas 初始化数据库主从连接，驱动由配置决定
 func InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) error {
-	return DefaultManager.InitDBWithReplicas(cfg, replicaDSNs)
+	return DefaultManager.Load().InitDBWithReplicas(cfg, replicaDSNs)
 }
 
 // GetReadDB 获取读库实例（按策略选择从库）
 func GetReadDB() *gorm.DB {
-	return DefaultManager.Replica()
+	return DefaultManager.Load().Replica()
 }
 
 // GetWriteDB 获取写库实例（主库）
 func GetWriteDB() *gorm.DB {
-	return DefaultManager.Master()
+	return DefaultManager.Load().Master()
 }
 
 // GetDB 获取数据库实例（默认主库，兼容旧代码）
 func GetDB() *gorm.DB {
-	return DefaultManager.Master()
+	return DefaultManager.Load().Master()
 }
 
 // GetReplicas 获取所有从库实例
 func GetReplicas() []*gorm.DB {
-	return DefaultManager.Replicas()
+	return DefaultManager.Load().Replicas()
 }
 
 // SetReplicaPicker 设置默认管理器的从库选择策略
 func SetReplicaPicker(p ReplicaPicker) {
-	DefaultManager.SetPicker(p)
+	DefaultManager.Load().SetPicker(p)
 }
 
 // UseMaster 强制使用主库（用于事务或需要实时数据的场景）
@@ -580,7 +646,7 @@ func UseReplica(ctx context.Context) context.Context {
 
 // GetDBFromContext 根据上下文选择数据库
 func GetDBFromContext(ctx context.Context) *gorm.DB {
-	return DefaultManager.FromContext(ctx)
+	return DefaultManager.Load().FromContext(ctx)
 }
 
 // WithTx 将外层事务注入 ctx，使上层（如 repository.BaseRepo）在调用时能 join 到该事务
@@ -624,12 +690,12 @@ func Close() error {
 
 // CloseAll 关闭所有数据库连接（包括从库）
 func CloseAll() error {
-	return DefaultManager.Close()
+	return DefaultManager.Load().Close()
 }
 
 // Transaction 事务操作（自动使用主库）
 func Transaction(fn func(tx *gorm.DB) error) error {
-	db := DefaultManager.Master()
+	db := DefaultManager.Load().Master()
 	if db == nil {
 		return errors.New("数据库未初始化")
 	}
@@ -638,7 +704,7 @@ func Transaction(fn func(tx *gorm.DB) error) error {
 
 // TransactionWithContext 带上下文的事务操作
 func TransactionWithContext(ctx context.Context, fn func(tx *gorm.DB) error) error {
-	db := DefaultManager.Master()
+	db := DefaultManager.Load().Master()
 	if db == nil {
 		return errors.New("数据库未初始化")
 	}
@@ -658,7 +724,7 @@ func ReadQuery(ctx context.Context, model any, query string, args ...any) error 
 // 注意：命名沿用历史，实际用 .Find() 扫描结果集（读取语义），并非写操作——
 // 强制主库是为了读到刚写入的最新数据（read-your-writes）。命名误导见 M11。
 func WriteQuery(ctx context.Context, model any, query string, args ...any) error {
-	db := DefaultManager.Master()
+	db := DefaultManager.Load().Master()
 	if db == nil {
 		return errors.New("数据库未初始化")
 	}
@@ -681,7 +747,7 @@ func HealthCheck() map[string]bool {
 	ctx := context.Background()
 
 	// 检查主库
-	if master := DefaultManager.Master(); master != nil {
+	if master := DefaultManager.Load().Master(); master != nil {
 		sqlDB, err := master.DB()
 		if err == nil && pingWithTimeout(sqlDB, ctx) == nil {
 			result["master"] = true
@@ -693,7 +759,7 @@ func HealthCheck() map[string]bool {
 	}
 
 	// 检查从库
-	for i, replica := range DefaultManager.Replicas() {
+	for i, replica := range DefaultManager.Load().Replicas() {
 		if replica != nil {
 			sqlDB, err := replica.DB()
 			if err == nil && pingWithTimeout(sqlDB, ctx) == nil {
@@ -713,11 +779,11 @@ func HealthCheck() map[string]bool {
 // 与 HealthCheck()（实时 ping）不同，这是后台探活维护的缓存标记，
 // 供 readiness 探针快速判断是否接流量，避免每次探针都同步 ping。
 func IsDBHealthy() bool {
-	return DefaultManager.IsHealthy()
+	return DefaultManager.Load().IsHealthy()
 }
 
 // StartDBProbing 启动主库/从库探活后台循环（#21）。
 // 阻塞，应通过 App.Go 在独立 goroutine 运行；ctx 取消时退出。
 func StartDBProbing(ctx context.Context) {
-	DefaultManager.StartProbing(ctx)
+	DefaultManager.Load().StartProbing(ctx)
 }

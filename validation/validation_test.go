@@ -80,8 +80,8 @@ func TestDefaultPasswordConfig(t *testing.T) {
 	if cfg.MinLength != 8 {
 		t.Errorf("MinLength = %d, want 8", cfg.MinLength)
 	}
-	if cfg.MaxLength != 128 {
-		t.Errorf("MaxLength = %d, want 128", cfg.MaxLength)
+	if cfg.MaxLength != 72 {
+		t.Errorf("MaxLength = %d, want 72 (P1 #17: bcrypt 72-byte truncation boundary)", cfg.MaxLength)
 	}
 	if !cfg.RequireUpper || !cfg.RequireLower || !cfg.RequireDigit {
 		t.Error("Default config should require upper, lower, digit")
@@ -345,6 +345,12 @@ func TestValidatePhone(t *testing.T) {
 	errors3 := validation.ValidateStruct(invalidPrefix)
 	if errors3 == nil {
 		t.Error("Phone not starting with 1 should fail")
+	}
+
+	// P1 #17：长度合规、以 1 开头但含非数字字符必须拒绝（原实现会误通过）。
+	invalidNonDigit := TestPhone{Phone: "1abcdefghij"}
+	if errs := validation.ValidateStruct(invalidNonDigit); errs == nil {
+		t.Error("Phone with non-digit chars should fail (P1 #17)")
 	}
 }
 

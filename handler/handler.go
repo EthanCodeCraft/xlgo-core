@@ -36,6 +36,11 @@ func BindQuery(c *gin.Context, req any) error {
 	return c.ShouldBindQuery(req)
 }
 
+// MaxPage GetPage 允许的最大页码（M-D 修复：防深分页 DoS）。
+// 超大 page 产生超大 OFFSET，大表上为性能灾难/DoS 面。钳制到该上限；
+// 需更深度遍历的业务应改用游标/keyset 分页（框架不内置，避免功能扩张）。
+const MaxPage = 10000
+
 // GetPage 获取分页参数
 func GetPage(c *gin.Context) (int, int) {
 	page := c.DefaultQuery("page", "1")
@@ -46,6 +51,10 @@ func GetPage(c *gin.Context) (int, int) {
 
 	if p < 1 {
 		p = 1
+	}
+	// M-D 修复：钳制 page 上限，防 ?page=999999999 产生超大 OFFSET 拖垮 DB。
+	if p > MaxPage {
+		p = MaxPage
 	}
 	if ps < 1 {
 		ps = 20

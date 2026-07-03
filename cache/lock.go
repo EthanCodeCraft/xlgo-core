@@ -283,30 +283,48 @@ func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duratio
 	return err
 }
 
-// IsLocked 检查锁是否被占用（不获取锁）
+// IsLocked 检查锁是否被占用（不获取锁）。
+//
+// M-E 修复（失败语义统一）：Redis 未初始化时返回 (false, ErrRedisNotReady) 而非 (false, nil)——
+// 后者与"锁确实未被占用"不可区分，调用方可能误以为可获取锁而进入临界区（正确性 bug）。
+// 调用方应 errors.Is(err, ErrRedisNotReady) 区分"Redis 不可用"与"锁未占用"。
+// L-G 修复：用 .Result() 显式返回 Redis 错误（原 .Val() 吞错致故障被当"未占用"）。
+//
+// 契约说明：锁操作有正确性影响（无锁进入临界区 = bug），故 Redis 不可用时显式返错；
+// 与 cache.Get/Set 等数据操作（性能层、best-effort 静默 no-op）区分。
 func IsLocked(ctx context.Context, key string) (bool, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return false, nil
+		return false, ErrRedisNotReady
 	}
-	return rdb.Exists(ctx, key).Val() > 0, nil
+	n, err := rdb.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
-// GetLockTTL 获取锁的剩余过期时间
+// GetLockTTL 获取锁的剩余过期时间。
+//
+// M-E 修复：Redis 未初始化时返回 (0, ErrRedisNotReady) 而非 (0, nil)，调用方可区分
+// "Redis 不可用"与"锁不存在/已过期"（后者 TTL=-1/-2）。
 func GetLockTTL(ctx context.Context, key string) (time.Duration, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return 0, nil
+		return 0, ErrRedisNotReady
 	}
 	return rdb.TTL(ctx, key).Result()
 }
 
 // ForceUnlock 强制释放锁（危险操作，仅用于管理场景）
 // 注意: 此函数不检查 Token，强制删除锁
+//
+// M-E 修复：Redis 未初始化时返回 ErrRedisNotReady 而非 nil——原 nil 让调用方误以为
+// 已解锁成功、实则从未操作。管理脚本应据此重试或告警，而非假设成功。
 func ForceUnlock(ctx context.Context, key string) error {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return nil
+		return ErrRedisNotReady
 	}
 	return rdb.Del(ctx, key).Err()
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +21,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Config 链路追踪配置
@@ -60,19 +60,16 @@ var DefaultConfig = Config{
 }
 
 // tracerProviderPtr 全局 TracerProvider（atomic，C13a）。
-// Init 之前/Close 之后均为 Noop，保证任何时刻 Load 非 nil，请求期不 panic。
+// Init 之前/Close 之后均为 Noop/NeverSample，保证任何时刻 Load 非 nil，请求期不 panic。
 var tracerProviderPtr atomic.Pointer[sdktrace.TracerProvider]
 
 // tracerPtr 全局 Tracer（atomic，C13a）。Init 之前为 Noop，调用安全。
 var tracerPtr atomic.Pointer[trace.Tracer]
 
-// closeOnce 保证 Close 只真正 Shutdown 一次（M18），重复调用安全返回 nil。
-var closeOnce sync.Once
-var closeErr error
-
 func init() {
 	// 初始化为 Noop，保证包级函数在任何时刻（未 Init / 已 Close）Load 均非 nil（C13a）。
-	noopProvider := trace.NewNoopTracerProvider()
+	// P1 #19：用 noop.NewTracerProvider()（新 OTel API），替代已弃用的 trace.NewNoopTracerProvider()。
+	noopProvider := noop.NewTracerProvider()
 	noopTracer := noopProvider.Tracer("xlgo")
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
 	tracerProviderPtr.Store(tp)
@@ -92,12 +89,17 @@ func TracerProvider() *sdktrace.TracerProvider {
 // Init 初始化链路追踪
 func Init(cfg Config) error {
 	if !cfg.Enabled {
-		// 设置 Noop Tracer
-		noopProvider := trace.NewNoopTracerProvider()
+		// 设置 Noop Tracer（P1 #19：noop 包替代弃用 API）
+		noopProvider := noop.NewTracerProvider()
 		otel.SetTracerProvider(noopProvider)
 		noopTracer := noopProvider.Tracer(cfg.ServiceName)
 		tracerPtr.Store(&noopTracer)
-		// 不替换 tracerProviderPtr（保留兜底 NeverSample provider），无 exporter 需关闭。
+		// M-64 修复：Swap 出旧 provider（可能持有 exporter）并 Shutdown，
+		// 避免禁用 trace 后旧 exporter 后台 goroutine/连接持续占用。
+		fallback := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+		if old := tracerProviderPtr.Swap(fallback); old != nil {
+			_ = old.Shutdown(context.Background())
+		}
 		return nil
 	}
 
@@ -132,16 +134,17 @@ func Init(cfg Config) error {
 		sdktrace.WithSampler(sdktrace.TraceIDRatioBased(cfg.SampleRatio)),
 	)
 
-	// 设置全局 TracerProvider
-	otel.SetTracerProvider(newProvider)
-
 	// 设置传播器（非法类型返错，C13e 不再静默回落）
 	prop, err := createPropagator(cfg.Propagator)
 	if err != nil {
-		// 传播器非法：回滚已创建的 provider，避免泄漏。
+		// M-65 修复：传播器非法时回滚已创建的 provider。此时尚未 otel.SetTracerProvider，
+		// otel 全局仍指向旧 provider，无需恢复——仅 Shutdown 新 provider 避免泄漏。
 		_ = newProvider.Shutdown(context.Background())
 		return err
 	}
+
+	// 全部成功后再切换全局状态（M-65：避免失败后 otel 指向已 Shutdown 的 provider）。
+	otel.SetTracerProvider(newProvider)
 	otel.SetTextMapPropagator(prop)
 
 	// 原子替换：先建新 provider，成功后再 Store，并关闭旧 provider（若持有 exporter）。
@@ -203,21 +206,22 @@ func createPropagator(propagatorType string) (propagation.TextMapPropagator, err
 	}
 }
 
-// Close 关闭链路追踪（幂等，M18：sync.Once 保证只 Shutdown 一次，重复调用安全）。
+// Close 关闭链路追踪。
+//
+// H-14 修复：去掉 sync.Once。原实现 Close→Init→Close 第二次因 once 已消费而 no-op，
+// 新 provider 的 exporter 后台 goroutine/连接泄漏。改为每次 Swap 出当前 provider 并
+// Shutdown，Store 回兜底 NeverSample provider（C13a：Close 后再用已关闭 provider）。
+// 幂等：重复 Close 时 Swap 得到的是无 exporter 的兜底 provider，Shutdown 无害。
+// 并发安全：Swap 原子返回唯一指针，不会 double-Shutdown 同一 provider。
 func Close(ctx context.Context) error {
-	closeOnce.Do(func() {
-		// 取出当前 provider 并 Shutdown；Store 回兜底 NeverSample provider，
-		// 防 Close 后再用已关闭 provider（C13a）。
-		tp := tracerProviderPtr.Load()
-		fallback := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
-		tracerProviderPtr.Store(fallback)
-		noopTracer := trace.NewNoopTracerProvider().Tracer("xlgo")
-		tracerPtr.Store(&noopTracer)
-		if tp != nil {
-			closeErr = tp.Shutdown(ctx)
-		}
-	})
-	return closeErr
+	fallback := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
+	old := tracerProviderPtr.Swap(fallback)
+	noopTracer := noop.NewTracerProvider().Tracer("xlgo") // P1 #19：noop 包替代弃用 API
+	tracerPtr.Store(&noopTracer)
+	if old != nil {
+		return old.Shutdown(ctx)
+	}
+	return nil
 }
 
 // Middleware Gin 中间件
@@ -226,10 +230,16 @@ func Middleware(serviceName string) gin.HandlerFunc {
 		// 从请求中提取 TraceContext
 		ctx := otel.GetTextMapPropagator().Extract(c.Request.Context(), propagation.HeaderCarrier(c.Request.Header))
 
-		// 创建 Span
-		spanName := c.Request.Method + " " + c.FullPath()
-		if spanName == "" {
-			spanName = c.Request.Method + " " + c.Request.URL.Path
+		// 创建 Span。P1 #19：span 名以路由模板（FullPath）为准以保持低基数。
+		// 原实现 `Method+" "+FullPath()` 后判 `== ""` 永不成立（"GET " 非空），
+		// 未匹配路由的回退分支形同虚设、且用原始 URL.Path（含 ID）会导致 span 名高基数爆炸。
+		// 现显式判断 FullPath 为空（未匹配路由），用固定低基数名。
+		route := c.FullPath()
+		var spanName string
+		if route == "" {
+			spanName = c.Request.Method + " [unmatched]"
+		} else {
+			spanName = c.Request.Method + " " + route
 		}
 
 		ctx, span := getTracer().Start(ctx, spanName,
@@ -237,11 +247,14 @@ func Middleware(serviceName string) gin.HandlerFunc {
 			trace.WithAttributes(
 				semconv.HTTPRequestMethodKey.String(c.Request.Method),
 				semconv.URLPathKey.String(c.Request.URL.Path),
-				semconv.HTTPRouteKey.String(c.FullPath()),
+				semconv.HTTPRouteKey.String(route),
 				attribute.String("http.user_agent", c.Request.UserAgent()),
 				attribute.String("http.host", c.Request.Host),
 			),
 		)
+		// P1 #19：defer 保证下游 handler panic（在上游 recovery 捕获前）时 span 也被结束，
+		// 不泄漏未结束的 span。
+		defer span.End()
 
 		// C13d：更新 c.Request，使下游 c.Request.Context() 含 span；
 		// 同时保留 c.Set("otel_ctx", ctx) 兼容既有 GetContext 用法。
@@ -264,9 +277,6 @@ func Middleware(serviceName string) gin.HandlerFunc {
 		}
 		// 成功路径不显式设 codes.Ok（M18）：OTel 规范中 Span 状态默认 UNSET，
 		// 仅在错误时设 Error；显式设 Ok 会掩盖下游子 Span 的真实错误状态。
-
-		// 结束 Span
-		span.End()
 	}
 }
 

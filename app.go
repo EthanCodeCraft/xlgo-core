@@ -14,6 +14,7 @@ import (
 
 	"github.com/EthanCodeCraft/xlgo-core/cache"
 	"github.com/EthanCodeCraft/xlgo-core/config"
+	"github.com/EthanCodeCraft/xlgo-core/cron"
 	"github.com/EthanCodeCraft/xlgo-core/database"
 	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"github.com/EthanCodeCraft/xlgo-core/middleware"
@@ -75,6 +76,7 @@ type App struct {
 	enableLiveness     bool
 	enableReadiness    bool
 	enableMetrics      bool
+	enableCron         bool
 	metricsPath        string
 
 	staticRoutes []staticRoute
@@ -279,6 +281,14 @@ func WithRequestTimeout(d time.Duration) Option {
 	return func(a *App) { a.requestTimeout = d }
 }
 
+// WithCron 将全局 cron 调度器纳入 App 生命周期（P1 #10）。
+// 启用后：Init 末尾 cron.Start() 启动调度循环；Shutdown 时在 ShutdownTimeout 约束内
+// 停止全局调度器并等待在跑任务退出（cron.StopGlobalWithTimeout），避免调度 goroutine
+// 与在跑任务在优雅关闭后残留。任务仍通过 cron.AddTask(...) 在 Run 前注册。
+func WithCron() Option {
+	return func(a *App) { a.enableCron = true }
+}
+
 // WithModels 注册 GORM 自动迁移模型（自动启用 AutoMigrate）
 func WithModels(models ...any) Option {
 	return WithMigrator(func(db *gorm.DB) error {
@@ -358,7 +368,24 @@ func RunFullStack(opts ...Option) error {
 // Init 初始化应用，不启动 HTTP 监听（A1 修复：sync.Once 保证单次执行，并发安全）。
 // 多次调用返回首次执行的结果。
 func (a *App) Init() error {
-	a.initOnce.Do(func() { a.initErr = a.doInit() })
+	a.initOnce.Do(func() {
+		a.initErr = a.doInit()
+		if a.initErr != nil {
+			// H-2 修复：Init 失败时 cancel rootCtx 并等待已通过 App.Go 启动的后台 goroutine 退出。
+			// App.Go 不要求 Init 先成功（注释 app.go:337），若不清理，调用方在 Init 失败后
+			// 不调 Run/Shutdown，则 rootCtx 永不 cancel、wg 永不归零，后台 goroutine 永久泄漏。
+			if a.cancel != nil {
+				a.cancel()
+			}
+			waitDone := make(chan struct{})
+			go func() { a.wg.Wait(); close(waitDone) }()
+			select {
+			case <-waitDone:
+			case <-time.After(10 * time.Second):
+				logger.Warnf("Init 失败后等待后台 goroutine 退出超时（10s），可能存在未响应 ctx.Done 的 goroutine")
+			}
+		}
+	})
 	return a.initErr
 }
 
@@ -475,11 +502,20 @@ func (a *App) doInit() error {
 		}
 	}
 
+	// 错误 Detail 暴露策略（P1 #15）：仅开发环境向客户端输出 Error.Detail，
+	// 生产环境隐藏，避免内部错误细节（SQL/堆栈等）经 Detail 泄露给客户端。
+	response.SetExposeDetail(cfg.IsDevelopment())
+
 	// in-flight goroutine 根 ctx 在 New() 时已初始化（#22）
 
 	// 启动主库/从库探活后台循环（#21），ctx 在 Shutdown 时取消
 	if a.enableMySQL {
 		a.Go(database.StartDBProbing)
+	}
+
+	// 启动 cron 全局调度器（P1 #10），Shutdown 时统一停止。任务须在此前经 cron.AddTask 注册。
+	if a.enableCron {
+		cron.Start()
 	}
 
 	// OnInit hooks：组件初始化完成后触发（#12）
@@ -587,7 +623,13 @@ func (a *App) StartServer() error {
 		if h.OnReady != nil {
 			if err := h.OnReady(a); err != nil {
 				logger.Errorf("OnReady hook %q 失败: %v", h.Name, err)
-				serverErr <- fmt.Errorf("OnReady hook %q 失败: %w", h.Name, err)
+				// H-1 修复：失败时走 Shutdown 释放 HTTP 端口、后台 goroutine 与已初始化资源，
+				// 避免监听 goroutine 永久阻塞在 ListenAndServe 致端口/goroutine 泄漏。
+				// 不再向 serverErr 写入——监听 goroutine 在 Shutdown 后会写 nil 到 serverErr（cap=1），
+				// 若此处也写则第二次写阻塞致 goroutine 泄漏。
+				if shutErr := a.Shutdown(); shutErr != nil {
+					return fmt.Errorf("OnReady hook %q 失败: %w (关闭错误: %v)", h.Name, err, shutErr)
+				}
 				return fmt.Errorf("OnReady hook %q 失败: %w", h.Name, err)
 			}
 		}
@@ -655,6 +697,20 @@ func (a *App) Shutdown() error {
 	case <-waitDone:
 	case <-ctx.Done():
 		logger.Warnf("等待后台 goroutine 退出超时")
+	}
+
+	// 停止 cron 全局调度器（P1 #10），在剩余 shutdown 预算内等待在跑任务退出。
+	if a.enableCron {
+		logger.Info("停止 cron 调度器...")
+		remaining := time.Second
+		if dl, ok := ctx.Deadline(); ok {
+			if r := time.Until(dl); r > 0 {
+				remaining = r
+			}
+		}
+		if !cron.StopGlobalWithTimeout(remaining) {
+			logger.Warnf("cron 调度器停止超时，可能有任务未响应 ctx 取消")
+		}
 	}
 
 	logger.Info("停止限流器...")

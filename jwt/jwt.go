@@ -13,8 +13,10 @@ import (
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/database"
+	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 // Claims JWT 声明
@@ -44,7 +46,39 @@ var (
 	// IsBlacklisted 在无 Redis 时仍返回 false（验证侧 fail-open 是无 Redis 部署的固有局限，
 	// 文档约束：安全敏感场景必须启用 Redis）。
 	ErrBlacklistUnavailable = errors.New("token 黑名单不可用：Redis 未初始化")
+	// ErrEmptySecret JWT 密钥为空（P0 修复）。空 secret 意味着以零长度 HMAC 密钥签发/校验，
+	// 任何以 "" 签名的 token 都会通过——签发与校验一律 fail-closed 拒绝，杜绝该空密钥绕过。
+	ErrEmptySecret = errors.New("jwt.secret 未配置：拒绝签发/校验（防空密钥导致任意 token 通过）")
+	// ErrUnsupportedAlgorithm 配置了不支持的签名算法（P0 修复）。
+	// 本实现仅支持 HMAC 族（HS256/HS384/HS512）；RS256 等非对称算法暂不支持，
+	// 不再静默回退 HS256——避免用户误以为在用非对称算法、实则 HMAC，并助长算法混淆攻击。
+	ErrUnsupportedAlgorithm = errors.New("jwt: 不支持的签名算法（仅支持 HS256/HS384/HS512）")
 )
+
+// validMethods 允许的签名算法名（HMAC 族）。ParseWithClaims 传 jwt.WithValidMethods 固定算法，
+// 防算法混淆（alg confusion，P0）：拒绝 alg=none 及非 HMAC 算法——否则若部署配置为非对称算法，
+// 攻击者可用公钥作为 HMAC 密钥伪造 token 通过校验。
+var validMethods = []string{"HS256", "HS384", "HS512"}
+
+// secretKey 返回 HMAC 密钥字节；cfg 为 nil 或密钥为空时 fail-closed 返回 ErrEmptySecret（P0）。
+func secretKey(cfg *config.Config) ([]byte, error) {
+	if cfg == nil || cfg.JWT.Secret == "" {
+		return nil, ErrEmptySecret
+	}
+	return []byte(cfg.JWT.Secret), nil
+}
+
+// hmacKeyfunc 构造校验签名方法为 HMAC 族并返回密钥的 jwt.Keyfunc（P0：防算法混淆 + 空密钥）。
+// 双重防护：① 断言 token.Method 为 *jwt.SigningMethodHMAC，拒绝非 HMAC（含 none/RS/ES）；
+// ② 经 secretKey 拒绝空密钥。配合 ParseWithClaims 的 jwt.WithValidMethods(validMethods) 使用。
+func hmacKeyfunc(cfg *config.Config) jwt.Keyfunc {
+	return func(token *jwt.Token) (any, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("%w: 期望 HMAC，实际 alg=%v", ErrUnsupportedAlgorithm, token.Header["alg"])
+		}
+		return secretKey(cfg)
+	}
+}
 
 // generateJTI 生成唯一的 JWT ID
 func generateJTI() (string, error) {
@@ -73,6 +107,18 @@ func (tb *TokenBlacklist) redisClient() *redis.Client {
 	return database.GetRedis()
 }
 
+// blacklistOpTimeout 黑名单 Redis 操作的上下文超时（M-A 修复）。
+// Redis 客户端已配 ReadTimeout/WriteTimeout=3s（redis.go D7），但鉴权热路径（ParseToken
+// 每次调 IsBlacklisted）需更紧边界——显式 ctx 超时把鉴权阻塞上限收敛到 1s，避免 Redis
+// 挂起时每个鉴权请求被长时间拖住。健康 Redis 下 Exists/SET 为亚毫秒级，1s 余量充足。
+// 注：ctx 超时只约束命令往返，不影响 Set 的服务端 TTL（ttl 可远大于 1s）。
+const blacklistOpTimeout = 1 * time.Second
+
+// blacklistCtx 创建带超时的 context 用于黑名单 Redis 操作（M-A）。
+func blacklistCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), blacklistOpTimeout)
+}
+
 // Add 将 Token 的 JTI 加入黑名单
 // 参数: jti JWT ID，expiry Token 过期时间
 //
@@ -85,7 +131,8 @@ func (tb *TokenBlacklist) Add(jti string, expiry time.Time) error {
 		return ErrBlacklistUnavailable
 	}
 
-	ctx := context.Background()
+	ctx, cancel := blacklistCtx()
+	defer cancel()
 	ttl := time.Until(expiry)
 	if ttl <= 0 {
 		// Token 已过期，无需加入黑名单
@@ -105,9 +152,18 @@ func (tb *TokenBlacklist) IsBlacklisted(jti string) bool {
 		return false
 	}
 
-	ctx := context.Background()
+	ctx, cancel := blacklistCtx()
+	defer cancel()
 	key := fmt.Sprintf("jwt_bl:%s", jti)
-	return client.Exists(ctx, key).Val() > 0
+	// M-A 修复：显式处理 Redis 错误（原 .Val() 吞错致故障被静默当"未拉黑"）。
+	// 错误时保持 fail-open（返 false），与"无 Redis 部署可用"的固有局限一致，但记录告警
+	// 便于运维感知 Redis 故障。安全敏感场景必须启用 Redis（见 ErrBlacklistUnavailable 注释）。
+	n, err := client.Exists(ctx, key).Result()
+	if err != nil {
+		logger.Warn("jwt 黑名单检查失败，fail-open 放行", zap.String("jti", jti), zap.Error(err))
+		return false
+	}
+	return n > 0
 }
 
 // Manager JWT 管理器（#10）。持有独立的 TokenBlacklist，
@@ -175,6 +231,17 @@ func (m *Manager) Blacklist() *TokenBlacklist {
 func GenerateToken(userID uint, username, role, userType string) (string, error) {
 	cfg := config.Get()
 
+	// P0：先校验密钥非空与算法受支持（fail-closed）。secretKey 亦守卫 cfg==nil，
+	// 通过后 cfg 保证非空，后续访问 cfg.JWT.* 安全。
+	key, err := secretKey(cfg)
+	if err != nil {
+		return "", err
+	}
+	method, err := signingMethod(cfg.JWT.Algorithm)
+	if err != nil {
+		return "", err
+	}
+
 	// 生成唯一的 JWT ID
 	jti, err := generateJTI()
 	if err != nil {
@@ -196,13 +263,23 @@ func GenerateToken(userID uint, username, role, userType string) (string, error)
 		},
 	}
 
-	token := jwt.NewWithClaims(signingMethod(cfg.JWT.Algorithm), claims)
-	return token.SignedString([]byte(cfg.JWT.Secret))
+	token := jwt.NewWithClaims(method, claims)
+	return token.SignedString(key)
 }
 
 // GenerateTokenWithCustomExpiry 生成带自定义过期时间的 Token
 func GenerateTokenWithCustomExpiry(userID uint, username, role, userType string, expireSeconds int) (string, error) {
 	cfg := config.Get()
+
+	// P0：先校验密钥非空与算法受支持（fail-closed，见 GenerateToken）。
+	key, err := secretKey(cfg)
+	if err != nil {
+		return "", err
+	}
+	method, err := signingMethod(cfg.JWT.Algorithm)
+	if err != nil {
+		return "", err
+	}
 
 	jti, err := generateJTI()
 	if err != nil {
@@ -224,8 +301,8 @@ func GenerateTokenWithCustomExpiry(userID uint, username, role, userType string,
 		},
 	}
 
-	token := jwt.NewWithClaims(signingMethod(cfg.JWT.Algorithm), claims)
-	return token.SignedString([]byte(cfg.JWT.Secret))
+	token := jwt.NewWithClaims(method, claims)
+	return token.SignedString(key)
 }
 
 // issuerOrDefault 返回配置的 issuer，未配置时回退 "xlgo"。
@@ -237,16 +314,18 @@ func issuerOrDefault(issuer string) string {
 }
 
 // signingMethod 根据 algorithm 配置返回 HMAC 签名方法。
-// 目前支持 HS256(默认)/HS384/HS512；其它值回退 HS256。
-// RS256 等非对称算法需扩展密钥类型，暂不支持。
-func signingMethod(algorithm string) jwt.SigningMethod {
-	switch strings.ToUpper(algorithm) {
+// 支持 HS256（默认，空值等价）/HS384/HS512；其它值（含 RS256 等非对称算法，暂不支持）
+// 返回 ErrUnsupportedAlgorithm，不再静默回退 HS256（P0：防"配 RS256 实得 HMAC"的算法混淆隐患）。
+func signingMethod(algorithm string) (jwt.SigningMethod, error) {
+	switch strings.ToUpper(strings.TrimSpace(algorithm)) {
+	case "", "HS256":
+		return jwt.SigningMethodHS256, nil
 	case "HS384":
-		return jwt.SigningMethodHS384
+		return jwt.SigningMethodHS384, nil
 	case "HS512":
-		return jwt.SigningMethodHS512
+		return jwt.SigningMethodHS512, nil
 	default:
-		return jwt.SigningMethodHS256
+		return nil, fmt.Errorf("%w: %q", ErrUnsupportedAlgorithm, algorithm)
 	}
 }
 
@@ -254,9 +333,7 @@ func signingMethod(algorithm string) jwt.SigningMethod {
 func ParseToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
-		return []byte(cfg.JWT.Secret), nil
-	})
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), jwt.WithValidMethods(validMethods))
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -286,9 +363,7 @@ func ParseToken(tokenString string) (*Claims, error) {
 func InvalidateToken(tokenString string) error {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
-		return []byte(cfg.JWT.Secret), nil
-	})
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), jwt.WithValidMethods(validMethods))
 
 	if err != nil {
 		// Token 无效或已过期，无需加入黑名单
@@ -356,9 +431,8 @@ func IsTokenRevoked(jti string) bool {
 func GetClaimsFromToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
-		return []byte(cfg.JWT.Secret), nil
-	}, jwt.WithoutClaimsValidation())
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg),
+		jwt.WithValidMethods(validMethods), jwt.WithoutClaimsValidation())
 
 	if err != nil {
 		return nil, err

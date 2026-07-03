@@ -20,7 +20,7 @@ db := database.GetDB()
 // 同一份代码，也能注入实例 / 跑多套 / 塞 mock
 myDB := database.NewManager(cfg)
 myDB.Open(ctx)                       // 独立实例，不受全局影响
-database.SetDefaultManager(myDB)     // 或提升为全局默认
+database.SetDefaultManager(myDB)     // 或提升为全局默认（并发安全）
 mockCache := &fakeCacheSvc{}
 cache.SetDefaultCacheManager(&cache.CacheManager{}) // 测试注入
 ```
@@ -792,7 +792,7 @@ xlgo/
 ### Docker 部署
 
 ```dockerfile
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 COPY . .

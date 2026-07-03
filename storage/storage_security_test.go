@@ -262,6 +262,31 @@ func TestLocalStorageUploadFromBytesPolicy(t *testing.T) {
 	}
 }
 
+// ===== P0：上传大小拷贝阶段实测封顶（客户端 Size 不可信）=====
+
+// 回归 P0：客户端谎报 file.Size 绕过前置校验时，拷贝阶段按实际字节封顶必须拦截，
+// 返回 ErrUploadTooLarge，防止声明小体积却流式发送大 body 撑爆磁盘。
+func TestLocalStorageUploadSizeEnforcedOnCopy(t *testing.T) {
+	s := newLocalStorageWithPolicy(t, config.UploadPolicy{MaxSizeBytes: 5}, 0)
+
+	content := make([]byte, 100) // 真实 100 字节
+	fh := makeFileHeader(t, "file", "big.bin", "application/octet-stream", content)
+	fh.Size = 1 // 谎报大小，绕过前置 validateUploadSize
+
+	if _, err := s.Upload(fh, "docs"); !errors.Is(err, storage.ErrUploadTooLarge) {
+		t.Errorf("Upload with lied Size err = %v, want ErrUploadTooLarge", err)
+	}
+}
+
+// 回归 P0：实际大小恰好等于上限应通过（边界不误伤）。
+func TestLocalStorageUploadSizeBoundaryExact(t *testing.T) {
+	s := newLocalStorageWithPolicy(t, config.UploadPolicy{MaxSizeBytes: 8}, 0)
+	fh := makeFileHeader(t, "file", "ok.bin", "application/octet-stream", []byte("12345678")) // 恰好 8 字节
+	if _, err := s.Upload(fh, "docs"); err != nil {
+		t.Errorf("Upload exactly-at-limit err = %v, want success", err)
+	}
+}
+
 // 兼容性回归：零值 UploadPolicy（默认配置）不上传限制，正常文件通过。
 func TestLocalStorageZeroPolicyAllowsAll(t *testing.T) {
 	s := newLocalStorageWithPolicy(t, config.UploadPolicy{}, 0)

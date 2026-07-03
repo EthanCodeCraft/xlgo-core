@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -40,6 +41,9 @@ var (
 	ErrPathTraversal = errors.New("path traversal detected")
 	// ErrInvalidPath 路径非法（空、含 NUL 等）。
 	ErrInvalidPath = errors.New("invalid path")
+	// ErrUploadTooLarge 上传实际字节数超过 MaxSizeBytes（P0）。客户端声明的 file.Size
+	// 不可信，故除前置校验外，拷贝阶段按实际字节封顶，防止声明小体积却流式发送大 body 撑爆磁盘/OSS。
+	ErrUploadTooLarge = errors.New("upload exceeds max size")
 )
 
 const (
@@ -61,11 +65,50 @@ func resolveMaxRead(n int64) int64 {
 }
 
 // validateUploadSize 校验上传文件大小（C4b）。MaxSizeBytes<=0 表示不限。
+//
+// 注意：此处的 size 来自客户端声明（multipart.FileHeader.Size），仅作前置快速拒绝，
+// 不可信——攻击者可声明小体积却流式发送大 body。真正的落盘/上传封顶由 enforceUploadSize
+// 在拷贝阶段按实际字节数二次把关（P0）。
 func validateUploadSize(p config.UploadPolicy, size int64) error {
 	if p.MaxSizeBytes > 0 && size > p.MaxSizeBytes {
 		return fmt.Errorf("文件大小 %d 超过上限 %d: %w", size, p.MaxSizeBytes, ErrInvalidPath)
 	}
 	return nil
+}
+
+// enforceMaxReader 包装底层 reader，实际读取累计超过 max 字节即返回 ErrUploadTooLarge（P0）。
+// max<=0 表示不限。用于上传拷贝阶段的真实大小封顶，弥补客户端声明 Size 不可信。
+type enforceMaxReader struct {
+	src   io.Reader
+	max   int64
+	count int64
+}
+
+func (r *enforceMaxReader) Read(p []byte) (int, error) {
+	if r.max > 0 && r.count >= r.max {
+		// 上限内的字节已全部读出：用独立探针读 1 字节判断源是否还有数据，有则超限。
+		var probe [1]byte
+		if n, _ := r.src.Read(probe[:]); n > 0 {
+			return 0, ErrUploadTooLarge
+		}
+		// 源已到 EOF，实际大小恰好等于上限，放行结束。
+		return 0, io.EOF
+	}
+	n, err := r.src.Read(p)
+	r.count += int64(n)
+	if r.max > 0 && r.count > r.max {
+		return 0, ErrUploadTooLarge
+	}
+	return n, err
+}
+
+// enforceUploadSize 若策略配置了 MaxSizeBytes，则包装 src 在拷贝阶段实测封顶（P0）。
+// 未配置上限时原样返回，零开销。
+func enforceUploadSize(p config.UploadPolicy, src io.Reader) io.Reader {
+	if p.MaxSizeBytes <= 0 {
+		return src
+	}
+	return &enforceMaxReader{src: src, max: p.MaxSizeBytes}
 }
 
 // validateUploadExt 校验上传文件扩展名（C4b）。AllowedExts 为空表示不限。
@@ -158,12 +201,20 @@ type LocalStorage struct {
 // Get 会跟随 symlink 读到根外内容——需保证攻击者无法在根目录内创建 symlink。
 func NewLocalStorage(cfg *config.LocalStorageConfig) *LocalStorage {
 	// 用绝对路径作根锚定，避免相对路径 + `..` 组合绕过前缀校验（C4a）。
-	rootAbs, err := filepath.Abs(cfg.Path)
+	var rootAbs string
+	abs, err := filepath.Abs(cfg.Path)
 	if err != nil {
-		rootAbs = cfg.Path
+		// P1 #20：Abs 失败（如 os.Getwd 失败）不再回退相对 cfg.Path——相对根会使 safeJoin
+		// 前缀校验基于相对路径、削弱穿越防御。改为 fail-closed：置空 rootAbs，
+		// safeJoin 据此拒绝一切操作，并记录错误，避免"看似可用实则防御失效"的本地存储。
+		logger.Error("storage: 解析存储根目录绝对路径失败，本地存储将不可用（fail-closed）",
+			zap.String("path", cfg.Path), zap.Error(err))
+		rootAbs = ""
+	} else {
+		rootAbs = filepath.Clean(abs)
 	}
 	return &LocalStorage{
-		rootAbs:      filepath.Clean(rootAbs),
+		rootAbs:      rootAbs,
 		baseURL:      cfg.BaseURL,
 		policy:       cfg.Upload,
 		maxReadBytes: resolveMaxRead(cfg.MaxReadBytes),
@@ -173,6 +224,10 @@ func NewLocalStorage(cfg *config.LocalStorageConfig) *LocalStorage {
 // safeJoin 将根路径与相对片段拼接为绝对路径，并以前缀锚定拒绝穿越（C4a）。
 // 任何片段为绝对路径或含 NUL、最终路径逃逸 rootAbs 时返回错误。
 func (s *LocalStorage) safeJoin(parts ...string) (string, error) {
+	// P1 #20：rootAbs 为空表示构造时 Abs 失败，fail-closed 拒绝所有路径操作。
+	if s.rootAbs == "" {
+		return "", ErrStorageNotInitialized
+	}
 	for _, p := range parts {
 		if filepath.IsAbs(p) {
 			return "", ErrPathTraversal
@@ -241,8 +296,11 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 	}
 	defer dstFile.Close()
 
-	// 复制文件内容
-	if _, err := io.Copy(dstFile, srcReader); err != nil {
+	// 复制文件内容。按策略实测封顶（P0）：超限即报错并清理已落盘的部分文件。
+	if _, err := io.Copy(dstFile, enforceUploadSize(s.policy, srcReader)); err != nil {
+		// 先关闭再删除（Windows 下删除打开中的文件会失败）；defer 的 Close 随后成为无害 no-op。
+		_ = dstFile.Close()
+		_ = os.Remove(dst)
 		return "", fmt.Errorf("保存文件失败: %w", err)
 	}
 
@@ -450,8 +508,9 @@ func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, 
 		return "", err
 	}
 
-	// 上传到 OSS
-	if err := s.bucket.PutObject(objectKey, srcReader); err != nil {
+	// 上传到 OSS。按策略实测封顶（P0）：超限时 PutObject 读到 ErrUploadTooLarge 而失败，
+	// 简单 PutObject 语义下对象不会被提交，无需额外清理。
+	if err := s.bucket.PutObject(objectKey, enforceUploadSize(s.policy, srcReader)); err != nil {
 		logger.Error("OSS 上传失败", zap.Error(err), zap.String("key", objectKey))
 		return "", fmt.Errorf("OSS 上传失败: %w", err)
 	}
@@ -566,9 +625,6 @@ func (s *OSSStorage) Exists(p string) bool {
 	return err == nil
 }
 
-// 全局存储实例（兼容 facade，由 Manager.Init 同步维护）
-var storage Storage
-
 // StorageManager 存储管理器（#10）。照 database.Manager 模式：
 // 实例化 + DefaultStorage 全局默认 + 包级 facade 代理，支持多实例与测试注入。
 type StorageManager struct {
@@ -578,15 +634,24 @@ type StorageManager struct {
 }
 
 // DefaultStorage 默认存储管理器，包级 facade 代理到它。
-var DefaultStorage = NewStorageManager()
+//
+// 主线A 修复：改用 atomic.Pointer 保护读写，消除原裸指针置换（SetDefaultStorageManager）
+// 与 facade 无锁读之间的数据竞争，与 config.defaultManager / database.DefaultRedis 对齐。
+// 类型由 *StorageManager 变更为 atomic.Pointer[StorageManager]（breaking：下游若直接
+// 调用 DefaultStorage.Init 等方法需改用 Init 等 facade，或 DefaultStorage.Load().Init）。
+var DefaultStorage atomic.Pointer[StorageManager]
+
+func init() {
+	DefaultStorage.Store(NewStorageManager())
+}
 
 // NewStorageManager 创建存储管理器实例。
 func NewStorageManager() *StorageManager { return &StorageManager{} }
 
-// SetDefaultStorageManager 提升指定 StorageManager 为全局默认。
+// SetDefaultStorageManager 提升指定 StorageManager 为全局默认。并发安全（atomic.Store）。
 func SetDefaultStorageManager(m *StorageManager) {
 	if m != nil {
-		DefaultStorage = m
+		DefaultStorage.Store(m)
 	}
 }
 
@@ -613,7 +678,6 @@ func (m *StorageManager) Init(cfg *config.StorageConfig) error {
 
 	m.cfg = cfg
 	m.current = s
-	storage = s // 同步兼容 facade
 	return nil
 }
 
@@ -629,24 +693,23 @@ func (m *StorageManager) Set(s Storage) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.current = s
-	storage = s
 }
 
 // --- 包级 facade（代理到 DefaultStorage，兼容存量） ---
 
 // Init 初始化存储
 func Init(cfg *config.StorageConfig) error {
-	return DefaultStorage.Init(cfg)
+	return DefaultStorage.Load().Init(cfg)
 }
 
 // GetStorage 获取全局存储实例
 func GetStorage() Storage {
-	return DefaultStorage.Get()
+	return DefaultStorage.Load().Get()
 }
 
 // SetStorage 设置全局存储实例
 func SetStorage(s Storage) {
-	DefaultStorage.Set(s)
+	DefaultStorage.Load().Set(s)
 }
 
 // Upload 上传文件

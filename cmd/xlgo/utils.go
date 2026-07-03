@@ -7,16 +7,16 @@ import (
 	"strings"
 )
 
-func writeFile(path, content string) {
+func writeFile(path, content string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Printf("创建目录失败: %s\n", err)
-		return
+		return fmt.Errorf("创建目录失败: %w", err)
 	}
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		fmt.Printf("写入文件失败: %s\n", err)
+		return fmt.Errorf("写入文件失败: %w", err)
 	}
+	return nil
 }
 
 func fileExists(path string) bool {

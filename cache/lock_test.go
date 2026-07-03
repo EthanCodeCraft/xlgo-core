@@ -2,6 +2,7 @@ package cache_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -32,19 +33,20 @@ func TestLockErrors(t *testing.T) {
 		t.Errorf("Unlock with nil token should return ErrLockNotHeld or ErrRedisNotReady, got %v", err)
 	}
 
-	// Test IsLocked without Redis (should return false)
+	// Test IsLocked without Redis — M-E：应返回 (false, ErrRedisNotReady)，
+	// 让调用方可区分"Redis 不可用"与"锁未占用"（原 (false,nil) 与"未占用"不可区分）。
 	locked, err := cache.IsLocked(ctx, "test_key")
-	if err != nil {
-		t.Errorf("IsLocked error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("IsLocked without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if locked {
 		t.Error("IsLocked should return false without Redis")
 	}
 
-	// Test GetLockTTL without Redis
+	// Test GetLockTTL without Redis — M-E：应返回 (0, ErrRedisNotReady)。
 	ttl, err := cache.GetLockTTL(ctx, "test_key")
-	if err != nil {
-		t.Errorf("GetLockTTL error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("GetLockTTL without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if ttl != 0 {
 		t.Error("GetLockTTL should return 0 without Redis")

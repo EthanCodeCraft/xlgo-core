@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"net/http"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 )
 
 const (
@@ -152,18 +154,21 @@ func CSRF(config ...CSRFConfig) gin.HandlerFunc {
 			clientToken = c.PostForm(cfg.FormField)
 		}
 
-		// 最后从 JSON body 获取
+		// 最后从 JSON body 获取。
+		// P1 #9：用 ShouldBindBodyWith(binding.JSON) 而非 ShouldBindJSON——后者会读干
+		// c.Request.Body，导致下游 handler 再 ShouldBindJSON 拿到空 body(EOF)。前者把原始
+		// body 缓存进 gin context，下游可重复读取。
 		if clientToken == "" {
 			var body map[string]any
-			if err := c.ShouldBindJSON(&body); err == nil {
+			if err := c.ShouldBindBodyWith(&body, binding.JSON); err == nil {
 				if token, ok := body[cfg.FormField].(string); ok {
 					clientToken = token
 				}
 			}
 		}
 
-		// 验证 Token 是否匹配
-		if clientToken == "" || clientToken != cookieToken {
+		// 验证 Token 是否匹配（H-7: 恒定时间比较防时序侧信道）
+		if len(clientToken) == 0 || subtle.ConstantTimeCompare([]byte(clientToken), []byte(cookieToken)) != 1 {
 			cfg.ErrorFunc(c)
 			return
 		}
@@ -188,7 +193,13 @@ func GetCSRFToken(c *gin.Context) string {
 	if !exists {
 		return ""
 	}
-	return token.(string)
+	// H-7: comma-ok 防裸断言 panic。csrf_token 虽由本包以 string 写入，
+	// 但 gin context 是共享 map，下游误写其他类型即 panic。
+	s, ok := token.(string)
+	if !ok {
+		return ""
+	}
+	return s
 }
 
 // CSRFToken 返回 CSRF Token 的处理器（用于 API 模式）
@@ -320,9 +331,12 @@ func CSRFWithExempt(config ...CSRFConfig) gin.HandlerFunc {
 
 	originalSkipFunc := cfg.SkipFunc
 	cfg.SkipFunc = func(c *gin.Context) bool {
-		// 检查是否标记为 exempt
-		if exempt, exists := c.Get("csrf_exempt"); exists && exempt.(bool) {
-			return true
+		// 检查是否标记为 exempt（P1 #9：comma-ok 防裸断言 panic——gin context 为共享 map，
+		// 下游若误以非 bool 写入 csrf_exempt，exempt.(bool) 会 panic）。
+		if exempt, exists := c.Get("csrf_exempt"); exists {
+			if b, ok := exempt.(bool); ok && b {
+				return true
+			}
 		}
 		// 调用原始 SkipFunc
 		if originalSkipFunc != nil {
@@ -371,8 +385,8 @@ func DoubleSubmitCookie() gin.HandlerFunc {
 			return
 		}
 
-		// 验证 Cookie 和 Header 中的 Token 是否一致
-		if cookieToken != headerToken {
+		// 验证 Cookie 和 Header 中的 Token 是否一致（H-7: 恒定时间比较防时序侧信道）
+		if subtle.ConstantTimeCompare([]byte(cookieToken), []byte(headerToken)) != 1 {
 			response.Fail(c, "CSRF Token 不匹配")
 			c.Abort()
 			return

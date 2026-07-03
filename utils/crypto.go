@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"hash"
+	"io"
+	"os"
 )
 
 // MD5 计算字符串的 MD5 哈希值
@@ -45,14 +47,21 @@ func SHA256Bytes(data []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// HashFile 计算文件的哈希值
+// HashFile 计算文件的哈希值。
+//
+// M-F 修复：改为流式 io.Copy(h, f)，不再经 ReadFile 把整文件读入内存——原实现大文件 OOM。
+// 流式哈希内存占用恒定、可处理任意大小文件，与 hash.Hash 的 io.Writer 接口契合。
+// 调用方负责选择哈希算法（如 sha256.New）。
 func HashFile(path string, newHash func() hash.Hash) (string, error) {
-	data, err := ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
+	defer f.Close()
 	h := newHash()
-	h.Write(data)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 

@@ -8,6 +8,7 @@ import (
 	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/jwt"
 	"github.com/alicebob/miniredis/v2"
+	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -309,6 +310,77 @@ func TestInvalidateTokenByIDNoRedis(t *testing.T) {
 	err := jwt.InvalidateTokenByID("some-jti", time.Now().Add(time.Hour))
 	if !errors.Is(err, jwt.ErrBlacklistUnavailable) {
 		t.Errorf("InvalidateTokenByID without Redis err = %v, want ErrBlacklistUnavailable", err)
+	}
+}
+
+// ===== P0 回归：算法混淆 / 空密钥 / 不支持算法 =====
+
+// 回归 P0：alg=none 的 token 必须被拒（jwt.WithValidMethods 固定 HMAC 族）。
+// 这是算法混淆攻击的一种典型形态——攻击者去掉签名并将 alg 置为 none。
+func TestParseTokenRejectsAlgNone(t *testing.T) {
+	setupTestConfig()
+
+	claims := jwt.Claims{UserID: 1, Username: "attacker", Role: "admin", UserType: "super_admin"}
+	// 构造 alg=none 的未签名 token。
+	noneToken := gojwt.NewWithClaims(gojwt.SigningMethodNone, claims)
+	signed, err := noneToken.SignedString(gojwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatalf("构造 none token 失败: %v", err)
+	}
+
+	if _, err := jwt.ParseToken(signed); err == nil {
+		t.Error("ParseToken 必须拒绝 alg=none 的 token（算法混淆防护）")
+	}
+}
+
+// 回归 P0：空密钥时 GenerateToken/ParseToken 必须 fail-closed 返 ErrEmptySecret，
+// 杜绝以零长度 HMAC 密钥签发/校验导致任意 token 通过。
+func TestEmptySecretFailsClosed(t *testing.T) {
+	config.Set(&config.Config{JWT: config.JWTConfig{Secret: "", Expire: time.Hour}})
+	t.Cleanup(setupTestConfig) // 还原基线，避免污染其它测试
+
+	_, err := jwt.GenerateToken(1, "u", "admin", "admin")
+	if !errors.Is(err, jwt.ErrEmptySecret) {
+		t.Errorf("空密钥 GenerateToken err = %v, want ErrEmptySecret", err)
+	}
+
+	// 校验侧：任意 token 在空密钥下都不得通过。
+	if _, err := jwt.ParseToken("a.b.c"); err == nil {
+		t.Error("空密钥 ParseToken 不得通过任何 token")
+	}
+}
+
+// 回归 P0：配置不支持的算法（如 RS256）时 GenerateToken 必须返 ErrUnsupportedAlgorithm，
+// 不再静默回退 HS256。
+func TestUnsupportedAlgorithmFailsClosed(t *testing.T) {
+	config.Set(&config.Config{JWT: config.JWTConfig{
+		Secret:    "test-secret-key-1234567890123456789012",
+		Algorithm: "RS256",
+		Expire:    time.Hour,
+	}})
+	t.Cleanup(setupTestConfig)
+
+	_, err := jwt.GenerateToken(1, "u", "admin", "admin")
+	if !errors.Is(err, jwt.ErrUnsupportedAlgorithm) {
+		t.Errorf("RS256 GenerateToken err = %v, want ErrUnsupportedAlgorithm", err)
+	}
+}
+
+// 回归 P0：显式支持的 HS384 仍可正常签发与校验（确认算法固定未误伤合法 HMAC 族）。
+func TestSupportedAlgorithmHS384(t *testing.T) {
+	config.Set(&config.Config{JWT: config.JWTConfig{
+		Secret:    "test-secret-key-1234567890123456789012",
+		Algorithm: "HS384",
+		Expire:    time.Hour,
+	}})
+	t.Cleanup(setupTestConfig)
+
+	token, err := jwt.GenerateToken(1, "u", "admin", "admin")
+	if err != nil {
+		t.Fatalf("HS384 GenerateToken: %v", err)
+	}
+	if _, err := jwt.ParseToken(token); err != nil {
+		t.Errorf("HS384 ParseToken: %v", err)
 	}
 }
 

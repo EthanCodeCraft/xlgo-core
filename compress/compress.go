@@ -154,7 +154,7 @@ func GzipDecompressFile(src, dst string) error {
 }
 
 // GzipDecompressFileWithOptions 解压文件，可配置大小上限（C5b）。
-func GzipDecompressFileWithOptions(src, dst string, opts DecompressOptions) error {
+func GzipDecompressFileWithOptions(src, dst string, opts DecompressOptions) (err error) {
 	// #nosec G304 -- src 为调用方提供的本地文件路径，解压 API 固有语义，非不可信输入
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -173,7 +173,14 @@ func GzipDecompressFileWithOptions(src, dst string, opts DecompressOptions) erro
 	if err != nil {
 		return err
 	}
-	defer dstFile.Close()
+	// L-A 修复：失败时（超限/拷贝错误）清理部分落盘的 dst，避免被拒炸弹遗留残片；
+	// 成功时仅关闭。os.Remove 在 Close 之后，兼容 Windows（删除打开中的文件会失败）。
+	defer func() {
+		dstFile.Close()
+		if err != nil {
+			_ = os.Remove(dst)
+		}
+	}()
 
 	limit := resolveLimit(opts.MaxBytes, defaultDecompressLimit)
 	var written int64
@@ -312,7 +319,7 @@ func UnzipWithOptions(zipPath, dstDir string, opts DecompressOptions) error {
 // unzipFile 解压单个 zip 条目到 absDst 下。
 // entryLimit: 单条目上限（-1 不限）；totalLimit: 累计上限（-1 不限）；accrued: 已解压累计字节。
 // 返回本条目写入字节数。
-func unzipFile(file *zip.File, absDst string, entryLimit, totalLimit, accrued int64) (int64, error) {
+func unzipFile(file *zip.File, absDst string, entryLimit, totalLimit, accrued int64) (written int64, err error) {
 	// 拒绝符号链接条目，防经软链二次穿越（C5a）。
 	if file.Mode()&os.ModeSymlink != 0 {
 		return 0, fmt.Errorf("条目 %s 为符号链接: %w", file.Name, ErrSymlinkEntry)
@@ -355,7 +362,14 @@ func unzipFile(file *zip.File, absDst string, entryLimit, totalLimit, accrued in
 	if err != nil {
 		return 0, err
 	}
-	defer dstFile.Close()
+	// L-A 修复：失败时（超限/拷贝错误）清理部分落盘的 target，避免被拒炸弹遗留残片；
+	// 成功时仅关闭。os.Remove 在 Close 之后，兼容 Windows（删除打开中的文件会失败）。
+	defer func() {
+		dstFile.Close()
+		if err != nil {
+			_ = os.Remove(target)
+		}
+	}()
 
 	// 计算本次拷贝上限：单条目上限与累计剩余上限中较小者（-1 视为无限）。
 	// remaining: 累计剩余（-1 表示累计不限）；totalLimit>0 时若已无剩余，直接判超限。
@@ -369,7 +383,6 @@ func unzipFile(file *zip.File, absDst string, entryLimit, totalLimit, accrued in
 	cap := minLimit(entryLimit, remaining)
 	// cap 为 -1（两者皆不限）或 >0（有限上限，剩余已保证 >0），不会是 0。
 
-	var written int64
 	if cap > 0 {
 		written, err = io.CopyN(dstFile, rc, cap+1)
 	} else {

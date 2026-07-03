@@ -4,14 +4,20 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gin-gonic/gin/binding"
 	"github.com/go-playground/validator/v10"
 )
 
-// Validator 全局验证器实例
-var Validator *validator.Validate
+// Validator 全局验证器实例。
+//
+// H-13 修复：改用 atomic.Pointer 保护读写，消除原裸指针（InitValidator 无锁写、
+// ValidateStruct 无锁读）在运行期热重载/并发校验时的数据竞争。类型由 *validator.Validate
+// 变更为 atomic.Pointer[validator.Validate]（breaking：下游若直接读 validation.Validator.Struct
+// 需改用 ValidateStruct，或 validation.Validator.Load().Struct）。
+var Validator atomic.Pointer[validator.Validate]
 
 // ValidationError 验证错误
 type ValidationError struct {
@@ -77,8 +83,6 @@ func (ve ValidationErrors) FirstMessage() string {
 // InitValidator 初始化验证器
 func InitValidator() {
 	if v, ok := binding.Validator.Engine().(*validator.Validate); ok {
-		Validator = v
-
 		// 注册自定义标签名函数（优先使用 label，其次 json）
 		v.RegisterTagNameFunc(func(fld reflect.StructField) string {
 			// 优先使用 label tag 作为字段显示名
@@ -95,31 +99,51 @@ func InitValidator() {
 			return name
 		})
 
-		// 注册自定义验证规则
+		// 注册自定义验证规则（先注册再 Store，避免并发 ValidateStruct 拿到
+		// "已 Store 但自定义规则未注册完"的 validator）
 		registerCustomValidations(v)
+
+		// 全部配置完成后再发布，确保 Load 得到的 validator 永远是完整的
+		Validator.Store(v)
 	}
 }
 
-// registerCustomValidations 注册自定义验证规则
+// registerCustomValidations 注册自定义验证规则。
+//
+// P1 #18：每个 RegisterValidation 的错误都必须检查——注册失败会导致该 tag 静默不存在、
+// 所有输入被视为通过（password/idcard 等 fail-open 安全漏洞）。用 must 包装，在 init
+// 期以明确信息 panic（配置类错误应启动即暴露，而非运行期静默放行）。
 func registerCustomValidations(v *validator.Validate) {
+	must := func(tag string, fn validator.Func) {
+		if err := v.RegisterValidation(tag, fn); err != nil {
+			panic(fmt.Sprintf("validation: 注册校验规则 %q 失败: %v", tag, err))
+		}
+	}
+
 	// 密码强度验证
-	v.RegisterValidation("password", func(fl validator.FieldLevel) bool {
+	must("password", func(fl validator.FieldLevel) bool {
 		password := fl.Field().String()
 		valid, _ := ValidatePassword(password)
 		return valid
 	})
 
 	// 手机号验证（中国大陆）
-	v.RegisterValidation("phone", func(fl validator.FieldLevel) bool {
+	must("phone", func(fl validator.FieldLevel) bool {
 		phone := fl.Field().String()
-		if len(phone) != 11 {
+		if len(phone) != 11 || !strings.HasPrefix(phone, "1") {
 			return false
 		}
-		return strings.HasPrefix(phone, "1")
+		// P1 #17：要求全数字——原实现仅查长度+前缀，"1abcdefghij" 这类会误通过。
+		for i := 0; i < len(phone); i++ {
+			if phone[i] < '0' || phone[i] > '9' {
+				return false
+			}
+		}
+		return true
 	})
 
 	// 用户名验证（字母开头，允许字母数字下划线）
-	v.RegisterValidation("username", func(fl validator.FieldLevel) bool {
+	must("username", func(fl validator.FieldLevel) bool {
 		username := fl.Field().String()
 		if len(username) < 3 || len(username) > 20 {
 			return false
@@ -138,7 +162,7 @@ func registerCustomValidations(v *validator.Validate) {
 	})
 
 	// 手机号严格验证（验证运营商号段）
-	v.RegisterValidation("phone_strict", func(fl validator.FieldLevel) bool {
+	must("phone_strict", func(fl validator.FieldLevel) bool {
 		phone := fl.Field().String()
 		if len(phone) != 11 {
 			return false
@@ -166,7 +190,7 @@ func registerCustomValidations(v *validator.Validate) {
 	})
 
 	// 身份证号验证（18 位带校验位；15 位仅格式，向后兼容旧号段）。
-	v.RegisterValidation("idcard", func(fl validator.FieldLevel) bool {
+	must("idcard", func(fl validator.FieldLevel) bool {
 		id := fl.Field().String()
 		if len(id) != 18 && len(id) != 15 {
 			return false
@@ -226,11 +250,13 @@ func validateIDCardChecksum(id string) bool {
 
 // ValidateStruct 验证结构体
 func ValidateStruct(s any) ValidationErrors {
-	if Validator == nil {
+	v := Validator.Load()
+	if v == nil {
 		InitValidator()
+		v = Validator.Load()
 	}
 
-	err := Validator.Struct(s)
+	err := v.Struct(s)
 	if err == nil {
 		return nil
 	}

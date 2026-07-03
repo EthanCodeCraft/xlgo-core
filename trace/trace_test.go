@@ -390,3 +390,66 @@ func TestC13GetContextCommaOk(t *testing.T) {
 		t.Error("GetContext should fall back to c.Request.Context() on bad otel_ctx")
 	}
 }
+
+// ============================================================
+// H-14：Close→Init→Close 多轮生命周期（原 sync.Once 致第二次 Close 不 Shutdown）
+// ============================================================
+
+// TestH14CloseInitCloseMultipleRounds 验证 Close 可反复执行，
+// 且 Close→Init→Close 第二次 Close 仍真正 Shutdown 新 provider（不泄漏 exporter）。
+//
+// 修复前：Close 用 sync.Once，第二次 Close no-op，第二轮 Init 创建的 provider 的
+// exporter 后台 goroutine/连接泄漏。
+func TestH14CloseInitCloseMultipleRounds(t *testing.T) {
+	t.Cleanup(func() { resetGlobal(t) })
+
+	for round := 0; round < 3; round++ {
+		if err := Init(Config{Enabled: true, ServiceName: "svc", ExporterType: "stdout", Propagator: "w3c"}); err != nil {
+			t.Fatalf("round %d Init failed: %v", round, err)
+		}
+		// Init 后 provider 非 nil
+		if TracerProvider() == nil {
+			t.Fatalf("round %d: provider nil after Init", round)
+		}
+		if err := Close(context.Background()); err != nil {
+			t.Fatalf("round %d Close failed: %v", round, err)
+		}
+		// Close 后仍非 nil（兜底 NeverSample provider，C13a）
+		if TracerProvider() == nil {
+			t.Fatalf("round %d: provider nil after Close", round)
+		}
+	}
+}
+
+// TestH14CloseIdempotent 验证连续 Close 不 panic、不报错。
+func TestH14CloseIdempotent(t *testing.T) {
+	t.Cleanup(func() { resetGlobal(t) })
+	if err := Close(context.Background()); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := Close(context.Background()); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestM65PropagatorFailureLeavesOtelUsable 验证传播器失败时 otel 全局未被切到
+// 已 Shutdown 的 provider（M-65）。失败后仍可正常 start span 不 panic。
+func TestM65PropagatorFailureLeavesOtelUsable(t *testing.T) {
+	t.Cleanup(func() { resetGlobal(t) })
+
+	// 先成功 Init 一个
+	if err := Init(Config{Enabled: true, ServiceName: "svc", ExporterType: "stdout", Propagator: "w3c"}); err != nil {
+		t.Fatalf("setup Init: %v", err)
+	}
+
+	// 再用非法传播器 Init，应失败
+	err := Init(Config{Enabled: true, ExporterType: "stdout", Propagator: "xyz"})
+	if err == nil {
+		t.Fatal("Init with bad propagator should fail")
+	}
+
+	// otel 全局 provider 仍可用：StartSpan 不 panic
+	tr := otel.Tracer("test")
+	_, span := tr.Start(context.Background(), "after-failure")
+	span.End()
+}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
@@ -198,9 +200,10 @@ type Registry struct {
 	// 不经此中间件，故不被自采集。
 	metricsMiddleware gin.HandlerFunc
 
-	// applied 标记 Apply 是否已执行（H8b），二次 Apply 直接返回，
-	// 避免重复 engine.Use 与 Gin 重复路由 panic。
-	applied bool
+	// applyOnce 保证 Apply 仅执行一次（H8b + P1 #13）。
+	// 原实现用裸 bool 无同步，并发 Apply 会竞态并可能重复 engine.Use/重复注册致 gin panic；
+	// 改用 sync.Once，二次/并发 Apply 均安全幂等。
+	applyOnce sync.Once
 }
 
 // NewRegistry 创建路由注册中心
@@ -272,34 +275,38 @@ func (r *Registry) SetMetricsMiddleware(mw gin.HandlerFunc) {
 // 装入顺序：metrics 中间件（若有）→ 用户全局中间件 → 模块/版本路由。
 // metrics 置于首位保证全量业务路由被采集，且不依赖 RegisterMetricsRoute 调用顺序。
 func (r *Registry) Apply() {
-	if r.applied {
-		return
-	}
-	r.applied = true
-
-	// 指标采集中间件首个装入，统计所有经注册中心注册的业务路由
-	if r.metricsMiddleware != nil {
-		r.engine.Use(r.metricsMiddleware)
-	}
-
-	// 应用全局中间件
-	r.engine.Use(r.globalMiddlewares...)
-
-	// 注册无版本模块
-	for _, module := range r.modules {
-		module.Register(r.engine.Group(""))
-	}
-
-	// 注册版本化 API
-	for _, v := range r.versions {
-		group := r.engine.Group(v.BasePath)
-		if len(v.Middlewares) > 0 {
-			group.Use(v.Middlewares...)
+	r.applyOnce.Do(func() {
+		// 指标采集中间件首个装入，统计所有经注册中心注册的业务路由
+		if r.metricsMiddleware != nil {
+			r.engine.Use(r.metricsMiddleware)
 		}
-		for _, module := range v.Modules {
-			module.Register(group)
+
+		// 应用全局中间件
+		r.engine.Use(r.globalMiddlewares...)
+
+		// 注册无版本模块
+		for _, module := range r.modules {
+			module.Register(r.engine.Group(""))
 		}
-	}
+
+		// 注册版本化 API。P1 #13：按 version 键排序遍历，使跨版本注册顺序确定，
+		// 避免 map 随机序导致重叠路径"谁先胜出"（配合 registerGETOnce）每次运行不一致。
+		versionKeys := make([]string, 0, len(r.versions))
+		for k := range r.versions {
+			versionKeys = append(versionKeys, k)
+		}
+		sort.Strings(versionKeys)
+		for _, k := range versionKeys {
+			v := r.versions[k]
+			group := r.engine.Group(v.BasePath)
+			if len(v.Middlewares) > 0 {
+				group.Use(v.Middlewares...)
+			}
+			for _, module := range v.Modules {
+				module.Register(group)
+			}
+		}
+	})
 }
 
 // ===== 全局注册中心 =====
@@ -393,9 +400,13 @@ func Group(engine *gin.Engine, path string, middlewares ...gin.HandlerFunc) *gin
 	return engine.Group(path, middlewares...)
 }
 
-// GroupWithMiddlewareGroup 使用中间件分组创建路由组
+// GroupWithMiddlewareGroup 使用中间件分组创建路由组。
+//
+// H-B 修复：改走 ensureRegistry()（与 Use/RegisterModule/Apply 等所有全局 helper 一致），
+// 把"未初始化"从 nil 解引用 panic 转成可定位的明确 panic（H8a 目标）。原实现用 GetRegistry()
+// 可返回 nil，nil.GetMiddlewareGroup 即 panic，错误信息晦涩。
 func GroupWithMiddlewareGroup(engine *gin.Engine, path string, groupName string) *gin.RouterGroup {
-	middlewares := GetRegistry().GetMiddlewareGroup(groupName)
+	middlewares := ensureRegistry().GetMiddlewareGroup(groupName)
 	return engine.Group(path, middlewares...)
 }
 

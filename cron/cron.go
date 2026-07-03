@@ -143,6 +143,10 @@ func (s *Scheduler) ListTasks() []*Task {
 //
 // 占用 per-task running 守卫，与调度循环互斥，防止同一任务重叠执行（C12b）。
 // 不推进 NextRun（手动触发不影响调度节奏，C12c）。LastRun/RunCount 在锁内更新（C12a）。
+//
+// L-J：handler 收到的 ctx 为调度器 s.ctx。Stop 后 s.ctx 已取消，handler 会收到 canceled
+// ctx——这是预期行为（手动触发在调度器停止后不应继续执行长任务）。调用方若需在 Stop 后
+// 仍运行一次性任务，应在自己的 ctx 下执行而非依赖调度器。
 func (s *Scheduler) RunTask(name string) error {
 	s.mu.Lock()
 	task, ok := s.tasks[name]
@@ -186,18 +190,37 @@ func (s *Scheduler) Start() {
 	go s.run()
 }
 
-// Stop 停止调度器
+// Stop 停止调度器并无限等待在跑任务退出（要求 handler 尊重 ctx.Done）。
+// 若担心某 handler 不响应 ctx 而永久阻塞，请用 StopWithTimeout。
 func (s *Scheduler) Stop() {
+	s.StopWithTimeout(0)
+}
+
+// StopWithTimeout 停止调度器，最多等待 timeout 让在跑任务退出（P1 #10）。
+// 返回 true 表示所有任务已退出；false 表示超时（仍有任务未响应 ctx.Done 而运行）。
+// timeout<=0 等价于无限等待（同 Stop）。幂等：未运行时直接返回 true。
+func (s *Scheduler) StopWithTimeout(timeout time.Duration) bool {
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
-		return
+		return true
 	}
 	s.running = false
 	s.mu.Unlock()
 
 	s.cancel()
-	s.wg.Wait()
+	if timeout <= 0 {
+		s.wg.Wait()
+		return true
+	}
+	done := make(chan struct{})
+	go func() { s.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // run 运行调度循环
@@ -223,10 +246,21 @@ func (s *Scheduler) run() {
 // C12c：占用守卫后**先推进 NextRun**（以上次 NextRun 锚定，非 time.Now()），
 // 避免每周期累积 handler 时长致调度漂移；推进在 spawn 前，下次 tick 不会重复 spawn。
 // C12a：NextRun 推进在写锁内；LastRun/RunCount 在 goroutine 内写锁更新。
+//
+// M-H 修复：锁内只收集到期任务（CAS 占用 + 推进 NextRun + wg.Add），锁外再 spawn。
+// 原实现整个遍历+spawn 持写锁，task 多时阻塞 GetTask/AddTask/RunTask 等管理 API。
+//
+// wg.Add 必须在锁内完成：Stop 先持锁置 running=false 再 wg.Wait，若 wg.Add 在锁外，
+// Stop 可能在两个 due 任务之间读到计数器 0 并提前返回，留下后启动的 goroutine 在调度器
+// 停止后运行（其 wg.Done 还会触发计数器下溢 panic）。锁内 Add 保证 Stop 的 wg.Wait
+// 一定能等到本批全部 goroutine。收集阶段已 CAS 占用守卫并推进 NextRun，故 spawn 必须
+// 执行（否则守卫不释放、NextRun 已推进却未跑）。spawn 用 s.ctx——Stop 后 ctx 已取消，
+// handler 收到 canceled ctx 应及时退出。
 func (s *Scheduler) checkAndRun() {
 	now := time.Now()
 
 	s.mu.Lock()
+	var due []*Task
 	for _, task := range s.tasks {
 		if !task.Enabled || task.NextRun.IsZero() || !now.After(task.NextRun) {
 			continue
@@ -235,9 +269,14 @@ func (s *Scheduler) checkAndRun() {
 		if task.running != nil && !task.running.CompareAndSwap(false, true) {
 			continue
 		}
-		// 先推进 NextRun（以上次 NextRun 锚定防漂移 C12c），再 spawn。
+		// 先推进 NextRun（以上次 NextRun 锚定防漂移 C12c），再收集待 spawn。
 		task.NextRun = task.Schedule.Next(task.NextRun)
-		s.wg.Add(1)
+		s.wg.Add(1) // 锁内 Add，保证 Stop 的 wg.Wait 等到本批（见上方注释）
+		due = append(due, task)
+	}
+	s.mu.Unlock()
+
+	for _, t := range due {
 		go func(t *Task) {
 			defer s.wg.Done()
 			defer func() {
@@ -258,9 +297,8 @@ func (s *Scheduler) checkAndRun() {
 					zap.String("task", t.Name),
 					zap.Error(err))
 			}
-		}(task)
+		}(t)
 	}
-	s.mu.Unlock()
 }
 
 // IntervalSchedule 固定间隔调度
@@ -634,16 +672,20 @@ func Cron(minute, hour string) *CronSchedule {
 	return &CronSchedule{Minute: minute, Hour: hour}
 }
 
-// 全局调度器
-var globalScheduler *Scheduler
-var schedulerOnce sync.Once
+// 全局调度器。用 atomic.Pointer 懒初始化，使 StopGlobalWithTimeout 能安全 peek
+// 是否已创建而不触发创建，也消除原 once+裸指针读写的竞态。
+var globalScheduler atomic.Pointer[Scheduler]
 
-// GetScheduler 获取全局调度器
+// GetScheduler 获取全局调度器（懒初始化，并发安全）。
 func GetScheduler() *Scheduler {
-	schedulerOnce.Do(func() {
-		globalScheduler = NewScheduler()
-	})
-	return globalScheduler
+	if s := globalScheduler.Load(); s != nil {
+		return s
+	}
+	ns := NewScheduler()
+	if globalScheduler.CompareAndSwap(nil, ns) {
+		return ns
+	}
+	return globalScheduler.Load()
 }
 
 // AddTask 添加任务到全局调度器
@@ -656,7 +698,16 @@ func Start() {
 	GetScheduler().Start()
 }
 
-// Stop 停止全局调度器
+// Stop 停止全局调度器（无限等待，见 Scheduler.Stop）。
 func Stop() {
 	GetScheduler().Stop()
+}
+
+// StopGlobalWithTimeout 停止全局调度器并最多等待 timeout（P1 #10）。
+// 全局调度器尚未创建时无操作返回 true，不会因此惰性创建它——供 App.Shutdown 安全调用。
+func StopGlobalWithTimeout(timeout time.Duration) bool {
+	if s := globalScheduler.Load(); s != nil {
+		return s.StopWithTimeout(timeout)
+	}
+	return true
 }

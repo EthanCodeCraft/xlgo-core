@@ -106,7 +106,7 @@ func TestManagerSetPicker(t *testing.T) {
 }
 
 func TestDefaultManagerHealthCheckWithoutInit(t *testing.T) {
-	if err := database.DefaultManager.HealthCheck(context.Background()); err == nil {
+	if err := database.GetDefaultManager().HealthCheck(context.Background()); err == nil {
 		t.Fatal("expected error when health checking uninitialized master")
 	}
 }

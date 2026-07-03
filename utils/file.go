@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -34,11 +33,15 @@ func EnsureDir(path string) error {
 	return os.MkdirAll(path, 0755)
 }
 
-// ReadFile 读取文件内容
+// ReadFile 读取文件内容。
+//
+// M-F 修复：去掉前置 FileExists 检查（TOCTOU 竞态——检查与读取之间文件可能被删除/替换），
+// 直接 os.ReadFile 并返回其错误。文件不存在时返回 *os.PathError，调用方可经
+// errors.Is(err, os.ErrNotExist) 精确判断。
+//
+// 注意：本函数无大小上限（os.ReadFile 语义），读取不可信/超大文件有 OOM 风险——
+// 需限长读取请用 io.ReadAll(io.LimitReader(...))；流式哈希大文件请用 HashFile（已流式）。
 func ReadFile(path string) ([]byte, error) {
-	if !FileExists(path) {
-		return nil, fmt.Errorf("file not found: %s", path)
-	}
 	return os.ReadFile(path)
 }
 

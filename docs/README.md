@@ -2,10 +2,9 @@
 
 | 文档 | 位置 | 说明 |
 |---|---|---|
-| README.md | 仓库根 | 快速开始、功能概览、更新日志 |
+| README.md | 仓库根 | 快速开始、功能概览 |
 | GUIDE.md | 仓库根 | 完整使用指南 |
 | CHANGELOG.md | 仓库根 | 变更日志（遵循 Keep a Changelog） |
-| CLAUDE.md | 仓库根 | Claude Code 协作指引 |
 | docs/plans/ | 本目录 | 历史版本规划与体检报告归档 |
 
 ## docs/plans/ 归档文档

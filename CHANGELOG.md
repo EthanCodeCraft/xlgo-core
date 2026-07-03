@@ -24,6 +24,17 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`database.RedisClient` 不再可外部访问**：包级变量改为 unexported。所有消费者必须通过 `database.GetRedis()` 获取客户端。测试注入使用 `database.SetTestRedisClient(c)` 替代直接赋值。
 - **`xlgo.WithConfig(cfg)` 不再调用 `config.Set(cfg)`**：配置不再写入全局状态。依赖 `config.Get()` 获取注入配置的下游代码需改用 `WithConfigPath`。
 - **`App.Init()` 内部改为 `sync.Once`**：多次调用返回首次执行的结果（含错误），不再是之前的"第二次直接返回 nil"。
+- **`database.DefaultRedis` 类型变更**（database/redis.go）：由 `*RedisManager` 改为 `atomic.Pointer[RedisManager]`，消除裸指针无锁置换的数据竞争（C-1）。下游若直接调用 `DefaultRedis.Init(...)` 等方法需改用 `InitRedis(...)` facade，或 `DefaultRedis.Load().Init(...)`。
+- **`storage.DefaultStorage` 类型变更**（storage/storage.go）：由 `*StorageManager` 改为 `atomic.Pointer[StorageManager]`，与 `config.defaultManager`/`database.DefaultRedis` 并发保护对齐。下游直接调用方法需改用 facade 或 `.Load()`。
+- **`validation.Validator` 类型变更**（validation/validator.go）：由 `*validator.Validate` 改为 `atomic.Pointer[validator.Validate]`，消除无锁读写竞态（H-13）。下游直接读 `validation.Validator.Struct(...)` 需改用 `ValidateStruct(...)`，或 `validation.Validator.Load().Struct(...)`。
+- **`repository.FindWhereOrdered` / `FindPageWhereOrdered` 签名变更**（repository/repository.go）：`args []any` 改为 `args ...any`，与同类方法统一；因 Go 变长参数须为末尾参数，`order` 前置于 `query`。新签名：`FindWhereOrdered(ctx, order, query string, args ...any)`、`FindPageWhereOrdered(ctx, page, pageSize int, order, query string, args ...any)`（H-15）。
+- **`response.Response` 的 `Data`/`RequestID` 去掉 `omitempty`**（response/response.go）：`data` 与 `request_id` 字段在所有响应中恒存在（失败时 `data:null`、未装 RequestID 中间件时 `request_id:""`），下游严格按 schema 解析不再缺字段（M-38/M-39）。
+- **`cache.IsLocked`/`GetLockTTL`/`ForceUnlock` Redis 不可用时改返 `ErrRedisNotReady`**（cache/lock.go，M-E）：原返 `(false/0, nil)` 与"锁确实未占用/已过期"不可区分，调用方可能误以为可获取锁而进入临界区。现统一为：锁操作（正确性相关）Redis 不可用返 `ErrRedisNotReady`，调用方 `errors.Is(err, ErrRedisNotReady)` 区分；cache 数据操作（Get/Set/Incr，性能层）保持 best-effort 静默。
+- **`config.Load()` 返回深拷贝**（config/config.go，M-G）：新增 `(*Config).Clone()` 深拷贝所有切片字段（CORS/Upload/Storage 白名单），`Load()` 与 reload 回调改返 Clone。原"防御性拷贝"为浅拷贝，切片字段与内部 `m.cfg` 共享底层数组，调用方 append/sort/改元素会污染全局。`Get()` 仍返回内部只读指针（热路径零分配），需可变副本用 `Clone()`。
+- **`handler.GetPage` 加 page 上限 10000**（handler/handler.go，M-D）：防 `?page=999999999` 产生超大 OFFSET 拖垮 DB（深分页 DoS）。超过上限钳制到 `MaxPage`，需更深遍历应改游标/keyset 分页。
+- **`utils.EqualsIgnoreCase` 改 `strings.EqualFold`**（utils/strings.go，L-C）：原仅 ASCII 字节折叠，非 ASCII（如 `É`/`é`）误判为不等。现 Unicode 大小写折叠，行为更正确。
+- **`utils.ReadFile` 去 `FileExists` 前置检查**（utils/file.go，M-F）：消除 TOCTOU 竞态，直接 `os.ReadFile`。文件不存在返 `*os.PathError`，调用方改用 `errors.Is(err, os.ErrNotExist)` 判断（原字符串 `"file not found"` 不再返回）。
+- **`database.DefaultManager` 类型变更**（database/manager.go，主线A 收口）：由 `*Manager` 改为 `atomic.Pointer[Manager]`，消除原裸指针（外部直接 `database.DefaultManager = ...` 赋值与请求 goroutine 经 facade 读取）的数据竞争，与 `database.DefaultRedis`/`storage.DefaultStorage`/`cache.defaultCachePtr`/`jwt.defaultManager`/`config.defaultManager` 对齐——框架内包级可变全局一律 atomic.Pointer。新增 `database.SetDefaultManager(m)`（atomic.Store，并发安全）与 `database.GetDefaultManager()`（atomic 读取）。下游若直接调用 `DefaultManager.Init/Master` 等方法需改用 `InitDB`/`GetDB` 等 facade，或 `DefaultManager.Load().Init(...)`，或经 `GetDefaultManager()` 取实例；原 `database.DefaultManager = myDB` 直接赋值改为 `database.SetDefaultManager(myDB)`。
 
 ### Fixed 🐛
 
@@ -35,6 +46,58 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **D3/CK1 Redis 客户端访问竞态与不一致**（database/redis.go, cache/lock.go）：`database.RedisClient` 全局变量在 `Init`/`Close` 中有锁写入但可被外部无锁读取（数据竞态）；`cache/lock.go` 直接引用 `RedisClient` 而非 `GetRedis()`（绕过 RedisManager 抽象）。修复方案：`RedisClient` → unexported `redisClient`；`GetRedis()` 加入回退逻辑（优先 `DefaultRedis.Client()`，回退内部 `redisClient`）；lock.go 全部改为 `rdb := database.GetRedis()` 单次获取 + nil 检查。
 - **M2 Metrics in-flight gauge 泄漏**（middleware/metrics.go）：`httpRequestsInFlight.Inc()` 后无 `defer Dec()`，handler panic 时 gauge 永久膨胀。改为 `Inc()` 后立即 `defer Dec()`，不依赖 Recover 中间件顺序。
 - **R1 FailWithError 丢弃 Detail**（response/error.go）：`FailWithError` 直接 `writeResp(c, err.Code, err.Message, nil)` 丢弃了 `err.Detail`。改为 `resp := err.ToResponse(); writeResp(c, resp.Code, resp.Msg, resp.Data)`。
+
+#### 第二轮：并发纪律红线 + 生命周期/泄漏修复
+
+> 来源：glm_check_report_framework.md 结构性评估。聚焦"包级可变全局统一治理"与"重建路径资源释放"两条主线。
+
+- **C-1/H-4 `database.DefaultRedis` 并发竞态 + `redisClient` 双源**（database/redis.go）：`DefaultRedis` 改 `atomic.Pointer[RedisManager]`（init Store 兜底），所有 facade 经 `Load()`；废弃 `redisClient` 包级变量，`GetRedis` 单源化；`SetTestRedisClient` 改为在当前 manager 上持锁 `setClientForTest` 替换 client，消除双源真相与无锁写竞态。
+- **H-13 `validation.Validator` 无锁读写**（validation/validator.go）：改 `atomic.Pointer[validator.Validate]`；`InitValidator` 先注册全部自定义规则再 Store，确保 Load 得到的 validator 永远完整。
+- **H-11 + 主线A `storage` 死代码全局 + `DefaultStorage` 裸指针**（storage/storage.go）：删除从未被读取的死代码 `var storage Storage`；`DefaultStorage` 改 `atomic.Pointer[StorageManager]`。
+- **H-10 `response.Error.WithDetail` 并发不安全**（response/error.go）：原实现 `e.Detail = detail` mutate 共享的预定义 `Err*`（并发写竞争 + 全局污染）。改为返回新 `*Error` 拷贝。
+- **H-6 `middleware.RedisRateLimiter.failClosed` 数据竞争**（middleware/ratelimit.go）：改 `atomic.Bool`，`SetFailClosed`/`Allow` 全用 atomic，支持运行期并发切换策略。
+- **H-7 `middleware.GetCSRFToken` 裸断言 + 非恒定时间比较**（middleware/csrf.go）：`token.(string)` 改 comma-ok；CSRF token 比较改 `subtle.ConstantTimeCompare`（两处），防时序侧信道。
+- **H-14/M-64/M-65 `trace.Close` sync.Once 泄漏 + Init 回滚不全**（trace/trace.go）：`Close` 去 `sync.Once` 改 Swap+Shutdown，支持 Close→Init→Close 多轮生命周期（原第二次 Close no-op 致 exporter 泄漏）；`Init` `!Enabled` 分支 Swap+Shutdown 旧 provider；传播器失败时不切 otel 全局（移到成功路径末尾），避免指向已 Shutdown provider。
+- **H-8/H-9 `ws.Hub.Stop` double-close panic + WaitGroup Add/Wait 竞态**（ws/ws.go）：`Stop` 用 `sync.Once` 包 `close(stop)`（删除"stopped 标志"虚假注释）；用 `runDone chan` + `runStarted atomic.Bool` 替代 WaitGroup，消除 `wg.Add(0→1)` 与 `wg.Wait` 的 happens-before 竞态，Stop 先于 Run 调用也不泄漏。
+- **H-1 `app.OnReady` 失败资源泄漏**（app.go）：失败时走 `Shutdown()` 释放 HTTP 端口/后台 goroutine/资源，不再直接 return 致监听 goroutine 永久阻塞。
+- **H-2 `app.Go` + `Init` 失败 goroutine 泄漏**（app.go）：`Init` 失败时 cancel rootCtx + 等 wg（10s 超时兜底），通知已通过 `App.Go` 启动的后台 goroutine 退出。
+- **H-12 `utils.HTTPClient.SetSkipTLS` 数据竞争**（utils/http.go）：加 `sync.RWMutex`；`SetSkipTLS`/`SetTimeout` 写锁下重建 client/transport 并释放旧 transport 空闲连接；`do`/`DoWithResponse`/`Close` 读锁快照后无锁调 `Do`。修复注释自承"需重建 Transport"却未重建的不一致。
+
+#### 第三轮：P0 安全阻断 + P1 并发/资源收口（Claude 终审）
+
+> 来源：claude_check_report_framework.md / claude_check_report_module.md。在 deepseek/GLM 修复后的版本上补审，闭合两者共同漏掉的 JWT 算法混淆等安全默认值问题。
+
+- **#1 JWT 算法混淆（alg confusion）**（jwt/jwt.go）：`ParseWithClaims` 统一传 `jwt.WithValidMethods(["HS256","HS384","HS512"])`，keyfunc 内断言 `*jwt.SigningMethodHMAC`，拒绝 alg=none 及非 HMAC 算法（防公钥当 HMAC 密钥伪造 token）。回归 `TestParseTokenRejectsAlgNone`。
+- **#2 JWT 空密钥 fail-closed**（jwt/jwt.go）：新增 `secretKey()`，`GenerateToken*`/`ParseToken*` 空 secret 返 `ErrEmptySecret`。回归 `TestEmptySecretFailsClosed`。
+- **#3 JWT 不支持算法拒绝**（jwt/jwt.go）：`signingMethod` 改返 `(SigningMethod, error)`，RS256 等返 `ErrUnsupportedAlgorithm`，不再静默回退 HS256。回归 `TestUnsupportedAlgorithmFailsClosed`。
+- **#4 上传大小实测封顶**（storage/storage.go）：新增 `enforceUploadSize`/`enforceMaxReader`，本地与 OSS 上传拷贝阶段按实际字节封顶，超限返 `ErrUploadTooLarge` 并清理部分落盘文件。修复原信任客户端 `file.Size` 的绕过。
+- **#5 HTTP header/cookie map 竞态**（utils/http.go）：`SetHeader/SetHeaders/SetCookie` 加写锁，`do/DoWithResponse` 经 `snapshotHeadersCookies()` 读锁快照。
+- **#6 HTTP SSRF 防护**（utils/http.go）：新增 `BlockPrivateNetworks` + `NewSSRFSafeHTTPClient()` + `SetBlockPrivateNetworks()`，经 `net.Dialer.Control` 在连接建立时拦截回环/私有/链路本地/元数据 IP，覆盖重定向每一跳。
+- **#7–#21 P1 并发/资源/泄露收口**：console 写锁（`writeMu`）；config 包级 `Load/LoadWithWatch` `pkgLoadMu` 串行化 + debounce timer Stop；CSRF `ShouldBindBodyWith`（body 可重放）；cron `StopWithTimeout`/`WithCron()` 接入 App 生命周期；database `m.cfg` 经 `getCfg/setCfg` 锁内读写；`isTransientDBError` 移除过宽 `"database"` 子串；router `applyOnce sync.Once` + 版本 map 排序；logger `filterSensitiveQuery` 脱敏；response `SetExposeDetail`（生产隐藏 Detail）；validation 密码 MaxLength=72 + phone 全数字 + `RegisterValidation` `must` 检查；trace noop 包 + `defer span.End()` + `[unmatched]` 低基数 span 名；storage `NewLocalStorage` Abs fail-closed；cmd/xlgo 项目名/模块路径校验 + `os.Exit(1)` + 失败回滚。
+
+#### 第四轮：终审剩余项收口（last_report.md）
+
+> 来源：last_report.md 终审。在第三轮基础上逐项回读核实后修复，均经 `go test -race` 验证。
+
+- **H-A 从库连接池上限截断**（database/manager.go）：`MaxOpenConns/2` 在配置为 1 时得 0（`database/sql` 视 0 为无限制），与"从库减少"意图相反、资源失控。新增 `replicaMaxOpenConns()`：`>0` 取 `max(1, /2)`，`<=0` 与主库一致无限。
+- **H-B `router.GroupWithMiddlewareGroup` nil panic**（router/router.go）：改走 `ensureRegistry()`（与其他全局 helper 一致），把未初始化 nil 解引用 panic 转成可定位错误。
+- **M-A JWT 黑名单无超时 + 吞错**（jwt/jwt.go）：`Add`/`IsBlacklisted` 改用 `context.WithTimeout(1s)`（`blacklistCtx`），把鉴权路径阻塞上限收敛到 1s；`IsBlacklisted` 用 `.Result()` 替代 `.Val()` 显式处理错误（fail-open 保留但记录告警）。
+- **M-B `Recover` 响应已写出时无效写 500**（middleware/recover.go）：加 `c.Writer.Written()` 守卫，已写出时仅 Abort + 记录，避免流式/部分写场景下 `response.Custom` 沦为 no-op 致客户端收到截断响应。
+- **M-C `RedisRateLimiter` 多次 `GetRedis()` nil-deref 窗口**（middleware/ratelimit.go）：`Allow`/`GetCount`/`Reset` 改为取一次 `rdb` 复用，消除两次调用间 `CloseRedis` 致第二次 nil-deref 的窗口。
+- **M-D `handler.GetPage` 深分页 DoS**（handler/handler.go）：加 `page` 上限 `MaxPage=10000`（见 Breaking）。
+- **M-E Redis 不可用失败语义统一**（cache/lock.go，见 Breaking）：锁操作返 `ErrRedisNotReady`；`IsLocked` 用 `.Result()` 返错（合并 L-G）。
+- **M-F `HashFile`/`ReadFile` OOM 与 TOCTOU**（utils/crypto.go, utils/file.go）：`HashFile` 改流式 `io.Copy(h, f)`（恒定内存，可哈希任意大文件）；`ReadFile` 去 `FileExists` 前置检查（见 Breaking）。
+- **M-G `config.Get()` 返回内部指针切片别名**（config/config.go，见 Breaking）：新增 `Clone()`，`Load()` 与 reload 回调返深拷贝；`Get()` 保持热路径零分配返只读指针。
+- **M-H `cron.checkAndRun` 持锁 spawn 阻塞管理 API**（cron/cron.go）：锁内只收集到期任务（CAS + 推进 NextRun + `wg.Add`），锁外 spawn。`wg.Add` 必须在锁内以保证 `Stop` 的 `wg.Wait` 等到本批（否则 Stop 可能在任务间提前返回、后启动 goroutine `wg.Done` 下溢 panic）。
+- **L-A compress 解压残留文件**（compress/compress.go）：`GzipDecompressFileWithOptions`/`unzipFile` 失败时（超限/拷贝错误）`os.Remove` 部分落盘文件，避免被拒炸弹遗留残片。
+- **L-B utils 正则重编译**（utils/validator.go）：`IsPhone`/`IsEmail`/`IsIPv4`/`IsIDCard` 正则提为包级 `MustCompile`，避免每次调用重编译。
+- **L-C `EqualsIgnoreCase` 非 ASCII 误判**（utils/strings.go，见 Breaking）：改 `strings.EqualFold`。
+- **L-D `redisLimiters` 死代码**（middleware/ratelimit.go）：删除从未被读写的包级 `redisLimiters` map 与其 `init()`。
+- **L-E `logger.Logger` 导出变量**（logger/logger.go）：标 `Deprecated:`，引导用包级 `Info/Debug/...` 函数（atomic 读取，并发安全）。
+- **L-H `ws.SetCheckOrigin` 无锁写**（ws/ws.go）：文档明确"仅启动前调用"，运行期切换 Origin 用自有 upgrader 实例。
+- **L-J `cron.RunTask` 用 `s.ctx`**（cron/cron.go）：文档说明 Stop 后 handler 收到 canceled ctx 的预期行为。
+
+> **未修（评估后决定）**：L-K `model` 时间戳 `omitempty`——`encoding/json` 对 `time.Time`（结构体）的 `omitempty` 是 no-op，报告建议的修复无效；真正的修复需改 `*time.Time`（破坏性 + nil 安全隐患），收益与成本不匹配，暂不做。L-I `response.writeResp` nil-c 守卫——nil `*gin.Context` 是程序员错误，panic 是恰当反馈，加静默守卫反而掩盖 bug。L-F/L-M/L-N/L-O 为文档/命名类，已就地注释说明或属设计取舍。
 
 ### Changed 🔄
 

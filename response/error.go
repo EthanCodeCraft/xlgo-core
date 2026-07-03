@@ -87,16 +87,27 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("[%d] %s", e.Code, e.Message)
 }
 
-// WithDetail 添加详细信息
+// WithDetail 添加详细信息。
+//
+// H-10 修复：返回新 *Error 拷贝，不 mutate 接收者。预定义 Err*（如 ErrNotFound）是
+// 包级共享指针，原实现 e.Detail = detail 会污染全局且并发调用存在数据竞争。
 func (e *Error) WithDetail(detail string) *Error {
-	e.Detail = detail
-	return e
+	if e == nil {
+		return &Error{Detail: detail}
+	}
+	return &Error{
+		Code:    e.Code,
+		Message: e.Message,
+		Detail:  detail,
+	}
 }
 
 // ToResponse 转换为响应结构。
 // 把 Detail 放入 data.detail（若非空），保留链路细节（M7：原实现丢 Detail）。
+// P1 #15：仅当 detailExposed()（默认 true；App 生产环境置 false）时才向客户端输出 Detail，
+// 避免内部错误细节在生产泄露。
 func (e *Error) ToResponse() Response {
-	if e.Detail != "" {
+	if e.Detail != "" && detailExposed() {
 		return Response{
 			Code: e.Code,
 			Msg:  e.Message,
@@ -197,7 +208,12 @@ func FailWithError(c *gin.Context, err *Error) {
 	writeResp(c, resp.Code, resp.Msg, resp.Data)
 }
 
-// FailWithDetail 使用预定义错误并添加详细信息
+// FailWithDetail 使用预定义错误并添加详细信息。
+// P1 #15：detail 仅在 detailExposed()（默认 true；App 生产环境置 false）时输出给客户端。
 func FailWithDetail(c *gin.Context, err *Error, detail string) {
-	writeResp(c, err.Code, err.Message, gin.H{"detail": detail})
+	if detailExposed() {
+		writeResp(c, err.Code, err.Message, gin.H{"detail": detail})
+		return
+	}
+	writeResp(c, err.Code, err.Message, nil)
 }

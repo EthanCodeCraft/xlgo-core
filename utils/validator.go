@@ -4,28 +4,29 @@ import (
 	"regexp"
 )
 
+// L-B 修复：正则预编译到包级变量，避免 IsPhone/IsEmail/IsIPv4/IsIDCard 每次调用
+// regexp.MatchString 重编译（高 QPS 下浪费 CPU）。零行为变化。
+var (
+	phoneRE  = regexp.MustCompile(`^1[3-9]\d{9}$`)
+	emailRE  = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+	ipv4RE   = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
+	idCardRE = regexp.MustCompile(`^\d{6}(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$`)
+)
+
 // IsPhone 检查是否为有效的中国大陆手机号
 // 注意: 正则基于当前号段，新号段开放时需更新
 func IsPhone(phone string) bool {
-	// 1开头，第二位为3-9，共11位
-	pattern := `^1[3-9]\d{9}$`
-	matched, _ := regexp.MatchString(pattern, phone)
-	return matched
+	return phoneRE.MatchString(phone)
 }
 
 // IsEmail 检查是否为有效的邮箱地址
 func IsEmail(email string) bool {
-	// 简单邮箱验证：xxx@xxx.xxx
-	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
-	matched, _ := regexp.MatchString(pattern, email)
-	return matched
+	return emailRE.MatchString(email)
 }
 
 // IsIPv4 检查是否为有效的 IPv4 地址
 func IsIPv4(ip string) bool {
-	pattern := `^(\d{1,3}\.){3}\d{1,3}$`
-	matched, _ := regexp.MatchString(pattern, ip)
-	if !matched {
+	if !ipv4RE.MatchString(ip) {
 		return false
 	}
 	// 验证每个段在 0-255 范围内
@@ -42,10 +43,7 @@ func IsIPv4(ip string) bool {
 // IsIDCard 检查是否为有效的中国身份证号（18位）
 // 注意: 仅校验格式，不校验校验位
 func IsIDCard(id string) bool {
-	// 18位身份证：6位地区码 + 8位生日 + 3位顺序码 + 1位校验码
-	pattern := `^\d{6}(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])\d{3}[\dXx]$`
-	matched, _ := regexp.MatchString(pattern, id)
-	return matched
+	return idCardRE.MatchString(id)
 }
 
 // IsChinese 检查字符串是否全部为中文字符

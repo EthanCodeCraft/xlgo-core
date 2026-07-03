@@ -15,10 +15,15 @@ type PasswordConfig struct {
 	RequireSpecial bool // 需要特殊字符
 }
 
-// DefaultPasswordConfig 默认密码配置
+// DefaultPasswordConfig 默认密码配置。
+//
+// P1 #17：MaxLength 由 128 收敛到 72（字节）。bcrypt 在 72 字节处静默截断——
+// 若允许更长密码，两个前 72 字节相同的不同密码会被视为同一密码通过认证。
+// length 用 len()（字节）度量，与 bcrypt 的字节截断口径一致。需支持超长密码时，
+// 应在哈希前先做 SHA-256 预哈希再交给 bcrypt，而非放宽此上限。
 var DefaultPasswordConfig = PasswordConfig{
-	MinLength:      8,   // 最少8位
-	MaxLength:      128, // 最多128位
+	MinLength:      8,  // 最少8位
+	MaxLength:      72, // 最多72字节（bcrypt 截断边界，见上）
 	RequireUpper:   true,
 	RequireLower:   true,
 	RequireDigit:   true,

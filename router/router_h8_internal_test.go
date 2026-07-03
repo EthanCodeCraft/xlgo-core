@@ -29,9 +29,8 @@ func TestApplyIdempotent_H8b(t *testing.T) {
 	r.Apply() // 二次 Apply 必须无 panic
 	r.Apply() // 三次同样
 
-	if !r.applied {
-		t.Fatal("applied flag should be true after Apply")
-	}
+	// 幂等性由下方 runs==1 断言验证（P1 #13：applied bool 已改为 sync.Once，
+	// 无导出标志可查；若 Apply 非幂等则中间件会被重复装入致 runs>1）。
 
 	// 中间件只应被装入一次：请求一次，runs 应为 1（若重复装入则 >1）。
 	w := httptest.NewRecorder()
@@ -41,6 +40,37 @@ func TestApplyIdempotent_H8b(t *testing.T) {
 	}
 	if runs != 1 {
 		t.Fatalf("global middleware ran %d times, want 1 (Apply not idempotent)", runs)
+	}
+}
+
+// TestApplyConcurrent_P1_13 验证并发 Apply 无 data race 且仅生效一次（sync.Once）。
+// 修复前 applied 为裸 bool，多 goroutine 并发 Apply 竞态可重复 engine.Use/重复注册致 panic。
+// 须配合 -race 运行。
+func TestApplyConcurrent_P1_13(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	r := NewRegistry(engine)
+
+	runs := 0
+	r.Use(func(c *gin.Context) { runs++; c.Next() })
+	r.RegisterModuleFunc("p113", func(g *gin.RouterGroup) {
+		g.GET("/p113", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); r.Apply() }()
+	}
+	wg.Wait()
+
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/p113", nil))
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if runs != 1 {
+		t.Fatalf("global middleware ran %d times, want 1 (concurrent Apply not once)", runs)
 	}
 }
 

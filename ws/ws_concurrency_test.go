@@ -377,3 +377,38 @@ func TestHalfOpenConnectionExitsOnClose(t *testing.T) {
 // ===== 辅助：验证 errors 导入被使用 =====
 var _ = errors.New
 var _ = http.StatusOK
+
+// TestHubStopConcurrentNoPanic H-8 回归：并发 Stop 不应 double-close panic。
+// 修复前 Stop 用 select{<-stop/default:close(stop)}，两个 goroutine 都走 default
+// 同时 close → panic。修复后 stopOnce 保证 close 仅一次。
+func TestHubStopConcurrentNoPanic(t *testing.T) {
+	hub := ws.NewHub()
+	go hub.Run()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hub.Stop() // 并发 Stop
+		}()
+	}
+	wg.Wait()
+
+	// 再调一次 Stop（已 stop）也应安全返回
+	hub.Stop()
+}
+
+// TestHubStopBeforeRunNoPanic H-9 回归：Stop 先于 Run 调用，随后 Run 不应
+// 触发 wg 负计数 panic。
+func TestHubStopBeforeRunNoPanic(t *testing.T) {
+	hub := ws.NewHub()
+	hub.Stop() // Run 尚未启动，Wait 立即返回
+
+	// 之后启动 Run（实际场景是误用），应安全退出而非 panic
+	go hub.Run()
+	// 给 Run 一点时间观察到 stop 已 close 并退出
+	time.Sleep(50 * time.Millisecond)
+	// 再次 Stop 确保 wg 归零（Run 的 runOnce 已执行，wg.Add/Done 配对）
+	hub.Stop()
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -311,7 +312,11 @@ func HandleFunc(fn HandlerFunc) gin.HandlerFunc {
 	})
 }
 
-// SetCheckOrigin 设置 Origin 检查函数
+// SetCheckOrigin 设置 Origin 检查函数。
+//
+// L-H：直接写包级 upgrader.CheckOrigin 无锁，与并发 Upgrade（读 upgrader.CheckOrigin）
+// 存在数据竞争。约定仅在 HTTP 服务启动前（init/main 阶段、路由注册前）调用一次，
+// 不要在服务运行期与请求处理并发切换。运行期动态切换 Origin 策略请改用自有 upgrader 实例。
 func SetCheckOrigin(fn func(r *http.Request) bool) {
 	upgrader.CheckOrigin = fn
 }
@@ -325,7 +330,10 @@ type Hub struct {
 	broadcast   chan []byte
 	mu          sync.RWMutex
 	stop        chan struct{}
-	wg          sync.WaitGroup
+	stopOnce    sync.Once       // H-8: 保证 close(stop) 仅一次，并发 Stop 不 double-close panic
+	runOnce     sync.Once       // H-9: 保证 Run 仅执行一次
+	runStarted  atomic.Bool     // H-9: 标记 Run 是否已启动，Stop 据此决定是否等待
+	runDone     chan struct{}   // H-9: Run 退出时 close，替代 WaitGroup 避免 Add/Wait 竞态
 }
 
 // NewHub 创建 Hub
@@ -336,6 +344,7 @@ func NewHub() *Hub {
 		unregister:  make(chan *Connection),
 		broadcast:   make(chan []byte, 256),
 		stop:        make(chan struct{}),
+		runDone:     make(chan struct{}),
 	}
 }
 
@@ -343,61 +352,73 @@ func NewHub() *Hub {
 //
 // W1 修复：新增 stop 退出分支，Stop() 方法 close(stop) 通知退出。
 // 死锁修复（C2a）：广播分支不再向自身 unregister channel 回环。
+//
+// H-9 修复：用 runOnce 守卫 Run 仅执行一次；用 runDone channel 替代 WaitGroup。
+// 原实现 wg.Add(1) 在 Run 内、wg.Wait() 在 Stop 内，二者并发时违反 WaitGroup
+// "Add(正delta且计数器为0) 必须 happens-before Wait" 的约束，-race 必采。
+// 改为 Run 启动时 Store runStarted=true 并在退出时 close(runDone)；Stop 仅在
+// runStarted 为 true 时 <-runDone 等待，未启动则直接返回，无竞态。
 func (h *Hub) Run() {
-	h.wg.Add(1)
-	defer h.wg.Done()
-	for {
-		select {
-		case <-h.stop:
-			// 关闭所有连接后退出
-			h.mu.Lock()
-			for conn := range h.connections {
-				delete(h.connections, conn)
-				conn.Close()
-			}
-			h.mu.Unlock()
-			return
-
-		case conn := <-h.register:
-			h.mu.Lock()
-			h.connections[conn] = true
-			h.mu.Unlock()
-
-		case conn := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.connections[conn]; ok {
-				delete(h.connections, conn)
-				conn.Close()
-			}
-			h.mu.Unlock()
-
-		case message := <-h.broadcast:
-			// 持写锁单次遍历，失败的连接行内移除并关闭，不回环 unregister channel（C2a 修复）。
-			h.mu.Lock()
-			for conn := range h.connections {
-				if err := conn.Send(message); err != nil {
+	h.runOnce.Do(func() {
+		h.runStarted.Store(true)
+		defer close(h.runDone)
+		for {
+			select {
+			case <-h.stop:
+				// 关闭所有连接后退出
+				h.mu.Lock()
+				for conn := range h.connections {
 					delete(h.connections, conn)
 					conn.Close()
 				}
+				h.mu.Unlock()
+				return
+
+			case conn := <-h.register:
+				h.mu.Lock()
+				h.connections[conn] = true
+				h.mu.Unlock()
+
+			case conn := <-h.unregister:
+				h.mu.Lock()
+				if _, ok := h.connections[conn]; ok {
+					delete(h.connections, conn)
+					conn.Close()
+				}
+				h.mu.Unlock()
+
+			case message := <-h.broadcast:
+				// 持写锁单次遍历，失败的连接行内移除并关闭，不回环 unregister channel（C2a 修复）。
+				h.mu.Lock()
+				for conn := range h.connections {
+					if err := conn.Send(message); err != nil {
+						delete(h.connections, conn)
+						conn.Close()
+					}
+				}
+				h.mu.Unlock()
 			}
-			h.mu.Unlock()
 		}
-	}
+	})
 }
 
 // Stop 停止 Hub（W1 修复：优雅退出机制）。
-// close(stop) 通知 Run() 退出，WaitGroup 等待 Run() 完全结束。
-// 幂等：重复调用安全（close 已关闭的 channel 会 panic，
-// 由 Hub 内部 stopped 标志保护——这里的实现依赖 close(stop) 本身由唯一调用者执行）。
+// close(stop) 通知 Run() 退出；若 Run 已启动则等待其完全结束（<-runDone）。
+//
+// H-8 修复：用 stopOnce 保证 close(stop) 仅执行一次。原实现 select{<-stop/default:close(stop)}
+// 在并发 Stop 时两个调用方都可能走 default 分支同时 close → double-close panic；
+// 原注释声称的"stopped 标志保护"实际不存在（文档撒谎）。stopOnce 彻底消除该竞态。
+//
+// H-9 修复：仅在 runStarted 为 true 时等待 runDone；Run 未启动时直接返回，
+// 避免 WaitGroup Add/Wait 竞态，且 Stop 先于 Run 调用后误再调 Run 也不会 panic。
+// 幂等：重复/并发调用安全。
 func (h *Hub) Stop() {
-	select {
-	case <-h.stop:
-		// 已关闭，幂等返回
-		return
-	default:
+	h.stopOnce.Do(func() {
 		close(h.stop)
+	})
+	if h.runStarted.Load() {
+		<-h.runDone
 	}
-	h.wg.Wait()
 }
 
 // Register 注册连接（W1 修复：Hub 已 stop 时 non-blocking 返回，避免永久阻塞）。

@@ -6,9 +6,16 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// writeMu 串行化所有 Console 的写出序列（P1 #7）。
+// 用包级锁而非 per-Console 锁：多个 Console 实例可能共享同一底层 writer（如 stdout），
+// per-Console 锁无法阻止跨实例交错；且 Windows printColor 的"设色→写→复位"三步必须整体
+// 原子，否则并发彩色输出会串色。控制台输出非热路径，单一全局写锁的串行化开销可忽略。
+var writeMu sync.Mutex
 
 // Level 日志级别
 type Level int32
@@ -203,12 +210,15 @@ func (c *Console) print(level Level, s ...any) {
 	// 内容
 	sb.WriteString(fmt.Sprint(s...))
 
-	// 输出
+	// 输出。P1 #7：全局写锁串行化整个写序列，避免并发交错输出；
+	// Windows 下 printColor 的"设色→写→复位"三步也被此锁整体保护，防止串色。
+	writeMu.Lock()
 	if c.isColor {
 		c.printColor(color.Code, sb.String())
 	} else {
 		fmt.Fprintln(c.output, sb.String())
 	}
+	writeMu.Unlock()
 }
 
 // getCaller 获取调用位置
@@ -217,9 +227,8 @@ func (c *Console) getCaller() string {
 	if !ok {
 		return ""
 	}
-	// 只取文件名
-	idx := strings.LastIndex(file, "/")
-	if idx >= 0 {
+	// 只取文件名（兼容 / 与 \ 分隔）
+	if idx := strings.LastIndexAny(file, "/\\"); idx >= 0 {
 		file = file[idx+1:]
 	}
 	return fmt.Sprintf("%s:%d", file, line)

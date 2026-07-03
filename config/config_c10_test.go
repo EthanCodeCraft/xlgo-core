@@ -145,9 +145,9 @@ func TestLoadReturnsDefensiveCopy(t *testing.T) {
 	config.SetDefaultManager(nil)
 }
 
-// TestLoadDefensiveCopySliceContract 固化 C10c 的浅拷贝语义契约：
-// 标量字段独立（修改不污染全局），切片字段共享底层数组（文档化为只读契约，
-// 调用方不得修改切片元素）。本测试锁定该行为，防止未来误改。
+// TestLoadDefensiveCopySliceContract 固化 M-G 的深拷贝语义契约：
+// 标量字段与切片字段均独立（修改不污染全局）。M-G 修复后 Load() 返回 Clone() 深拷贝，
+// 切片字段不再共享底层数组——调用方可安全修改切片元素。本测试锁定该行为，防止回退到浅拷贝。
 func TestLoadDefensiveCopySliceContract(t *testing.T) {
 	content := "app:\n  name: c10slice\nserver:\n  port: 8090\ncors:\n  allowed_origins:\n    - https://a.example.com\n    - https://b.example.com\n"
 	p := writeConfig(t, "c10_slice.yaml", content)
@@ -165,11 +165,16 @@ func TestLoadDefensiveCopySliceContract(t *testing.T) {
 		t.Errorf("scalar polluted = %d, want 8090", got)
 	}
 
-	// 切片共享底层数组（浅拷贝局限）：修改切片元素会污染全局。
-	// 这是文档化的只读契约——本断言锁定该行为，提醒调用方不得改切片元素。
+	// M-G：切片底层数组独立（深拷贝）——修改切片元素不污染全局。
 	cfg.CORS.AllowedOrigins[0] = "https://mutated.example.com"
-	if got := config.Get().CORS.AllowedOrigins[0]; got != "https://mutated.example.com" {
-		t.Errorf("slice backing array should be shared (shallow copy), got %q", got)
+	if got := config.Get().CORS.AllowedOrigins[0]; got != "https://a.example.com" {
+		t.Errorf("slice should be deep-copied (independent), global polluted to %q, want %q", got, "https://a.example.com")
+	}
+
+	// append 也不应污染全局（深拷贝后调用方持独立切片）
+	cfg.CORS.AllowedOrigins = append(cfg.CORS.AllowedOrigins, "https://c.example.com")
+	if got := config.Get().CORS.AllowedOrigins; len(got) != 2 {
+		t.Errorf("global slice length should be unaffected by caller append, got %d, want 2", len(got))
 	}
 
 	config.SetDefaultManager(nil)
