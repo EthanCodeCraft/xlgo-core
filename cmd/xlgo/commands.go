@@ -281,7 +281,7 @@ func createRepository(name, nameTitle string) error {
 	content := fmt.Sprintf(templates.RepositoryMake,
 		nameTitle, name, nameTitle, nameTitle,
 		nameTitle, name, nameTitle, nameTitle, nameTitle, nameTitle,
-		nameTitle, nameTitle, nameTitle,
+		nameTitle, nameTitle,
 	)
 	content = replaceModuleImports(content)
 

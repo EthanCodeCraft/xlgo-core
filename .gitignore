@@ -7,3 +7,11 @@ gitHub_release_*.md
 # 构建产物
 *.exe
 bin/
+claude_check_report_framework.md
+claude_check_report_module.md
+cross_review_assessment.md
+deepseek_check_report_framework.md
+deepseek_check_report_module.md
+glm_check_report_framework.md
+glm_check_report_modelue.md
+last_report.md

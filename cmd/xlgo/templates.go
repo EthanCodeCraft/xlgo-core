@@ -491,14 +491,13 @@ func New%sRepository() *%sRepository {
 	}
 }
 
-// FindByName 根据名称查询
+// FindByName 根据名称查询。
+//
+// 走 BaseRepo.FindOne → readConn 读连接：默认路由到从库（读写分离，H6c），
+// 需读主库用 database.UseMaster(ctx)，事务内自动 join 外层事务。
+// 不要用 r.GetDB() 自行查询——它返回注入的主库且不参与路由（M-35 footgun）。
 func (r *%sRepository) FindByName(ctx context.Context, name string) (*model.%s, error) {
-	var m model.%s
-	err := r.GetDB().WithContext(ctx).Where("name = ?", name).First(&m).Error
-	if err != nil {
-		return nil, err
-	}
-	return &m, nil
+	return r.FindOne(ctx, "name = ?", name)
 }
 `,
 

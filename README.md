@@ -246,7 +246,8 @@ database.InitDBWithReplicas(cfg, []string{
 })
 
 // 读操作自动路由到从库
-users := database.GetReadDB().Find(&users)
+var users []model.User
+database.GetReadDB().Find(&users)
 
 // 强制使用主库
 ctx := database.UseMaster(context.Background())
@@ -818,6 +819,22 @@ docker run -d -p 8080:8080 xlgo-app:latest
 ## 更新日志
 
 > 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### v1.2.0 (2026-07-04)
+
+> **破坏性版本**：4 轮对抗性评审（deepseek / GLM / Claude / 终审）收口的全部 CRITICAL/HIGH/MEDIUM 修复 + 主线A 包级可变全局并发治理统一。`go vet` + `go build` + `go test -race ./...` 全绿。完整变更见 [CHANGELOG.md](./CHANGELOG.md)。
+
+主要破坏性变更（升级前必读）：
+
+- **包级可变全局一律 `atomic.Pointer`**（主线A）：`database.DefaultRedis`/`database.DefaultManager`/`storage.DefaultStorage`/`validation.Validator` 由裸指针改为 `atomic.Pointer[T]`。直接读字段调方法需改用 facade（`InitRedis`/`GetDB`/`ValidateStruct` 等）或 `.Load()`；`database.DefaultManager = x` 改 `database.SetDefaultManager(x)`。
+- **`jwt.DefaultJWT` 包级变量删除** → `GetDefaultJWT()` / `SetDefaultJWTManager()`。
+- **`repository.FindWhereOrdered`/`FindPageWhereOrdered` 签名**：`args []any` → `args ...any`，`order` 前置于 `query`。
+- **`response.Response` 的 `Data`/`RequestID` 去 `omitempty`**：两字段在所有响应中恒存在。
+- **`cache.IsLocked`/`GetLockTTL`/`ForceUnlock`** Redis 不可用改返 `ErrRedisNotReady`（锁操作正确性相关）。
+- **`config.Load()` 返回深拷贝**：新增 `(*Config).Clone()`；`Get()` 仍返只读指针（热路径零分配）。
+- **`handler.GetPage` 加 `page` 上限 10000**；`utils.EqualsIgnoreCase` 改 `strings.EqualFold`；`utils.ReadFile` 去 TOCTOU 前置检查（错误改 `errors.Is(err, os.ErrNotExist)`）。
+
+升级：`go get github.com/EthanCodeCraft/xlgo-core@v1.2.0`（⚠️ 含破坏性变更，详见 CHANGELOG 迁移说明）
 
 ### v1.1.1 (2026-06-23)
 

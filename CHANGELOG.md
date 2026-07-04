@@ -16,8 +16,12 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
-> 框架整体评估后的结构性修复，包含 2 CRITICAL + 12 HIGH + 6 MEDIUM 问题的修复。
-> 项目处于初级阶段，无下游用户，放心引入破坏性变更。
+_暂无未发布变更。_
+
+## [1.2.0] - 2026-07-04
+
+> 框架整体评估后的结构性修复：4 轮对抗性评审（deepseek / GLM / Claude / 终审）收口的全部 CRITICAL/HIGH/MEDIUM 问题 + 主线A 包级可变全局并发治理统一。
+> 项目处于初级阶段，无下游用户，放心引入破坏性变更。`go vet` + `go build` + `go test -race ./...` 全绿。
 
 ### Breaking ⚠️
 
@@ -964,7 +968,8 @@ v1.0.2 引入可插拔方言注册表后，`gorm.io/driver/postgres` 成为直�
 - 基础框架功能
 - 完整示例代码
 
-[Unreleased]: https://github.com/EthanCodeCraft/xlgo-core/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/EthanCodeCraft/xlgo-core/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/EthanCodeCraft/xlgo-core/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/EthanCodeCraft/xlgo-core/releases/tag/v1.1.1
 [1.1.0]: https://github.com/EthanCodeCraft/xlgo-core/releases/tag/v1.1.0
 [1.0.4]: https://github.com/EthanCodeCraft/xlgo-core/releases/tag/v1.0.4

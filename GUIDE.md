@@ -111,7 +111,6 @@ app:
   env: "dev" # dev/test/prod
   debug: true
   base_url: "http://localhost:8080"
-  token_expire: 86400 # Token过期时间(秒)
 
 server:
   port: 8080
@@ -134,7 +133,7 @@ redis:
 
 jwt:
   secret: your_jwt_secret_key
-  expire: 86400
+  expire: "24h" # time.Duration，如 "24h"/"30m"
 
 log:
   dir: ./logs
@@ -701,7 +700,9 @@ if !ok {
 | `max=20`   | 最大长度                              |
 | `email`    | 邮箱格式                              |
 | `phone`    | 手机号格式                            |
+| `phone_strict` | 手机号严格校验（验证运营商号段）   |
 | `password` | 密码强度（8-72 字节，需含大写+小写+数字） |
+| `username` | 字母开头，3-20 位字母/数字/下划线     |
 | `url`      | URL 格式                              |
 | `ip`       | IP 地址格式                           |
 
@@ -1070,7 +1071,8 @@ router.RegisterVersion(router.NewVersion("v1", "/api/v1"))
 // 应用路由
 router.Apply()
 
-xlgo.StartServer(engine, 8080)
+// 启动服务（如需优雅关闭与生命周期管理，改用 app := xlgo.New(...); app.Run()）
+engine.Run(":8080")
 ```
 
 #### 8.4.7 默认路由
@@ -1199,7 +1201,9 @@ storage:
 import "github.com/EthanCodeCraft/xlgo-core/storage"
 
 // 初始化
-storage.Init(&cfg.Storage)
+if err := storage.Init(&cfg.Storage); err != nil {
+    return err
+}
 
 // 上传文件（从请求中获取）
 file, _ := c.FormFile("file")
@@ -1799,13 +1803,17 @@ func Login(c *gin.Context) {
     }
 
     // 生成Token
-    token, _ := jwt.GenerateToken(user.ID, user.Username, "admin", "admin")
+    token, err := jwt.GenerateToken(user.ID, user.Username, "admin", "admin")
+    if err != nil {
+        response.FailWithError(c, response.ErrServerError)
+        return
+    }
 
     // 缓存用户信息
     cache.GetCache().Set(c.Request.Context(),
         cache.KSession(token),
         user,
-        time.Duration(cfg.JWT.Expire)*time.Second)
+        cfg.JWT.Expire)
 
     response.Success(c, gin.H{
         "token":    token,
@@ -1817,5 +1825,5 @@ func Login(c *gin.Context) {
 
 ---
 
-_文档版本: v1.1.1_
-_最后更新: 2026-07-03_
+_文档版本: v1.2.0_
+_最后更新: 2026-07-04_
