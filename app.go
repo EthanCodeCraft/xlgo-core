@@ -2,8 +2,10 @@ package xlgo
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -57,6 +59,26 @@ type staticRoute struct {
 	root         string
 }
 
+// appState 是 App 生命周期状态机（M1）。状态受 lifecycleMu 保护，单调推进：
+//
+//	stateCreated → stateInitializing → stateInitialized → stateStopping → stateStopped
+//	                     ↓ (doInit 失败)
+//	               stateStopping → stateStopped（failAfterInit 回滚）
+//
+// Go() 仅在 state < stateStopping 时放行 wg.Add；Init() 在 state >= stateStopping 时拒绝。
+type appState int32
+
+const (
+	stateCreated appState = iota
+	stateInitializing
+	stateInitialized
+	stateStopping
+	stateStopped
+)
+
+// ErrAppClosed 表示 App 已 Shutdown 或 Init 失败已回滚，拒绝再 Init（M1）。
+var ErrAppClosed = errors.New("xlgo: app already shut down")
+
 // App 应用实例
 type App struct {
 	config        *config.Config
@@ -66,27 +88,48 @@ type App struct {
 	registry      *router.Registry
 	server        *http.Server
 
-	enableLogger       bool
-	enableMySQL        bool
-	enableRedis        bool
-	enableStorage      bool
-	enableHealth       bool
-	enableSwagger      bool
-	enableAutoMigrate  bool
-	enableLiveness     bool
-	enableReadiness    bool
-	enableMetrics      bool
-	enableCron         bool
-	metricsPath        string
+	enableLogger      bool
+	enableMySQL       bool
+	enableRedis       bool
+	enableStorage     bool
+	enableHealth      bool
+	enableSwagger     bool
+	enableAutoMigrate bool
+	enableLiveness    bool
+	enableReadiness   bool
+	enableMetrics     bool
+	enableCron        bool
+	metricsPath       string
 
 	staticRoutes []staticRoute
 	migrators    []Migrator
 	healthChecks []router.HealthCheck
 	hooks        []Hook
 
-	// 初始化同步守卫（A1 修复：sync.Once 替代裸 bool，防止并发 Init 竞态）
-	initOnce sync.Once
-	initErr  error
+	// 生命周期状态机（M1：取代裸 initOnce，解决 Init/Shutdown 并发改资源、
+	// Init-after-Shutdown、App.Go 与 wg.Wait 的 WaitGroup 契约三类缺陷）。
+	// state 受 lifecycleMu 保护；initMu 串行化 doInit/doShutdown 长段，避免并发改资源。
+	// Go() 持 lifecycleMu.RLock 协调 wg.Add 与 Shutdown 的 wg.Wait（Add happens-before Wait）。
+	state       appState
+	lifecycleMu sync.RWMutex
+	initMu      sync.Mutex
+	initErr     error
+
+	// shutdownOnce 确保 doShutdown 单次执行；shutdownErr 缓存结果供并发调用者共享。
+	shutdownOnce sync.Once
+	shutdownErr  error
+
+	initializedLogger bool
+	initializedMySQL  bool
+	initializedRedis  bool
+	initializedCron   bool
+
+	loggerManager  *logger.LogManager
+	loggerSnapshot *logger.DefaultSnapshot
+	dbManager      *database.Manager
+	previousDB     *database.Manager
+	redisManager   *database.RedisManager
+	previousRedis  *database.RedisManager
 
 	// 请求级超时（#19），<=0 表示不启用
 	requestTimeout time.Duration
@@ -207,8 +250,6 @@ func WithoutStorage() Option {
 func WithoutWire() Option {
 	return func(a *App) {}
 }
-
-
 
 // WithAutoMigrate 启用数据库迁移（需配合 WithMigrator/WithModels 注册迁移逻辑）
 func WithAutoMigrate() Option {
@@ -365,31 +406,206 @@ func RunFullStack(opts ...Option) error {
 	return NewFullStack(opts...).Run()
 }
 
-// Init 初始化应用，不启动 HTTP 监听（A1 修复：sync.Once 保证单次执行，并发安全）。
-// 多次调用返回首次执行的结果。
+// Init 初始化应用，不启动 HTTP 监听（M1：状态机 + initMu 保证单次执行与并发安全）。
+// 多次调用：已成功则返回缓存结果；已 Shutdown/Init 失败则返回 ErrAppClosed。
+//
+// initMu 串行化 doInit 与 doShutdown（避免并发改资源）；lifecycleMu 仅短暂持有以翻状态，
+// 不阻塞 Go()（doInit 内 a.Go 只抢 lifecycleMu.RLock）。
+//
+// 注意：生命周期 hook（OnInit/OnStart/OnReady/OnStop）不允许重入调用 Init/Shutdown/Run——
+// initMu 非重入，hook 内调用会自锁死锁（M1 文档约束）。
 func (a *App) Init() error {
-	a.initOnce.Do(func() {
-		a.initErr = a.doInit()
-		if a.initErr != nil {
-			// H-2 修复：Init 失败时 cancel rootCtx 并等待已通过 App.Go 启动的后台 goroutine 退出。
-			// App.Go 不要求 Init 先成功（注释 app.go:337），若不清理，调用方在 Init 失败后
-			// 不调 Run/Shutdown，则 rootCtx 永不 cancel、wg 永不归零，后台 goroutine 永久泄漏。
-			if a.cancel != nil {
-				a.cancel()
-			}
-			waitDone := make(chan struct{})
-			go func() { a.wg.Wait(); close(waitDone) }()
-			select {
-			case <-waitDone:
-			case <-time.After(10 * time.Second):
-				logger.Warnf("Init 失败后等待后台 goroutine 退出超时（10s），可能存在未响应 ctx.Done 的 goroutine")
-			}
-		}
-	})
-	return a.initErr
+	a.initMu.Lock()
+	defer a.initMu.Unlock()
+
+	a.lifecycleMu.Lock()
+	switch a.state {
+	case stateCreated:
+		a.state = stateInitializing
+		a.lifecycleMu.Unlock()
+	case stateInitialized:
+		err := a.initErr
+		a.lifecycleMu.Unlock()
+		return err
+	case stateStopping, stateStopped:
+		a.lifecycleMu.Unlock()
+		return ErrAppClosed
+	default: // stateInitializing — initMu 串行下不可达，防御性返回
+		err := a.initErr
+		a.lifecycleMu.Unlock()
+		return err
+	}
+
+	a.initErr = a.doInit()
+	if a.initErr != nil {
+		a.failAfterInit()
+		return a.initErr
+	}
+
+	a.lifecycleMu.Lock()
+	a.state = stateInitialized
+	a.lifecycleMu.Unlock()
+	return nil
 }
 
-// doInit 执行实际初始化流程。仅在 sync.Once 中调用，不可直接调用。
+// failAfterInit 在 doInit 失败时执行资源回滚（M1）。
+// 顺序：标记 stateStopping（阻新 Go）→ cancel rootCtx → wg.Wait（让 a.Go 启动的探活等
+// goroutine 先退出）→ closeResources。先停 goroutine 再关资源，避免“关 DB 时探活 goroutine
+// 仍在用”的竞态。回滚错误与原 initErr 合并上抛，不吞。
+func (a *App) failAfterInit() {
+	a.lifecycleMu.Lock()
+	a.state = stateStopping
+	a.lifecycleMu.Unlock()
+
+	// H-2：cancel rootCtx 让 a.Go 启动的后台 goroutine 退出，不泄漏。
+	if a.cancel != nil {
+		a.cancel()
+	}
+	waitDone := make(chan struct{})
+	go func() { a.wg.Wait(); close(waitDone) }()
+	select {
+	case <-waitDone:
+	case <-time.After(10 * time.Second):
+		logger.Warnf("Init 失败后等待后台 goroutine 退出超时（10s），可能存在未响应 ctx.Done 的 goroutine")
+	}
+
+	// M1：回滚 doInit 已初始化的资源。cron 显式 5s 超时不卡死回滚；
+	// logger/db/redis 恢复 Init 前默认 manager，再关闭本 App 新建的 manager。
+	if err := a.stopCron(5 * time.Second); err != nil {
+		a.initErr = errors.Join(a.initErr, err)
+	}
+	if rbErr := a.rollbackReplacedResources(); rbErr != nil {
+		a.initErr = errors.Join(a.initErr, fmt.Errorf("回滚已初始化资源失败: %w", rbErr))
+	}
+
+	a.lifecycleMu.Lock()
+	a.state = stateStopped
+	a.lifecycleMu.Unlock()
+}
+
+// closeResources 关闭 db→redis→logger（M1）。各均为幂等 no-op（未 init 时安全），
+// 供 failAfterInit 与 doShutdown 复用。cron 因停止预算随调用方不同（Init 失败 5s /
+// Shutdown 剩余预算），由各调用方单独停止，不在此处。返回聚合错误。
+func (a *App) closeResources() error {
+	var errs []error
+	if a.initializedMySQL {
+		if a.dbManager != nil {
+			if err := a.dbManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		} else if err := database.CloseAll(); err != nil {
+			errs = append(errs, err)
+		}
+		a.initializedMySQL = false
+		a.dbManager = nil
+	}
+	if a.initializedRedis {
+		if a.redisManager != nil {
+			if err := a.redisManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		} else if err := database.CloseRedis(); err != nil {
+			errs = append(errs, err)
+		}
+		a.initializedRedis = false
+		a.redisManager = nil
+	}
+	if a.initializedLogger {
+		if a.loggerManager != nil {
+			if err := a.loggerManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		} else if err := logger.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		a.initializedLogger = false
+		a.loggerManager = nil
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) rollbackReplacedResources() error {
+	var errs []error
+	if a.initializedMySQL {
+		if a.previousDB != nil {
+			database.SetDefaultManager(a.previousDB)
+		}
+		if a.dbManager != nil {
+			if err := a.dbManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.dbManager = nil
+		a.previousDB = nil
+		a.initializedMySQL = false
+	}
+	if a.initializedRedis {
+		if a.previousRedis != nil {
+			database.SetDefaultRedisManager(a.previousRedis)
+		}
+		if a.redisManager != nil {
+			if err := a.redisManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.redisManager = nil
+		a.previousRedis = nil
+		a.initializedRedis = false
+	}
+	if a.initializedLogger {
+		if err := logger.RestoreDefaultSnapshot(a.loggerSnapshot); err != nil {
+			errs = append(errs, err)
+		}
+		a.loggerManager = nil
+		a.loggerSnapshot = nil
+		a.initializedLogger = false
+	}
+	return errors.Join(errs...)
+}
+
+func (a *App) commitReplacedResources() {
+	if a.previousDB != nil {
+		if err := a.previousDB.Close(); err != nil {
+			logger.Warnf("关闭被替换的旧数据库 manager 失败: %v", err)
+		}
+		a.previousDB = nil
+	}
+	if a.previousRedis != nil {
+		if err := a.previousRedis.Close(); err != nil {
+			logger.Warnf("关闭被替换的旧 Redis manager 失败: %v", err)
+		}
+		a.previousRedis = nil
+	}
+	if a.loggerSnapshot != nil {
+		if err := logger.CloseDefaultSnapshot(a.loggerSnapshot); err != nil {
+			logger.Warnf("关闭被替换的旧 logger writer 失败: %v", err)
+		}
+		a.loggerSnapshot = nil
+	}
+}
+
+func (a *App) stopCron(timeout time.Duration) error {
+	if !a.initializedCron {
+		return nil
+	}
+	a.initializedCron = false
+	if !cron.StopGlobalWithTimeout(timeout) {
+		return fmt.Errorf("cron 调度器停止超时（%s）", timeout)
+	}
+	return nil
+}
+
+func (a *App) shutdownAfterStartFailure(startErr error) error {
+	if startErr == nil {
+		return nil
+	}
+	if shutErr := a.Shutdown(); shutErr != nil {
+		return fmt.Errorf("%w (关闭错误: %v)", startErr, shutErr)
+	}
+	return startErr
+}
+
+// doInit 执行实际初始化流程。仅在 Init 持有 initMu 并完成状态切换后调用，不可直接调用。
 func (a *App) doInit() error {
 	cfg, err := a.resolveConfig()
 	if err != nil {
@@ -400,33 +616,45 @@ func (a *App) doInit() error {
 	}
 
 	if a.enableLogger {
-		if err := logger.Init(cfg); err != nil {
+		lm := logger.NewLogManager()
+		snapshot := logger.SnapshotDefault()
+		if err := lm.InitPreservingPrevious(cfg); err != nil {
 			return fmt.Errorf("初始化日志失败: %w", err)
 		}
+		logger.SetDefaultLogManager(lm)
+		a.loggerManager = lm
+		a.loggerSnapshot = snapshot
+		a.initializedLogger = true
 	}
 
 	if a.enableMySQL {
-		if err := database.InitDB(cfg); err != nil {
+		dbm := database.NewManager(cfg)
+		if err := dbm.InitDB(cfg); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
 		}
+		a.previousDB = database.GetDefaultManager()
+		database.SetDefaultManager(dbm)
+		a.dbManager = dbm
+		a.initializedMySQL = true
 		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "mysql", Check: func(ctx context.Context) error {
 			// 优先读探活缓存标记（#21），避免每次探针都同步 ping
-			if !database.IsDBHealthy() {
+			if !dbm.IsHealthy() {
 				return errors.New("mysql 主库探活不健康")
 			}
-			status := database.HealthCheck()
-			if !status["master"] {
-				return errors.New("mysql 主库不可用")
-			}
-			return nil
+			return dbm.HealthCheck(ctx)
 		}})
 	}
 
 	if a.enableRedis {
-		if err := database.InitRedis(cfg); err != nil {
+		rm := database.NewRedisManager()
+		if err := rm.Init(cfg); err != nil {
 			return fmt.Errorf("初始化 Redis 失败: %w", err)
 		}
-		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "redis", Check: database.HealthCheckRedis})
+		a.previousRedis = database.GetDefaultRedisManager()
+		database.SetDefaultRedisManager(rm)
+		a.redisManager = rm
+		a.initializedRedis = true
+		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "redis", Check: rm.HealthCheck})
 	}
 
 	if a.enableStorage {
@@ -510,12 +738,13 @@ func (a *App) doInit() error {
 
 	// 启动主库/从库探活后台循环（#21），ctx 在 Shutdown 时取消
 	if a.enableMySQL {
-		a.Go(database.StartDBProbing)
+		a.Go(a.dbManager.StartProbing)
 	}
 
 	// 启动 cron 全局调度器（P1 #10），Shutdown 时统一停止。任务须在此前经 cron.AddTask 注册。
 	if a.enableCron {
 		cron.Start()
+		a.initializedCron = true
 	}
 
 	// OnInit hooks：组件初始化完成后触发（#12）
@@ -526,6 +755,7 @@ func (a *App) doInit() error {
 			}
 		}
 	}
+	a.commitReplacedResources()
 	return nil
 }
 
@@ -560,7 +790,7 @@ func (a *App) Run() error {
 	if err := a.Init(); err != nil {
 		return err
 	}
-	return a.StartServer()
+	return a.shutdownAfterStartFailure(a.StartServer())
 }
 
 // StartServer 启动 HTTP 服务器（支持优雅关闭）
@@ -591,13 +821,37 @@ func (a *App) StartServer() error {
 	for _, h := range a.hooks {
 		if h.OnStart != nil {
 			if err := h.OnStart(a); err != nil {
-				return fmt.Errorf("OnStart hook %q 失败: %w", h.Name, err)
+				return a.shutdownAfterStartFailure(fmt.Errorf("OnStart hook %q 失败: %w", h.Name, err))
 			}
 		}
 	}
 
+	network := "tcp"
+	address := a.server.Addr
+	if useUnix {
+		network = "unix"
+		address = srvCfg.UnixSocket
+	}
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		return a.shutdownAfterStartFailure(fmt.Errorf("服务器监听失败: %w", err))
+	}
+	if srvCfg.TLS.Enabled {
+		cert, err := tls.LoadX509KeyPair(srvCfg.TLS.CertFile, srvCfg.TLS.KeyFile)
+		if err != nil {
+			_ = ln.Close()
+			return a.shutdownAfterStartFailure(fmt.Errorf("服务器 TLS 配置无效: %w", err))
+		}
+		ln = tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+	}
+
 	serverErr := make(chan error, 1)
+	serveStarted := make(chan struct{})
 	go func() {
+		close(serveStarted)
 		if useUnix {
 			logger.Infof("服务器启动，监听 unix socket %s", srvCfg.UnixSocket)
 		} else if srvCfg.Host != "" {
@@ -605,31 +859,36 @@ func (a *App) StartServer() error {
 		} else {
 			logger.Infof("服务器启动，监听端口 %d（所有接口）", srvCfg.Port)
 		}
-		var err error
-		if srvCfg.TLS.Enabled {
-			err = a.server.ListenAndServeTLS(srvCfg.TLS.CertFile, srvCfg.TLS.KeyFile)
-		} else {
-			err = a.server.ListenAndServe()
-		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+		serveErr := a.server.Serve(ln)
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			serverErr <- serveErr
 			return
 		}
 		serverErr <- nil
 	}()
+	<-serveStarted
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			return a.shutdownAfterStartFailure(fmt.Errorf("服务器启动失败: %w", err))
+		}
+		return nil
+	default:
+	}
 
-	// OnReady hooks：端口就绪后（A2 修复：失败时触发 shutdown）
+	// OnReady hooks：listener 已成功创建，Serve goroutine 已启动（M1）。
 	for _, h := range a.hooks {
 		if h.OnReady != nil {
 			if err := h.OnReady(a); err != nil {
 				logger.Errorf("OnReady hook %q 失败: %v", h.Name, err)
 				// H-1 修复：失败时走 Shutdown 释放 HTTP 端口、后台 goroutine 与已初始化资源，
-				// 避免监听 goroutine 永久阻塞在 ListenAndServe 致端口/goroutine 泄漏。
+				// 避免监听 goroutine 永久阻塞在 Serve 致端口/goroutine 泄漏。
 				// 不再向 serverErr 写入——监听 goroutine 在 Shutdown 后会写 nil 到 serverErr（cap=1），
 				// 若此处也写则第二次写阻塞致 goroutine 泄漏。
 				if shutErr := a.Shutdown(); shutErr != nil {
 					return fmt.Errorf("OnReady hook %q 失败: %w (关闭错误: %v)", h.Name, err, shutErr)
 				}
+				_ = ln.Close()
 				return fmt.Errorf("OnReady hook %q 失败: %w", h.Name, err)
 			}
 		}
@@ -642,7 +901,7 @@ func (a *App) StartServer() error {
 	select {
 	case err := <-serverErr:
 		if err != nil {
-			return fmt.Errorf("服务器启动失败: %w", err)
+			return a.shutdownAfterStartFailure(fmt.Errorf("服务器启动失败: %w", err))
 		}
 		return nil
 	case sig := <-quit:
@@ -651,8 +910,40 @@ func (a *App) StartServer() error {
 	}
 }
 
-// Shutdown 优雅关闭应用
+// Shutdown 优雅关闭应用（M1：幂等 + 与 Init 互斥）。
+// shutdownOnce 保证 doShutdown 单次执行，并发调用者阻塞至首个完成后返回同一 shutdownErr。
+// initMu 串行化 doShutdown 与 doInit，避免并发改资源。
+//
+// 注意：生命周期 hook 不允许重入调用 Init/Shutdown/Run——initMu 非重入，hook 内调用会自锁。
 func (a *App) Shutdown() error {
+	a.shutdownOnce.Do(func() {
+		a.initMu.Lock()
+		defer a.initMu.Unlock()
+
+		a.lifecycleMu.Lock()
+		if a.state >= stateStopping {
+			// shutdownOnce 已保证单次，此处不可达；防御性直接返回。
+			a.lifecycleMu.Unlock()
+			return
+		}
+		wasInitialized := a.state == stateInitialized
+		a.state = stateStopping
+		a.lifecycleMu.Unlock()
+
+		a.shutdownErr = a.doShutdown(wasInitialized)
+
+		a.lifecycleMu.Lock()
+		a.state = stateStopped
+		a.lifecycleMu.Unlock()
+	})
+	return a.shutdownErr
+}
+
+// doShutdown 执行实际关闭流程。仅在 Shutdown（持 initMu）中调用。
+// 顺序（M1 调整）：OnStop（仅 Init 曾成功时）→ cancel rootCtx → server.Shutdown →
+// wg.Wait → cron / 限流器 / db / redis / logger。OnStop 在 shutdown 开头、关 HTTP 之前，
+// 保有 cancel 前协调资源的机会；state=Stopping 已阻新 Go，无需先 cancel/wait 再跑 hook。
+func (a *App) doShutdown(wasInitialized bool) error {
 	shutdownTimeout := 30 * time.Second
 	if a.config != nil {
 		shutdownTimeout = a.config.Server.EffectiveShutdownTimeout()
@@ -662,11 +953,14 @@ func (a *App) Shutdown() error {
 
 	var errs []error
 
-	// OnStop hooks：关 HTTP 之前触发（#12）
-	for _, h := range a.hooks {
-		if h.OnStop != nil {
-			if err := h.OnStop(a); err != nil {
-				errs = append(errs, fmt.Errorf("OnStop hook %q 失败: %w", h.Name, err))
+	// OnStop hooks：Shutdown 开头，关 HTTP 之前触发（#12）。仅 Init 曾成功时执行（M1）——
+	// Init 失败/未 Init 时 HTTP 从未启动，OnStop 语义不适用。
+	if wasInitialized {
+		for _, h := range a.hooks {
+			if h.OnStop != nil {
+				if err := h.OnStop(a); err != nil {
+					errs = append(errs, fmt.Errorf("OnStop hook %q 失败: %w", h.Name, err))
+				}
 			}
 		}
 	}
@@ -700,7 +994,7 @@ func (a *App) Shutdown() error {
 	}
 
 	// 停止 cron 全局调度器（P1 #10），在剩余 shutdown 预算内等待在跑任务退出。
-	if a.enableCron {
+	if a.initializedCron {
 		logger.Info("停止 cron 调度器...")
 		remaining := time.Second
 		if dl, ok := ctx.Deadline(); ok {
@@ -708,7 +1002,7 @@ func (a *App) Shutdown() error {
 				remaining = r
 			}
 		}
-		if !cron.StopGlobalWithTimeout(remaining) {
+		if err := a.stopCron(remaining); err != nil {
 			logger.Warnf("cron 调度器停止超时，可能有任务未响应 ctx 取消")
 		}
 	}
@@ -716,18 +1010,11 @@ func (a *App) Shutdown() error {
 	logger.Info("停止限流器...")
 	middleware.StopRateLimiters()
 
-	logger.Info("关闭数据库连接...")
-	if err := database.CloseAll(); err != nil {
-		errs = append(errs, err)
-	}
-	if err := database.CloseRedis(); err != nil {
-		errs = append(errs, err)
-	}
-
-	logger.Info("关闭日志...")
-	// 先记录最后一条 "应用已优雅关闭"，再 Close（关闭后写日志会 fall back 到 nop）
+	// db/redis/logger 经 closeResources 统一关闭（与 failAfterInit 复用，M1）。
+	// 先记最后一条 "应用已优雅关闭"，再 Close（关闭后写日志会 fall back 到 nop）。
+	logger.Info("关闭数据库连接/Redis/日志...")
 	logger.Info("应用已优雅关闭")
-	if err := logger.Close(); err != nil {
+	if err := a.closeResources(); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -735,9 +1022,15 @@ func (a *App) Shutdown() error {
 
 // Go 启动一个受 App 生命周期管理的后台 goroutine（#22）。
 // fn 收到的 ctx 在 Shutdown 时被 cancel，fn 应在 ctx.Done() 时及时退出。
-// Shutdown 会等待所有 App.Go 启动的 goroutine 退出（带 ShutdownTimeout 超时）。
+// Shutdown/Init 失败后调用为 no-op（M1：state>=stateStopping 拒绝 wg.Add，避免与
+// Shutdown 的 wg.Wait 竞争 WaitGroup 契约——Add 由 lifecycleMu.RLock 保护 happen-before Wait）。
 func (a *App) Go(fn func(ctx context.Context)) {
 	if fn == nil {
+		return
+	}
+	a.lifecycleMu.RLock()
+	if a.state >= stateStopping {
+		a.lifecycleMu.RUnlock()
 		return
 	}
 	ctx := a.rootCtx
@@ -745,6 +1038,7 @@ func (a *App) Go(fn func(ctx context.Context)) {
 		ctx = context.Background()
 	}
 	a.wg.Add(1)
+	a.lifecycleMu.RUnlock()
 	go func() {
 		defer a.wg.Done()
 		fn(ctx)

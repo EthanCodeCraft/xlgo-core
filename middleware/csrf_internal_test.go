@@ -87,3 +87,148 @@ func TestCSRFJSONBodyPreservedForDownstream(t *testing.T) {
 		t.Errorf("downstream read data=%q, want 'hello-downstream' (P1 #9: body must survive CSRF)", gotData)
 	}
 }
+
+func TestCSRFJSONBodyTooLargeRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CSRF(CSRFConfig{MaxBodyBytes: 16}))
+	r.POST("/action", func(c *gin.Context) { c.JSON(200, gin.H{"status": "ok"}) })
+
+	body := `{"_csrf":"token","data":"` + strings.Repeat("x", 64) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/action", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: CSRFCookieName, Value: "token"})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestCSRFNegativeTokenLengthFallsBack(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CSRF(CSRFConfig{TokenLength: -1}))
+	r.GET("/form", func(c *gin.Context) { c.JSON(200, gin.H{"token": GetCSRFToken(c)}) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/form", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if len(w.Result().Cookies()) == 0 {
+		t.Fatal("expected csrf cookie to be set")
+	}
+}
+
+func TestCSRFCookieSameSiteLax(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CSRF())
+	r.GET("/form", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/form", nil))
+	for _, c := range w.Result().Cookies() {
+		if c.Name == CSRFCookieName {
+			if c.SameSite != http.SameSiteLaxMode {
+				t.Fatalf("SameSite = %v, want Lax", c.SameSite)
+			}
+			return
+		}
+	}
+	t.Fatal("csrf cookie not set")
+}
+
+func TestCSRFPartialConfigKeepsCookieDefaults(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CSRF(CSRFConfig{TokenLength: -1}))
+	r.GET("/form", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/form", nil))
+	for _, c := range w.Result().Cookies() {
+		if c.Name == CSRFCookieName {
+			if c.SameSite != http.SameSiteLaxMode {
+				t.Fatalf("SameSite = %v, want Lax for partial config", c.SameSite)
+			}
+			if c.MaxAge != DefaultCSRFConfig.MaxAge {
+				t.Fatalf("MaxAge = %d, want %d for partial config", c.MaxAge, DefaultCSRFConfig.MaxAge)
+			}
+			return
+		}
+	}
+	t.Fatal("csrf cookie not set")
+}
+
+func TestDoubleSubmitCookieSameSiteLax(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(DoubleSubmitCookie())
+	r.GET("/get", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/get", nil))
+	for _, c := range w.Result().Cookies() {
+		if c.Name == CSRFCookieName {
+			if c.SameSite != http.SameSiteLaxMode {
+				t.Fatalf("SameSite = %v, want Lax", c.SameSite)
+			}
+			return
+		}
+	}
+	t.Fatal("csrf cookie not set")
+}
+
+func TestCSRFWithSkipAnchorsPathBoundary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(CSRFWithSkip([]string{"/api"}))
+	r.POST("/api", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	r.POST("/api/users", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	r.POST("/apix", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+	for _, path := range []string{"/api", "/api/users"} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, nil))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("%s status = %d, want skipped 204", path, w.Code)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/apix", nil))
+	if w.Code == http.StatusNoContent {
+		t.Fatal("/apix was skipped by /api prefix; want CSRF rejection")
+	}
+}
+
+func TestGenerateAPITokenCleansExpiredTokens(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	expiredToken := "expired-before-issue"
+	apiTokensMu.Lock()
+	apiTokens[expiredToken] = time.Now().Add(-(apiTokenTTL + time.Second))
+	apiTokensMu.Unlock()
+	defer func() {
+		apiTokensMu.Lock()
+		delete(apiTokens, expiredToken)
+		apiTokensMu.Unlock()
+	}()
+
+	r := gin.New()
+	r.GET("/csrf-token", GenerateAPIToken)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/csrf-token", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	apiTokensMu.RLock()
+	_, exists := apiTokens[expiredToken]
+	apiTokensMu.RUnlock()
+	if exists {
+		t.Fatal("GenerateAPIToken did not clean expired token")
+	}
+}

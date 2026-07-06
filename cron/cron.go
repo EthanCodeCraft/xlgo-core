@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,6 +140,20 @@ func (s *Scheduler) ListTasks() []*Task {
 	return tasks
 }
 
+// executeTask 在 exec 边界运行 task handler；recover 捕获 panic 转为 error（含调用栈），
+// 防止调度 goroutine 内未 recover 的 panic 终止整个进程（M13）。
+// 命名返回值让 defer 在 panic 时改写 err。两侧调用点（RunTask / checkAndRun goroutine）
+// 共用此边界，panic 一律转为 error 记入 LastError 并向上返回，不破坏 running 守卫与 wg.Done
+// （recover 在本函数内部完成，外侧 defer 仍正常执行）。
+func (s *Scheduler) executeTask(t *Task) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("cron task %q panic recovered: %v\n%s", t.Name, r, debug.Stack())
+		}
+	}()
+	return t.Handler(s.ctx)
+}
+
 // RunTask 立即运行任务（手动触发，同步返回 handler 错误）。
 //
 // 占用 per-task running 守卫，与调度循环互斥，防止同一任务重叠执行（C12b）。
@@ -166,11 +181,12 @@ func (s *Scheduler) RunTask(name string) error {
 		}
 	}()
 
-	err := task.Handler(s.ctx)
+	err := s.executeTask(task)
 
 	s.mu.Lock()
 	task.LastRun = time.Now()
 	task.RunCount++
+	task.LastError = err // M13: 手动路径也记 LastError（与调度路径对齐）
 	s.mu.Unlock()
 
 	return err
@@ -285,7 +301,7 @@ func (s *Scheduler) checkAndRun() {
 				}
 			}()
 
-			err := t.Handler(s.ctx)
+			err := s.executeTask(t)
 
 			s.mu.Lock()
 			t.LastRun = time.Now()

@@ -2,8 +2,8 @@ package utils
 
 import (
 	"bytes"
-	"crypto/md5"
-	"crypto/sha1"
+	"crypto/md5"  // #nosec G501 -- exported checksum helper for non-password/non-security use; callers needing security should use SHA256/HMAC.
+	"crypto/sha1" // #nosec G505 -- exported checksum helper for legacy/non-security use; callers needing security should use SHA256/HMAC.
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -20,6 +20,7 @@ func MD5(s string) string {
 
 // MD5Bytes 计算字节数组的 MD5 哈希值
 func MD5Bytes(data []byte) string {
+	// #nosec G401 -- MD5 helper is retained for legacy checksums, not password storage or security decisions.
 	h := md5.New()
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
@@ -28,6 +29,7 @@ func MD5Bytes(data []byte) string {
 // SHA1 计算字符串的 SHA1 哈希值
 // 注意: 不应用于密码存储
 func SHA1(s string) string {
+	// #nosec G401 -- SHA1 helper is retained for legacy checksums, not password storage or security decisions.
 	h := sha1.New()
 	h.Write([]byte(s))
 	return hex.EncodeToString(h.Sum(nil))
@@ -53,6 +55,7 @@ func SHA256Bytes(data []byte) string {
 // 流式哈希内存占用恒定、可处理任意大小文件，与 hash.Hash 的 io.Writer 接口契合。
 // 调用方负责选择哈希算法（如 sha256.New）。
 func HashFile(path string, newHash func() hash.Hash) (string, error) {
+	// #nosec G304 -- generic hashing helper intentionally opens caller-provided trusted local paths.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err

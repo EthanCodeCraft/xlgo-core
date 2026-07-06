@@ -9,10 +9,12 @@ import (
 
 func writeFile(path, content string) error {
 	dir := filepath.Dir(path)
+	// #nosec G301,G703 -- path is built by makeFile from fixed scaffold directories and a name that rejects separators/".."; 0755 is intentional for generated dirs.
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("创建目录失败: %w", err)
 	}
 
+	// #nosec G306,G703 -- path is built by makeFile from fixed scaffold directories and a validated name; 0644 is intentional for generated source files.
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return fmt.Errorf("写入文件失败: %w", err)
 	}
@@ -20,6 +22,7 @@ func writeFile(path, content string) error {
 }
 
 func fileExists(path string) bool {
+	// #nosec G703 -- path is built by makeFile from fixed scaffold directories and a name that rejects separators/"..".
 	_, err := os.Stat(path)
 	if err == nil {
 		return true

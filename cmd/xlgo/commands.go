@@ -18,6 +18,7 @@ func createProject(name string) error {
 	if err := validateProjectName(name); err != nil {
 		return err
 	}
+	// #nosec G703 -- name was validated by validateProjectName: no path separators, no "..", no leading dot, Go identifier only.
 	if _, err := os.Stat(name); !os.IsNotExist(err) {
 		return fmt.Errorf("目录 %s 已存在", name)
 	}
@@ -74,7 +75,9 @@ func createProject(name string) error {
 	}
 
 	for _, dir := range dirs {
+		// #nosec G301,G703 -- dir is built from validated project name plus fixed scaffold subdirectories; 0755 is intentional for generated project dirs.
 		if err := os.MkdirAll(dir, 0755); err != nil {
+			// #nosec G703 -- name was validated by validateProjectName and is the scaffold root being rolled back.
 			_ = os.RemoveAll(name) // P1 #21：清理半成品
 			return fmt.Errorf("创建目录失败: %w", err)
 		}
@@ -115,6 +118,7 @@ func createProject(name string) error {
 
 	for path, content := range files {
 		if err := renderTemplateFile(path, content, data); err != nil {
+			// #nosec G703 -- name was validated by validateProjectName and is the scaffold root being rolled back.
 			_ = os.RemoveAll(name) // P1 #21：部分失败回滚，避免留下半成品项目
 			return err
 		}
@@ -135,6 +139,7 @@ func renderTemplateFile(path, content string, data TemplateData) (retErr error) 
 	if err != nil {
 		return fmt.Errorf("解析模板 %s 失败: %w", path, err)
 	}
+	// #nosec G304 -- path is from createProject's files map built from validated project name plus fixed filenames.
 	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("创建文件 %s 失败: %w", path, err)

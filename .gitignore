@@ -1,17 +1,16 @@
 # Claude Code 协作指引（本地，不入库）
 CLAUDE.md
 
+AGENTS.md
+
 # 临时发版辅助文件
 gitHub_release_*.md
 
 # 构建产物
 *.exe
 bin/
-claude_check_report_framework.md
-claude_check_report_module.md
-cross_review_assessment.md
-deepseek_check_report_framework.md
-deepseek_check_report_module.md
-glm_check_report_framework.md
-glm_check_report_modelue.md
-last_report.md
+md/
+.gocache/
+gpt_check_report_framework.md
+gpt_check_report_review.md
+gpt_check_report_module.md

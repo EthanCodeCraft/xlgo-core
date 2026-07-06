@@ -2,10 +2,11 @@ package database
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,7 +38,8 @@ type ReplicaPicker interface {
 
 // RoundRobinPicker 轮询选择从库
 type RoundRobinPicker struct {
-	counter uint64
+	mu      sync.Mutex
+	counter int
 }
 
 // Pick 轮询选择一个从库
@@ -45,8 +47,11 @@ func (p *RoundRobinPicker) Pick(replicas []*gorm.DB) *gorm.DB {
 	if len(replicas) == 0 {
 		return nil
 	}
-	n := atomic.AddUint64(&p.counter, 1)
-	return replicas[int(n-1)%len(replicas)]
+	p.mu.Lock()
+	idx := p.counter % len(replicas)
+	p.counter = (idx + 1) % len(replicas)
+	p.mu.Unlock()
+	return replicas[idx]
 }
 
 // RandomPicker 随机选择从库。
@@ -60,7 +65,11 @@ func (p *RandomPicker) Pick(replicas []*gorm.DB) *gorm.DB {
 	if len(replicas) == 0 {
 		return nil
 	}
-	return replicas[rand.Intn(len(replicas))]
+	n, err := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(len(replicas))))
+	if err != nil {
+		return replicas[0]
+	}
+	return replicas[int(n.Int64())]
 }
 
 // Manager 数据库管理器，持有主库与从库连接实例
@@ -334,6 +343,12 @@ func closeDB(db *gorm.DB) error {
 	return sqlDB.Close()
 }
 
+func warnCloseDB(db *gorm.DB, context string) {
+	if err := closeDB(db); err != nil {
+		logger.Warnf("%s: %v", context, err)
+	}
+}
+
 // Close 关闭主库与全部从库连接，并重置从库健康状态。
 // 字段置空在锁内完成（保证新读取得到 nil），实际关闭在锁外执行避免持锁阻塞。
 func (m *Manager) Close() error {
@@ -439,7 +454,7 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 			sqlDB, err := db.DB()
 			if err != nil {
 				lastErr = err
-				_ = closeDB(db) // C11b: 关闭刚打开的池，避免下轮泄漏
+				warnCloseDB(db, "关闭刚打开的数据库连接池失败") // C11b: 关闭刚打开的池，避免下轮泄漏
 			} else {
 				sqlDB.SetMaxIdleConns(cfg.Database.MaxIdleConns)
 				sqlDB.SetMaxOpenConns(cfg.Database.MaxOpenConns)
@@ -455,7 +470,7 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 					m.master = db
 					m.mu.Unlock()
 					m.healthy.Store(true) // Ping 通过才标记健康（#21）
-					_ = closeDB(old)
+					warnCloseDB(old, "关闭旧数据库主库连接池失败")
 					logger.Info("数据库主库连接成功",
 						zap.String("driver", driverDescription(cfg.Database.Driver)),
 						zap.String("host", cfg.Database.Host),
@@ -464,7 +479,7 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 				} else {
 					// Ping 失败（如服务端暂时不可达）视作可重试
 					lastErr = err
-					_ = closeDB(db) // C11b: 关闭刚打开的池，避免下轮覆盖泄漏
+					warnCloseDB(db, "关闭 Ping 失败的数据库连接池失败") // C11b: 关闭刚打开的池，避免下轮覆盖泄漏
 				}
 			}
 		}
@@ -540,7 +555,7 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 	m.resetReplicaHealth()
 	m.mu.Unlock()
 	for _, r := range oldReplicas {
-		_ = closeDB(r)
+		warnCloseDB(r, "关闭旧数据库从库连接池失败")
 	}
 
 	// 初始化从库
@@ -568,7 +583,7 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 			sqlDB, err := replicaDB.DB()
 			if err != nil {
 				logger.Warnf("数据库从库 %d 获取连接池失败: %v", i+1, err)
-				_ = closeDB(replicaDB) // C11c: 关闭刚打开的池避免泄漏
+				warnCloseDB(replicaDB, "关闭刚打开的数据库从库连接池失败") // C11c: 关闭刚打开的池避免泄漏
 				continue
 			}
 
@@ -583,7 +598,7 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 
 			if err := sqlDB.Ping(); err != nil {
 				logger.Warnf("数据库从库 %d Ping 失败: %v", i+1, err)
-				_ = closeDB(replicaDB) // C11c: 关闭刚打开的池避免泄漏
+				warnCloseDB(replicaDB, "关闭 Ping 失败的数据库从库连接池失败") // C11c: 关闭刚打开的池避免泄漏
 				continue
 			}
 

@@ -176,7 +176,9 @@ func GzipDecompressFileWithOptions(src, dst string, opts DecompressOptions) (err
 	// L-A 修复：失败时（超限/拷贝错误）清理部分落盘的 dst，避免被拒炸弹遗留残片；
 	// 成功时仅关闭。os.Remove 在 Close 之后，兼容 Windows（删除打开中的文件会失败）。
 	defer func() {
-		dstFile.Close()
+		if cerr := dstFile.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
 		if err != nil {
 			_ = os.Remove(dst)
 		}
@@ -252,7 +254,7 @@ func Zip(zipPath string, paths []string) error {
 					return nil
 				}
 
-				// #nosec G304 -- path 为 Walk 遍历调用方源路径产生，非不可信输入
+				// #nosec G304,G122 -- path 为 Walk 遍历调用方源路径产生，非不可信输入；压缩场景接受 symlink 跟随语义。
 				file, err := os.Open(path)
 				if err != nil {
 					return err
@@ -365,7 +367,9 @@ func unzipFile(file *zip.File, absDst string, entryLimit, totalLimit, accrued in
 	// L-A 修复：失败时（超限/拷贝错误）清理部分落盘的 target，避免被拒炸弹遗留残片；
 	// 成功时仅关闭。os.Remove 在 Close 之后，兼容 Windows（删除打开中的文件会失败）。
 	defer func() {
-		dstFile.Close()
+		if cerr := dstFile.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
 		if err != nil {
 			_ = os.Remove(target)
 		}

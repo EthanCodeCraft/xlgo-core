@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -23,6 +24,8 @@ const (
 	CSRFCookieName = "csrf_token"
 	// CSRFFormField 表单字段名称
 	CSRFFormField = "_csrf"
+	// CSRFMaxBodyBytes JSON body 中读取 CSRF token 的最大字节数，防止 pre-auth OOM。
+	CSRFMaxBodyBytes = 1 << 20 // 1 MiB
 )
 
 // CSRFConfig CSRF 配置
@@ -47,6 +50,12 @@ type CSRFConfig struct {
 	Path string
 	// MaxAge Cookie 有效期（秒）
 	MaxAge int
+	// SessionCookie 为 true 时显式使用会话 Cookie（MaxAge=0）。
+	// 为保持 CSRFWithConfig(CSRFConfig{}) 的默认行为，MaxAge=0 且本字段为 false 时仍使用默认 1 小时。
+	SessionCookie bool
+	// MaxBodyBytes 从 JSON body 提取 token 时允许读取的最大字节数。
+	// <=0 时使用默认 1MiB。Header/Form token 不受此限制。
+	MaxBodyBytes int64
 	// ErrorFunc 错误处理函数
 	ErrorFunc func(c *gin.Context)
 	// SkipFunc 跳过检查函数
@@ -55,21 +64,25 @@ type CSRFConfig struct {
 
 // DefaultCSRFConfig 默认 CSRF 配置
 var DefaultCSRFConfig = CSRFConfig{
-	TokenLength: CSRFTokenLength,
-	HeaderName:  CSRFHeaderName,
-	CookieName:  CSRFCookieName,
-	FormField:   CSRFFormField,
-	Secure:      false,
-	HTTPOnly:    true,
-	SameSite:    http.SameSiteLaxMode,
-	Path:        "/",
-	MaxAge:      3600, // 1 小时
-	ErrorFunc:   defaultCSRFError,
-	SkipFunc:    nil,
+	TokenLength:  CSRFTokenLength,
+	HeaderName:   CSRFHeaderName,
+	CookieName:   CSRFCookieName,
+	FormField:    CSRFFormField,
+	Secure:       false,
+	HTTPOnly:     true,
+	SameSite:     http.SameSiteLaxMode,
+	Path:         "/",
+	MaxAge:       3600, // 1 小时
+	MaxBodyBytes: CSRFMaxBodyBytes,
+	ErrorFunc:    defaultCSRFError,
+	SkipFunc:     nil,
 }
 
 // generateCSRFToken 生成 CSRF Token
 func generateCSRFToken(length int) (string, error) {
+	if length <= 0 {
+		length = CSRFTokenLength
+	}
 	bytes := make([]byte, length)
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
@@ -83,15 +96,13 @@ func defaultCSRFError(c *gin.Context) {
 	c.Abort()
 }
 
-// CSRF 创建 CSRF 中间件
-func CSRF(config ...CSRFConfig) gin.HandlerFunc {
-	cfg := DefaultCSRFConfig
-	if len(config) > 0 {
-		cfg = config[0]
-	}
+func csrfBodyTooLarge(c *gin.Context) {
+	response.Custom(c, http.StatusRequestEntityTooLarge, response.CodeFileTooLarge, "请求体过大", nil)
+	c.Abort()
+}
 
-	// 设置默认值
-	if cfg.TokenLength == 0 {
+func normalizeCSRFConfig(cfg CSRFConfig) CSRFConfig {
+	if cfg.TokenLength <= 0 {
 		cfg.TokenLength = CSRFTokenLength
 	}
 	if cfg.HeaderName == "" {
@@ -100,9 +111,45 @@ func CSRF(config ...CSRFConfig) gin.HandlerFunc {
 	if cfg.CookieName == "" {
 		cfg.CookieName = CSRFCookieName
 	}
+	if cfg.FormField == "" {
+		cfg.FormField = CSRFFormField
+	}
+	if cfg.Path == "" {
+		cfg.Path = "/"
+	}
+	if cfg.SameSite == 0 {
+		cfg.SameSite = DefaultCSRFConfig.SameSite
+	}
+	if cfg.MaxAge == 0 && !cfg.SessionCookie {
+		cfg.MaxAge = DefaultCSRFConfig.MaxAge
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = CSRFMaxBodyBytes
+	}
 	if cfg.ErrorFunc == nil {
 		cfg.ErrorFunc = defaultCSRFError
 	}
+	return cfg
+}
+
+func pathMatchesSkip(path, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	if prefix == "/" {
+		return true
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+// CSRF 创建 CSRF 中间件
+func CSRF(config ...CSRFConfig) gin.HandlerFunc {
+	cfg := DefaultCSRFConfig
+	if len(config) > 0 {
+		cfg = config[0]
+	}
+	cfg = normalizeCSRFConfig(cfg)
 
 	return func(c *gin.Context) {
 		// 检查是否跳过
@@ -123,6 +170,7 @@ func CSRF(config ...CSRFConfig) gin.HandlerFunc {
 			cookieToken = token
 
 			// 设置 Cookie
+			c.SetSameSite(cfg.SameSite)
 			c.SetCookie(
 				cfg.CookieName,
 				token,
@@ -160,9 +208,16 @@ func CSRF(config ...CSRFConfig) gin.HandlerFunc {
 		// body 缓存进 gin context，下游可重复读取。
 		if clientToken == "" {
 			var body map[string]any
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, cfg.MaxBodyBytes)
 			if err := c.ShouldBindBodyWith(&body, binding.JSON); err == nil {
 				if token, ok := body[cfg.FormField].(string); ok {
 					clientToken = token
+				}
+			} else {
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					csrfBodyTooLarge(c)
+					return
 				}
 			}
 		}
@@ -225,7 +280,7 @@ func CSRFWithSkip(skipPaths []string) gin.HandlerFunc {
 	cfg.SkipFunc = func(c *gin.Context) bool {
 		path := c.Request.URL.Path
 		for _, p := range skipPaths {
-			if strings.HasPrefix(path, p) {
+			if pathMatchesSkip(path, p) {
 				return true
 			}
 		}
@@ -295,6 +350,7 @@ func GenerateAPIToken(c *gin.Context) {
 	}
 
 	apiTokensMu.Lock()
+	cleanupExpiredAPITokensLocked(time.Now())
 	apiTokens[token] = time.Now()
 	apiTokensMu.Unlock()
 
@@ -313,6 +369,14 @@ var (
 // apiTokenTTL API 模式 CSRF Token 有效期
 const apiTokenTTL = 30 * time.Minute
 
+func cleanupExpiredAPITokensLocked(now time.Time) {
+	for t, at := range apiTokens {
+		if now.Sub(at) > apiTokenTTL {
+			delete(apiTokens, t)
+		}
+	}
+}
+
 // CSRFExempt 标记路由不需要 CSRF 保护
 // 使用方法：在路由组上使用此中间件
 func CSRFExempt() gin.HandlerFunc {
@@ -328,6 +392,7 @@ func CSRFWithExempt(config ...CSRFConfig) gin.HandlerFunc {
 	if len(config) > 0 {
 		cfg = config[0]
 	}
+	cfg = normalizeCSRFConfig(cfg)
 
 	originalSkipFunc := cfg.SkipFunc
 	cfg.SkipFunc = func(c *gin.Context) bool {
@@ -360,6 +425,7 @@ func DoubleSubmitCookie() gin.HandlerFunc {
 				token, _ := generateCSRFToken(CSRFTokenLength)
 				// 双重提交模式要求前端 JS 读取 cookie 并回填 X-CSRF-Token 头，
 				// 故 HttpOnly 必须为 false（与 CSRF() cookie 模式相反）。
+				c.SetSameSite(http.SameSiteLaxMode)
 				c.SetCookie(CSRFCookieName, token, 3600, "/", "", false, false)
 				c.Set("csrf_token", token)
 			} else {

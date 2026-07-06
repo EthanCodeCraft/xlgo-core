@@ -30,6 +30,7 @@ func DirExists(path string) bool {
 
 // EnsureDir 确保目录存在，不存在则创建
 func EnsureDir(path string) error {
+	// #nosec G301 -- generic filesystem helper intentionally uses conventional directory permissions; caller controls trusted path and policy.
 	return os.MkdirAll(path, 0755)
 }
 
@@ -42,6 +43,7 @@ func EnsureDir(path string) error {
 // 注意：本函数无大小上限（os.ReadFile 语义），读取不可信/超大文件有 OOM 风险——
 // 需限长读取请用 io.ReadAll(io.LimitReader(...))；流式哈希大文件请用 HashFile（已流式）。
 func ReadFile(path string) ([]byte, error) {
+	// #nosec G304 -- generic filesystem helper intentionally reads caller-provided trusted paths; package docs require callers to sanitize untrusted input.
 	return os.ReadFile(path)
 }
 
@@ -51,6 +53,7 @@ func WriteFile(path string, data []byte) error {
 	if err := EnsureDir(dir); err != nil {
 		return err
 	}
+	// #nosec G306 -- generic filesystem helper intentionally uses conventional file permissions; caller controls trusted path and policy.
 	return os.WriteFile(path, data, 0644)
 }
 
@@ -60,6 +63,7 @@ func AppendFile(path string, data []byte) error {
 	if err := EnsureDir(dir); err != nil {
 		return err
 	}
+	// #nosec G302,G304 -- generic filesystem helper intentionally appends caller-provided trusted paths with conventional file permissions.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return err
@@ -71,6 +75,7 @@ func AppendFile(path string, data []byte) error {
 
 // CopyFile 复制文件
 func CopyFile(dst, src string) error {
+	// #nosec G304 -- generic filesystem helper intentionally opens caller-provided trusted source paths.
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -83,6 +88,7 @@ func CopyFile(dst, src string) error {
 		return err
 	}
 
+	// #nosec G304 -- generic filesystem helper intentionally creates caller-provided trusted destination paths.
 	dstFile, err := os.Create(dst)
 	if err != nil {
 		return err

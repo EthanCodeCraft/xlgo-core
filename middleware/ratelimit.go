@@ -36,6 +36,7 @@ type visitor struct {
 
 // NewRateLimiter 创建速率限制器（内存版）
 func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
+	mustValidRateLimit(rate, window)
 	ctx, cancel := context.WithCancel(context.Background())
 	limiter := &RateLimiter{
 		visitors: make(map[string]*visitor),
@@ -50,6 +51,15 @@ func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
 	go limiter.cleanupVisitors()
 
 	return limiter
+}
+
+func mustValidRateLimit(rate int, window time.Duration) {
+	if rate <= 0 {
+		panic("rate limiter: rate must be positive")
+	}
+	if window <= 0 {
+		panic("rate limiter: window must be positive")
+	}
 }
 
 // now 返回当前时间（可被测试注入 nowFunc 覆盖）。
@@ -151,10 +161,10 @@ var (
 
 // RedisRateLimiter Redis 分布式限流器
 type RedisRateLimiter struct {
-	keyPrefix   string        // 键名前缀
-	rate        int           // 每分钟允许的请求数
-	window      time.Duration // 时间窗口
-	failClosed  atomic.Bool   // H4c/H-6: Redis 错误/断言失败时是否拒绝（true=安全型 fail-closed）。atomic 以支持运行期 SetFailClosed 并发安全切换。
+	keyPrefix  string        // 键名前缀
+	rate       int           // 每分钟允许的请求数
+	window     time.Duration // 时间窗口
+	failClosed atomic.Bool   // H4c/H-6: Redis 错误/断言失败时是否拒绝（true=安全型 fail-closed）。atomic 以支持运行期 SetFailClosed 并发安全切换。
 }
 
 // slidingWindowLua 滑动窗口限流 Lua 脚本
@@ -184,6 +194,7 @@ end
 // NewRedisRateLimiter 创建 Redis 分布式限流器（默认 fail-open：Redis 错误时放行，避免影响业务）。
 // 安全敏感场景（如登录防爆破）应使用 NewRedisRateLimiterFailClosed，Redis 故障时拒绝以防限流失效。
 func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
+	mustValidRateLimit(rate, window)
 	return &RedisRateLimiter{
 		keyPrefix: keyPrefix,
 		rate:      rate,
@@ -195,6 +206,7 @@ func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration) *Redi
 // NewRedisRateLimiterFailClosed 创建安全型 Redis 分布式限流器（fail-closed）：
 // Redis 不可用/错误/返回非预期类型时拒绝请求，避免限流静默失效（防爆破场景必备）。
 func NewRedisRateLimiterFailClosed(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
+	mustValidRateLimit(rate, window)
 	rl := &RedisRateLimiter{
 		keyPrefix: keyPrefix,
 		rate:      rate,
@@ -352,6 +364,12 @@ func StopRateLimiters() {
 // RateLimit 通用速率限制中间件（内存版）
 func RateLimit(limiter *RateLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if limiter == nil {
+			response.Custom(c, http.StatusServiceUnavailable, response.CodeServiceUnavailable,
+				"限流器未初始化", nil)
+			c.Abort()
+			return
+		}
 		ip := c.ClientIP()
 		if !limiter.Allow(ip) {
 			response.RateLimit(c)
@@ -476,7 +494,10 @@ func RedisRateLimitWithIdentifier(keyPrefix string, rate int, identifierFunc fun
 	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute)
 
 	return func(c *gin.Context) {
-		identifier := identifierFunc(c)
+		identifier := ""
+		if identifierFunc != nil {
+			identifier = identifierFunc(c)
+		}
 		if identifier == "" {
 			identifier = c.ClientIP()
 		}

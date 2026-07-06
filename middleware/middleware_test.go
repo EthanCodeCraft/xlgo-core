@@ -1094,6 +1094,55 @@ func TestRateLimiterBurstCappedAtRate(t *testing.T) {
 	}
 }
 
+func assertPanic(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("%s did not panic", name)
+		}
+	}()
+	fn()
+}
+
+func TestRateLimiterRejectsInvalidConfig(t *testing.T) {
+	assertPanic(t, "memory limiter zero rate", func() {
+		_ = middleware.NewRateLimiter(0, time.Minute)
+	})
+	assertPanic(t, "memory limiter zero window", func() {
+		_ = middleware.NewRateLimiter(1, 0)
+	})
+	assertPanic(t, "redis limiter zero rate", func() {
+		_ = middleware.NewRedisRateLimiter("bad", 0, time.Minute)
+	})
+	assertPanic(t, "redis fail-closed limiter zero window", func() {
+		_ = middleware.NewRedisRateLimiterFailClosed("bad", 1, 0)
+	})
+}
+
+func TestRateLimiterStopIdempotent(t *testing.T) {
+	limiter := middleware.NewRateLimiter(1, time.Minute)
+	limiter.Stop()
+	limiter.Stop()
+}
+
+func TestRateLimitNilLimiterFailsClosed(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(middleware.RateLimit(nil))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("RateLimit(nil) status = %d, want 503; body=%s", w.Code, w.Body.String())
+	}
+	if got := respCode(t, w); got != response.CodeServiceUnavailable {
+		t.Fatalf("RateLimit(nil) code = %d, want %d", got, response.CodeServiceUnavailable)
+	}
+}
+
 func TestLoginRateLimit(t *testing.T) {
 	middleware.InitRateLimiters()
 	defer middleware.StopRateLimiters()
@@ -1235,6 +1284,32 @@ func TestCustomRedisRateLimit(t *testing.T) {
 
 	if w.Code != 200 {
 		t.Errorf("CustomRedisRateLimit status = %d", w.Code)
+	}
+}
+
+func TestRedisRateLimitWithIdentifierNilFuncUsesClientIP(t *testing.T) {
+	setupMiddlewareMiniRedis(t)
+
+	r := setupTestRouter()
+	r.Use(middleware.RedisRateLimitWithIdentifier("nil_identifier", 1, nil))
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	w1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest("GET", "/test", nil)
+	req1.RemoteAddr = "192.0.2.10:12345"
+	r.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want 200; body=%s", w1.Code, w1.Body.String())
+	}
+
+	w2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest("GET", "/test", nil)
+	req2.RemoteAddr = "192.0.2.10:12345"
+	r.ServeHTTP(w2, req2)
+	if got := respCode(t, w2); got != response.CodeRateLimit {
+		t.Fatalf("second request code = %d, want %d; status=%d body=%s", got, response.CodeRateLimit, w2.Code, w2.Body.String())
 	}
 }
 

@@ -42,9 +42,9 @@ func TestH7ConcurrentInitCloseAndRead(t *testing.T) {
 	dir := t.TempDir()
 	cfg := tmpCfg(dir)
 
-	// 确保 DefaultLogger 起点干净。
-	_ = DefaultLogger.Close()
-	t.Cleanup(func() { _ = DefaultLogger.Close() })
+	// 确保默认 LogManager 起点干净。
+	_ = GetDefaultLogManager().Close()
+	t.Cleanup(func() { _ = GetDefaultLogManager().Close() })
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -59,8 +59,8 @@ func TestH7ConcurrentInitCloseAndRead(t *testing.T) {
 				return
 			default:
 			}
-			_ = DefaultLogger.Init(cfg)
-			_ = DefaultLogger.Close()
+			_ = GetDefaultLogManager().Init(cfg)
+			_ = GetDefaultLogManager().Close()
 		}
 	}()
 
@@ -96,7 +96,7 @@ func TestH7ConcurrentInitCloseAndRead(t *testing.T) {
 	wg.Wait()
 
 	// 收尾到 Nop，避免后续测试持有临时目录句柄。
-	_ = DefaultLogger.Close()
+	_ = GetDefaultLogManager().Close()
 }
 
 // TestH7CurrentLoggerReflectsInitAndClose 验证 atomic 快照随 Init/Close 正确切换：
@@ -105,8 +105,8 @@ func TestH7CurrentLoggerReflectsInitAndClose(t *testing.T) {
 	dir := t.TempDir()
 	cfg := tmpCfg(dir)
 
-	_ = DefaultLogger.Close()
-	t.Cleanup(func() { _ = DefaultLogger.Close() })
+	_ = GetDefaultLogManager().Close()
+	t.Cleanup(func() { _ = GetDefaultLogManager().Close() })
 
 	// Init 前：Nop，调用安全且不写文件。
 	before := currentLogger()
@@ -114,7 +114,7 @@ func TestH7CurrentLoggerReflectsInitAndClose(t *testing.T) {
 		t.Fatal("currentLogger nil before Init")
 	}
 
-	if err := DefaultLogger.Init(cfg); err != nil {
+	if err := GetDefaultLogManager().Init(cfg); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -130,7 +130,7 @@ func TestH7CurrentLoggerReflectsInitAndClose(t *testing.T) {
 	// 写一条日志并 flush，验证落到文件（说明拿到的是真实 logger，非 Nop）。
 	const mark = "H7_INIT_REFLECT_xyz"
 	after.Info(mark)
-	_ = DefaultLogger.Sync()
+	_ = GetDefaultLogManager().Sync()
 
 	data, err := readFile(t, filepath.Join(dir, "app.log"))
 	if err != nil {
@@ -141,7 +141,7 @@ func TestH7CurrentLoggerReflectsInitAndClose(t *testing.T) {
 	}
 
 	// Close 后：currentLogger 回到 Nop（与 Init 前实例不同，但同为 Nop 行为）。
-	if err := DefaultLogger.Close(); err != nil {
+	if err := GetDefaultLogManager().Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	closed := currentLogger()
@@ -150,7 +150,7 @@ func TestH7CurrentLoggerReflectsInitAndClose(t *testing.T) {
 	}
 	// Nop logger 写不报错也不落盘；验证 Close 后再写不新增 mark。
 	closed.Info("H7_SHOULD_NOT_APPEAR_xyz")
-	_ = DefaultLogger.Sync()
+	_ = GetDefaultLogManager().Sync()
 	data2, _ := readFile(t, filepath.Join(dir, "app.log"))
 	if strings.Contains(data2, "H7_SHOULD_NOT_APPEAR_xyz") {
 		t.Error("wrote to file after Close (expected Nop)")
@@ -180,6 +180,57 @@ func TestH7AtomicPointersNonNil(t *testing.T) {
 	}
 	if currentLogger() != loggerPtr.Load() {
 		t.Error("currentLogger() != loggerPtr")
+	}
+}
+
+// TestH7DefaultLoggerCompatibility 锁定 M3 的兼容边界：
+// DefaultLogger 仍保持 *LogManager 类型，旧代码可继续直接调用其方法；
+// 包级 facade 的默认 manager 替换则必须走 SetDefaultLogManager 的 atomic 快照。
+func TestH7DefaultLoggerCompatibility(t *testing.T) {
+	var _ *LogManager = DefaultLogger
+
+	old := GetDefaultLogManager()
+	t.Cleanup(func() { SetDefaultLogManager(old) })
+
+	next := NewLogManager()
+	SetDefaultLogManager(next)
+	if got := GetDefaultLogManager(); got != next {
+		t.Fatalf("GetDefaultLogManager() = %p, want %p", got, next)
+	}
+}
+
+// TestM3StaleManagerCloseDoesNotCloseCurrentLogger 回归：旧 manager 的 Close
+// 不得关闭另一个 manager 后续发布的全局 logger/writer。
+func TestM3StaleManagerCloseDoesNotCloseCurrentLogger(t *testing.T) {
+	dir1 := t.TempDir()
+	dir2 := t.TempDir()
+	m1 := NewLogManager()
+	m2 := NewLogManager()
+	t.Cleanup(func() {
+		_ = m1.Close()
+		_ = m2.Close()
+		SetDefaultLogManager(NewLogManager())
+	})
+
+	if err := m1.Init(tmpCfg(dir1)); err != nil {
+		t.Fatalf("m1.Init: %v", err)
+	}
+	if err := m2.Init(tmpCfg(dir2)); err != nil {
+		t.Fatalf("m2.Init: %v", err)
+	}
+	if err := m1.Close(); err != nil {
+		t.Fatalf("stale m1.Close: %v", err)
+	}
+
+	const mark = "M3_CURRENT_LOGGER_SURVIVES_STALE_CLOSE"
+	currentLogger().Info(mark)
+	_ = syncLoggers(currentLogger())
+	data, err := readFile(t, filepath.Join(dir2, "app.log"))
+	if err != nil {
+		t.Fatalf("read current app.log: %v", err)
+	}
+	if !strings.Contains(data, mark) {
+		t.Fatal("stale manager Close closed the current logger")
 	}
 }
 
@@ -232,22 +283,22 @@ func readFile(t *testing.T, path string) (string, error) {
 func TestSetLevelHotSwap_M19(t *testing.T) {
 	dir := t.TempDir()
 	cfg := tmpCfg(dir)
-	_ = DefaultLogger.Close()
-	t.Cleanup(func() { _ = DefaultLogger.Close() })
+	_ = GetDefaultLogManager().Close()
+	t.Cleanup(func() { _ = GetDefaultLogManager().Close() })
 
-	if err := DefaultLogger.Init(cfg); err != nil {
+	if err := GetDefaultLogManager().Init(cfg); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
 	// Init 后（tmpCfg 为 production 模式，默认 InfoLevel）可热切换到 ErrorLevel。
-	before := DefaultLogger.GetLevel()
+	before := GetDefaultLogManager().GetLevel()
 	if before != zapcore.InfoLevel {
 		t.Errorf("default level = %v, want InfoLevel (production)", before)
 	}
-	if ok := DefaultLogger.SetLevel(zapcore.ErrorLevel); !ok {
+	if ok := GetDefaultLogManager().SetLevel(zapcore.ErrorLevel); !ok {
 		t.Fatal("SetLevel after Init should return true")
 	}
-	if got := DefaultLogger.GetLevel(); got != zapcore.ErrorLevel {
+	if got := GetDefaultLogManager().GetLevel(); got != zapcore.ErrorLevel {
 		t.Errorf("after SetLevel, level = %v, want ErrorLevel", got)
 	}
 
@@ -255,5 +306,177 @@ func TestSetLevelHotSwap_M19(t *testing.T) {
 	SetLevel(zapcore.WarnLevel)
 	if got := GetLevel(); got != zapcore.WarnLevel {
 		t.Errorf("package GetLevel = %v, want WarnLevel", got)
+	}
+}
+
+// TestM3ConcurrentInitSetLevelAndClose 验证 Init/SetLevel/GetLevel/Close
+// 共享同一个 manager 临界区，不再出现 m.level 锁外写与锁内读写竞争（-race）。
+func TestM3ConcurrentInitSetLevelAndClose(t *testing.T) {
+	dir := t.TempDir()
+	cfg := tmpCfg(dir)
+	m := NewLogManager()
+	SetDefaultLogManager(m)
+	t.Cleanup(func() {
+		_ = m.Close()
+		SetDefaultLogManager(NewLogManager())
+	})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = m.Init(cfg)
+			_ = m.Close()
+		}
+	}()
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			levels := []zapcore.Level{
+				zapcore.DebugLevel,
+				zapcore.InfoLevel,
+				zapcore.WarnLevel,
+				zapcore.ErrorLevel,
+			}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = m.SetLevel(levels[i%len(levels)])
+				_ = m.GetLevel()
+			}
+		}(i)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestM3ConcurrentSetDefaultAndFacades 验证默认 LogManager 经 atomic.Pointer
+// 读写，SetDefaultLogManager 与包级 facade 并发时无裸全局指针竞态（-race）。
+func TestM3ConcurrentSetDefaultAndFacades(t *testing.T) {
+	t.Cleanup(func() {
+		_ = Close()
+		SetDefaultLogManager(NewLogManager())
+	})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			SetDefaultLogManager(NewLogManager())
+		}
+	}()
+
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = GetLevel()
+				_ = SetLevel(zapcore.WarnLevel)
+				_ = Sync()
+				_ = APILog()
+				_ = DBLog()
+			}
+		}()
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+// TestM3ConcurrentManagersInitClose 验证不同 LogManager 实例并发 Init/Close 时，
+// 包级 Logger/fileWriters 的发布与关闭由 globalMu 串行化，不再依赖实例锁保护包级状态。
+func TestM3ConcurrentManagersInitClose(t *testing.T) {
+	dir := t.TempDir()
+	cfg := tmpCfg(dir)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	managers := make([]*LogManager, 3)
+
+	for i := 0; i < 3; i++ {
+		managers[i] = NewLogManager()
+		wg.Add(1)
+		go func(m *LogManager) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				SetDefaultLogManager(m)
+				_ = m.Init(cfg)
+				_ = m.Close()
+			}
+		}(managers[i])
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = currentLogger()
+			_ = currentSugar()
+			_ = APILog()
+			_ = DBLog()
+		}
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	for _, m := range managers {
+		_ = m.Close()
+	}
+	_ = Close()
+	SetDefaultLogManager(NewLogManager())
+}
+
+// TestM3InitRejectsInvalidLogConfig 验证 logger.Init 对明显非法日志配置失败，
+// 避免空目录意外把 app.log 写到进程工作目录。
+func TestM3InitRejectsInvalidLogConfig(t *testing.T) {
+	if err := NewLogManager().Init(&config.Config{}); err == nil {
+		t.Fatal("Init with empty log dir should fail")
+	}
+
+	cfg := tmpCfg(t.TempDir())
+	cfg.Log.MaxAge = -1
+	if err := NewLogManager().Init(cfg); err == nil {
+		t.Fatal("Init with negative MaxAge should fail")
 	}
 }

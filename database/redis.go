@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,11 @@ func SetDefaultRedisManager(m *RedisManager) {
 	}
 }
 
+// GetDefaultRedisManager 返回当前默认 Redis 管理器。
+func GetDefaultRedisManager() *RedisManager {
+	return DefaultRedis.Load()
+}
+
 // Init 初始化 Redis 连接并 ping 验证。
 func (m *RedisManager) Init(cfg *config.Config) error {
 	m.mu.Lock()
@@ -62,12 +68,20 @@ func (m *RedisManager) Init(cfg *config.Config) error {
 	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx).Err(); err != nil {
-		client.Close()
+		if cerr := client.Close(); cerr != nil {
+			return errors.Join(fmt.Errorf("Redis 连接失败: %w", err), fmt.Errorf("Redis 关闭失败: %w", cerr))
+		}
 		return fmt.Errorf("Redis 连接失败: %w", err)
 	}
 
+	old := m.client
 	m.cfg = cfg
 	m.client = client
+	if old != nil {
+		if err := old.Close(); err != nil {
+			logger.Warnf("关闭旧 Redis 连接失败: %v", err)
+		}
+	}
 	logger.Info("Redis 连接成功", zap.String("addr", cfg.Redis.Addr()))
 	return nil
 }

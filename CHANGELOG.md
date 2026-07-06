@@ -16,7 +16,59 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
-_暂无未发布变更。_
+> 复审报告 `gpt_check_report_review.md` 第一优先级（致命/进程级可用性）修复。P1 共 4 项，本次发布已推进 M13 cron panic、M1 App 生命周期、M3 logger 生命周期临界区；M8 CSRF JSON body 上限随后推进。
+
+### Breaking ⚠️
+
+- **`cache.WithLock` / `cache.WithLockAutoExtend` 未获取到锁时返回 `ErrLockNotAcquired`**：旧行为返回 `nil` 并跳过业务函数，调用方无法区分“业务执行成功”和“根本没有执行”。同时锁 TTL 小于 1ms、续期/重试间隔非正会返回显式错误，避免 Redis PX=0 或 `time.NewTicker(0)` 崩溃。
+- **`jwt.ParseToken` 开始校验 issuer，`RefreshToken` 使用 `jwt.refresh_expire`**：签发者与当前配置不一致的 token 会被拒绝；刷新后的 token 过期时间优先使用 `refresh_expire`，未配置时回退 `expire`。`GenerateTokenWithCustomExpiry` 现在拒绝非正过期时间，`InvalidateTokenByID("")` 返回 `ErrEmptyJTI`。
+- **`App.Init()` 由 `sync.Once` 改为生命周期状态机**（app.go，M1）：5 态 `stateCreated/Initializing/Initialized/Stopping/Stopped` + `lifecycleMu`(RWMutex) + `initMu`(Mutex)。`Shutdown` 后或 `Init` 失败后再调 `Init()` 返回新增导出错误 **`xlgo.ErrAppClosed`**（原 `sync.Once` "多次调用返回首次结果"语义不再适用——已关闭的 App 不可再 Init，需新建 App）。
+- **`App.Go()` 在 Shutdown 开始或 Init 失败后为 no-op**（app.go，M1）：`state >= stateStopping` 时拒绝 `wg.Add` 直接返回，避免与 `Shutdown` 的 `wg.Wait` 竞争 `sync.WaitGroup` 契约（Add 须 happen-before Wait）。依赖"Shutdown 后仍可 Go"的下游需改用独立 goroutine。
+- **生命周期 hook 不允许重入调用 `Init`/`Shutdown`/`Run`**（app.go，M1）：`initMu` 非重入，hook（OnInit/OnStart/OnReady/OnStop）内调用会自锁死锁。需在 hook 内触发关闭应改用信号通道由主流程处理。
+- **`logger.DefaultLogger = m` 直接赋值不再驱动包级 facade**（logger/logger.go，M3）：为消除 `SetDefaultLogManager()` 与包级 facade 并发读取默认 manager 的裸全局指针竞态，facade 改为读取内部 atomic 快照。`logger.DefaultLogger` 仍保持 `*LogManager` 类型，旧的 `logger.DefaultLogger.Init/Close/SetLevel/GetLevel` 直接调用仍可用；替换默认 manager 请使用 `logger.SetDefaultLogManager(m)`。
+- **`logger.Init` 拒绝明显非法日志配置**（logger/logger.go，M3）：空日志目录、负数 `MaxSize/MaxBackups/MaxAge` 现在直接返回错误。依赖零值日志配置启动 `WithLogger()` 的下游需显式设置 `Log.Dir` 与非负轮转参数。
+- **限流器非法配置改为 fail-fast**（middleware/ratelimit.go，M8）：`NewRateLimiter` / `NewRedisRateLimiter` / `NewRedisRateLimiterFailClosed` 现在对 `rate <= 0` 或 `window <= 0` 直接 panic，避免零值窗口/零值配额静默产生不确定限流语义。下游应在配置加载阶段校验限流参数。
+
+### Fixed 🐛
+
+- **M9 JWT issuer / refresh expiry 契约修复**：`ParseToken`、`InvalidateToken`、`GetClaimsFromToken` 统一按当前配置校验 issuer；`RefreshToken` 不再忽略 `refresh_expire`；空 JTI 不再写入永不命中的 `jwt_bl:` 黑名单键。
+- **M10 分布式锁参数与未获锁语义修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`。
+- **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
+- **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
+
+- **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
+- **M1 App 生命周期三类缺陷统一治理**（app.go）：
+  - **Init 失败无资源回滚** → 新增 `failAfterInit`：markStopping → cancel rootCtx → wg.Wait(10s) → cron 5s 显式超时停止 → `closeResources` 幂等关闭 db/redis/logger，回滚错误 `errors.Join` 进 `initErr` 不吞；先停 goroutine 再关资源，避免"关 DB 时探活 goroutine 仍在用"的竞态。
+  - **App.Go 与 wg.Wait race** → `lifecycleMu.RLock` 包住 `wg.Add`，`Shutdown` 持写锁翻 `stateStopping`，保证 Add happens-before Wait。
+  - **Shutdown 非幂等/非并发安全** → `shutdownOnce` 保证 `doShutdown` 单次执行，并发调用者返回同一 `shutdownErr`。
+  - **OnStop 语义** → 仅 `Init` 曾成功（`wasInitialized`）时在 `doShutdown` 开头执行；Init 失败/未 Init 时 HTTP 从未启动，OnStop 跳过。
+  - **资源所有权** → App 只关闭自己成功初始化过的 logger/db/redis/cron，避免一个 Init 失败的新 App 关闭同进程既有全局资源。
+  - **复审补强：资源替换事务边界** → App 初始化 logger/db/redis 时先创建 App-owned manager 并保存旧默认 manager 快照；OnInit 或后续步骤失败时恢复旧默认 manager 并关闭新资源，完整成功后才释放旧资源，避免“新 App Init 失败”破坏同进程既有全局 logger/db/redis。
+  - **复审补强：health/probing 绑定 App-owned manager** → App 注册的 MySQL/Redis health check 与 DB probing 使用本 App 持有的 manager，不随后续全局默认 manager 替换漂移。
+  - **OnReady 早于真实监听成功** → `StartServer` 改为同步 `net.Listen` 且 TLS 证书装配成功后再启动 `Serve` 与执行 OnReady；监听/TLS 失败直接返回，不触发 ready 副作用。
+  - **`server.unix_socket` 不可用** → 非空 `unix_socket` 现在走 `net.Listen("unix", path)` + `http.Server.Serve`，不再把 socket path 误传给 TCP `ListenAndServe`。
+  - `Init`/`Shutdown` 经 `initMu` 串行化 doInit/doShutdown 长段，杜绝并发改资源。
+- **M3 logger 生命周期与全局 manager 并发治理**（logger/logger.go）：
+  - **`LogManager.Init()` 锁外写 `m.level`** → `Init` 在通过局部配置校验后持 `m.mu` 完成建目录、构造与发布新 logger，`m.level` 只在同一临界区更新；包级 `Logger/fileWriters` 发布另由 `globalMu` 串行化，避免多个 `LogManager` 实例用各自实例锁保护同一包级状态。
+  - **`DefaultLogger` 裸全局指针** → 保留导出变量兼容旧代码，新增内部 atomic 默认 manager 快照与 `GetDefaultLogManager()`；包级 `Init/Close/Sync/SetLevel/GetLevel` 全部经 atomic 读取当前 manager。
+  - **stale manager 关闭当前 logger** → 每次发布全局 logger 分配 generation，只有拥有当前 generation 的 `LogManager.Close()` 才能关闭当前全局 logger/writer。
+  - **旧 writer 关闭顺序错误** → `Init` 先 atomic 发布新 logger，再关闭旧 lumberjack writer，避免替换窗口内包级读路径拿到指向已关闭 writer 的旧 logger。
+  - **`Close()` 与 `Init()` 生命周期互相覆盖** → `Close` 在同一 manager 锁内先快照旧 logger/writer 并发布 Nop，再执行 Sync/Close；关闭错误通过 `errors.Join` 聚合返回，不再静默吞掉 lumberjack `Close` 错误。
+- **M8 middleware/CSRF 与限流边界治理**（middleware/csrf.go，middleware/ratelimit.go）：
+  - **CSRF JSON body 读取无上限** → 从 body 提取 `_csrf` 时使用 `http.MaxBytesReader`，默认上限 1MiB（`CSRFConfig.MaxBodyBytes` 可调），超限返回 HTTP 413，避免 pre-auth OOM；仍使用 `ShouldBindBodyWith` 保留下游重复读取 body 的能力。
+  - **CSRF cookie SameSite 配置未真正写入** → `CSRF()` 与 `DoubleSubmitCookie()` 设置 cookie 前显式 `SetSameSite`，默认 Lax。
+  - **CSRF 局部配置丢默认 cookie 行为** → `CSRFConfig` 归一化补齐 `Path`、`SameSite`、`MaxAge`、`FormField`、`MaxBodyBytes` 等默认值，只覆盖单个字段时不再意外丢失默认 cookie 约束。
+  - **CSRF session cookie 显式配置** → 新增 `CSRFConfig.SessionCookie`，需要会话 Cookie 时设置为 `true`；为保持 `CSRFWithConfig(CSRFConfig{})` 默认 1 小时语义，`MaxAge=0` 且未设置 `SessionCookie` 时仍回退默认值。
+  - **CSRF TokenLength 负数 panic/退化** → `TokenLength <= 0` 统一回退默认长度，避免配置错误导致 `make([]byte, negative)` panic。
+  - **CSRF skip path 前缀误跳过** → `CSRFWithSkip([]string{"/api"})` 仅跳过 `/api` 与 `/api/...`，不再误跳过 `/apix`。
+  - **API CSRF token map 只校验时清理过期 token** → `GenerateAPIToken` 颁发新 token 前同步清理过期项，避免长期只发不验场景内存增长。
+  - **`RateLimit(nil)` panic** → 改为 fail-closed 返回 HTTP 503 + `CodeServiceUnavailable`，避免未初始化限流器导致请求路径 nil deref。
+  - **`RedisRateLimitWithIdentifier` nil 回调 panic** → `identifierFunc == nil` 时回退 `ClientIP()`，并保留空字符串回退逻辑。
+- **gosec database 告警收口**（database/manager.go，database/redis.go）：`RoundRobinPicker` 改为 mutex 保护的有界 `int` 计数器，消除 G115 整数转换告警；`RandomPicker` 改用 `crypto/rand` 选择从库，消除 G404 弱随机源告警，随机源失败时安全回退到首个从库；Redis 初始化 ping 失败时不再静默吞掉 `client.Close()` 错误。
+- **复审补强：DB/Redis 重建路径资源释放**（database/manager.go，database/redis.go）：Redis 重复初始化会关闭旧 client；DB 重建/重试路径的旧连接池关闭失败不再静默丢弃，会记录 warning 供排查。
+- **gosec Close 错误收口**（utils/http.go，compress/compress.go）：HTTP multipart 上传循环中的本地文件 `Close()` 错误不再静默吞掉；gzip/zip 解压输出文件关闭失败会通过 `errors.Join` 返回，并触发残留目标文件清理。
+- **gosec 兼容性/误报标注收口**（cmd/xlgo，utils/http.go，utils/crypto.go，utils/file.go，compress/compress.go）：为已存在输入校验或明确调用方契约的路径、客户端请求 cookie、非安全用途 checksum、压缩源路径遍历、兼容模式 HTTP 请求添加精确 `#nosec` 理由；`NewSSRFSafeHTTPClient` / `BlockPrivateNetworks` 仍是处理不可信 URL 的推荐入口。
+- **示例参数解析错误处理**（examples/full/main.go）：示例用户详情接口现在检查 `fmt.Sscanf` 错误，非法用户 ID 返回失败响应，不再静默使用零值。
 
 ## [1.2.0] - 2026-07-04
 

@@ -101,7 +101,10 @@ func getUser(c *gin.Context) {
 	id := c.Param("id")
 	// 示例简化：直接用 repo 查询，实际应转 uint
 	var uid uint
-	fmt.Sscanf(id, "%d", &uid)
+	if _, err := fmt.Sscanf(id, "%d", &uid); err != nil {
+		response.Fail(c, "用户ID无效")
+		return
+	}
 	u, err := userRepo.FindByID(c.Request.Context(), uid)
 	if err != nil {
 		response.NotFound(c, "用户不存在")

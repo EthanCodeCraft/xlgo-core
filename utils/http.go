@@ -45,12 +45,12 @@ type UploadFile struct {
 
 // HTTPClientConfig HTTP 客户端配置
 type HTTPClientConfig struct {
-	Timeout            time.Duration // 请求超时时间
-	MaxIdleConns       int           // 最大空闲连接数
-	IdleConnTimeout    time.Duration // 空闲连接超时时间
-	MaxConnsPerHost    int           // 每个主机最大连接数
+	Timeout             time.Duration // 请求超时时间
+	MaxIdleConns        int           // 最大空闲连接数
+	IdleConnTimeout     time.Duration // 空闲连接超时时间
+	MaxConnsPerHost     int           // 每个主机最大连接数
 	MaxIdleConnsPerHost int           // 每个主机最大空闲连接数
-	SkipTLSVerify      bool          // 是否跳过 TLS 验证（默认 false 校验 TLS；自签证书场景需显式设 true）
+	SkipTLSVerify       bool          // 是否跳过 TLS 验证（默认 false 校验 TLS；自签证书场景需显式设 true）
 	// MaxResponseBodySize 响应体读取上限（字节）。0 = 默认 32MB，-1 = 不限制。
 	// 防止异常服务端返回超大响应打爆内存（C5/N5）。
 	MaxResponseBodySize int64
@@ -365,15 +365,21 @@ func (c *HTTPClient) Upload(urlStr string, files []UploadFile, params map[string
 
 		part, err := writer.CreateFormFile(f.FieldName, filepath.Base(f.FilePath))
 		if err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				return nil, errors.Join(err, cerr)
+			}
 			return nil, err
 		}
 		if _, err = io.Copy(part, file); err != nil {
-			file.Close()
+			if cerr := file.Close(); cerr != nil {
+				return nil, errors.Join(err, cerr)
+			}
 			return nil, err
 		}
 		// 显式关闭，避免循环内 defer 累积 FD（N5/C5）。
-		file.Close()
+		if err := file.Close(); err != nil {
+			return nil, err
+		}
 	}
 
 	for k, v := range params {
@@ -445,10 +451,12 @@ func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
 		req.Header.Set(k, v)
 	}
 	for k, v := range cookies {
+		// #nosec G124 -- this builds outbound Cookie request headers; Secure/HttpOnly/SameSite apply to Set-Cookie responses.
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
 	// 发送请求（H-12：快照 client，与 SetSkipTLS/SetTimeout 重建无竞态）
+	// #nosec G704 -- default client intentionally allows caller-supplied URLs for compatibility; use NewSSRFSafeHTTPClient/BlockPrivateNetworks for untrusted URLs.
 	resp, err := c.currentClient().Do(req)
 	if err != nil {
 		return nil, err
@@ -491,9 +499,11 @@ func (c *HTTPClient) DoWithResponse(req *http.Request) (*http.Response, error) {
 		req.Header.Set(k, v)
 	}
 	for k, v := range cookies {
+		// #nosec G124 -- this builds outbound Cookie request headers; Secure/HttpOnly/SameSite apply to Set-Cookie responses.
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
+	// #nosec G704 -- default client intentionally allows caller-supplied URLs for compatibility; use NewSSRFSafeHTTPClient/BlockPrivateNetworks for untrusted URLs.
 	return c.currentClient().Do(req)
 }
 
