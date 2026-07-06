@@ -15,6 +15,12 @@ var (
 	ErrLockNotHeld   = errors.New("锁未被当前客户端持有")
 	ErrLockExpired   = errors.New("锁已过期")
 	ErrRedisNotReady = errors.New("Redis 未初始化")
+	// ErrLockNotAcquired 表示锁被其它客户端持有，业务函数未执行。
+	ErrLockNotAcquired = errors.New("未获取到锁")
+	// ErrInvalidLockTTL 表示锁 TTL 小于 Redis PX 支持的 1ms 粒度或非正。
+	ErrInvalidLockTTL = errors.New("锁 TTL 必须大于等于 1ms")
+	// ErrInvalidLockRetryInterval 表示重试或续期间隔非法。
+	ErrInvalidLockRetryInterval = errors.New("锁重试/续期间隔必须大于 0")
 	// ErrLockUnexpectedResult Lua 脚本返回了非预期的结果类型（C1b：裸类型断言防护）。
 	ErrLockUnexpectedResult = errors.New("锁脚本返回非预期结果")
 )
@@ -27,6 +33,13 @@ func toInt64(v any) (int64, error) {
 		return 0, fmt.Errorf("脚本返回类型 %T: %w", v, ErrLockUnexpectedResult)
 	}
 	return n, nil
+}
+
+func ttlMillis(ttl time.Duration) (int64, error) {
+	if ttl < time.Millisecond {
+		return 0, ErrInvalidLockTTL
+	}
+	return int64(ttl / time.Millisecond), nil
 }
 
 // LockToken 锁令牌（用于安全释放锁）。
@@ -88,7 +101,10 @@ func NewLock(ctx context.Context, key string, ttl time.Duration) (*LockToken, er
 	}
 
 	token := utils.UUID()
-	ttlMs := int64(ttl / time.Millisecond)
+	ttlMs, err := ttlMillis(ttl)
+	if err != nil {
+		return nil, err
+	}
 
 	result, err := rdb.Eval(ctx, lockScript, []string{key}, token, ttlMs).Result()
 	if err != nil {
@@ -148,7 +164,7 @@ func Unlock(ctx context.Context, token *LockToken) error {
 func UnlockByKey(ctx context.Context, key string) error {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return nil
+		return ErrRedisNotReady
 	}
 	return rdb.Del(ctx, key).Err()
 }
@@ -165,7 +181,10 @@ func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error 
 		return ErrLockNotHeld
 	}
 
-	ttlMs := int64(ttl / time.Millisecond)
+	ttlMs, err := ttlMillis(ttl)
+	if err != nil {
+		return err
+	}
 
 	result, err := rdb.Eval(ctx, extendScript, []string{token.Key}, token.Token, ttlMs).Result()
 	if err != nil {
@@ -185,6 +204,9 @@ func ExtendLock(ctx context.Context, token *LockToken, ttl time.Duration) error 
 
 // TryLock 尝试获取锁，失败时等待重试。重试等待响应 ctx 取消（C1c 修复）。
 func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval time.Duration, maxRetry int) (*LockToken, error) {
+	if retryInterval <= 0 {
+		return nil, ErrInvalidLockRetryInterval
+	}
 	for i := 0; i < maxRetry; i++ {
 		token, err := NewLock(ctx, key, ttl)
 		if err != nil {
@@ -200,7 +222,7 @@ func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval t
 		case <-time.After(retryInterval):
 		}
 	}
-	return nil, nil
+	return nil, ErrLockNotAcquired
 }
 
 // WithLock 使用分布式锁执行函数（自动管理锁）。
@@ -215,7 +237,7 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 		return err
 	}
 	if token == nil {
-		return nil // 未获取到锁，跳过执行
+		return ErrLockNotAcquired
 	}
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -235,12 +257,15 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 // （ctx 取消或 ExtendLock 失败时 done 已 closed，父再 send 即 panic，Unlock 不执行、锁泄漏到 TTL）。
 // Unlock 用 context.Background() 派生超时，避免原 ctx 已取消致 Unlock 失败再泄漏。
 func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duration, extendInterval time.Duration, fn func() error) error {
+	if extendInterval <= 0 {
+		return ErrInvalidLockRetryInterval
+	}
 	token, err := NewLock(ctx, key, initialTTL)
 	if err != nil {
 		return err
 	}
 	if token == nil {
-		return nil // 未获取到锁，跳过执行
+		return ErrLockNotAcquired
 	}
 
 	// 父关停信号（仅父 close）与子 ack 信号（仅子 close）。

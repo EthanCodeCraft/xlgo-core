@@ -17,7 +17,7 @@ func setupTestConfig() {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret-key-1234567890123456789012", // ≥32 字节
-			Expire: time.Hour,                                 // 1小时
+			Expire: time.Hour,                                // 1小时
 		},
 	}
 	config.Set(cfg)
@@ -384,3 +384,130 @@ func TestSupportedAlgorithmHS384(t *testing.T) {
 	}
 }
 
+func TestParseTokenRejectsWrongIssuer(t *testing.T) {
+	config.Set(&config.Config{JWT: config.JWTConfig{
+		Secret: "test-secret-key-1234567890123456789012",
+		Expire: time.Hour,
+		Issuer: "trusted-issuer",
+	}})
+	t.Cleanup(setupTestConfig)
+
+	claims := jwt.Claims{
+		UserID:   1,
+		Username: "attacker",
+		Role:     "admin",
+		UserType: "super_admin",
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ExpiresAt: gojwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  gojwt.NewNumericDate(time.Now()),
+			NotBefore: gojwt.NewNumericDate(time.Now()),
+			Issuer:    "evil-issuer",
+		},
+	}
+	token := signTokenForTest(t, claims)
+
+	if _, err := jwt.ParseToken(token); !errors.Is(err, jwt.ErrTokenInvalid) {
+		t.Errorf("ParseToken wrong issuer err = %v, want ErrTokenInvalid", err)
+	}
+	if _, err := jwt.GetClaimsFromToken(token); !errors.Is(err, jwt.ErrTokenInvalid) {
+		t.Errorf("GetClaimsFromToken wrong issuer err = %v, want ErrTokenInvalid", err)
+	}
+}
+
+func TestRefreshTokenUsesRefreshExpire(t *testing.T) {
+	config.Set(&config.Config{JWT: config.JWTConfig{
+		Secret:        "test-secret-key-1234567890123456789012",
+		Expire:        time.Hour,
+		RefreshExpire: 4 * time.Hour,
+	}})
+	t.Cleanup(setupTestConfig)
+	setupMiniRedis(t)
+
+	token, err := jwt.GenerateToken(1, "testuser", "admin", "super_admin")
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	newToken, err := jwt.RefreshToken(token)
+	if err != nil {
+		t.Fatalf("RefreshToken: %v", err)
+	}
+	claims, err := jwt.ParseToken(newToken)
+	if err != nil {
+		t.Fatalf("ParseToken refreshed token: %v", err)
+	}
+	ttl := time.Until(claims.ExpiresAt.Time)
+	if ttl < 3*time.Hour || ttl > 4*time.Hour+time.Minute {
+		t.Errorf("refreshed token ttl = %v, want about 4h", ttl)
+	}
+}
+
+func TestGenerateTokenWithCustomExpiryRejectsNonPositive(t *testing.T) {
+	setupTestConfig()
+
+	for _, seconds := range []int{0, -1} {
+		if _, err := jwt.GenerateTokenWithCustomExpiry(1, "u", "admin", "admin", seconds); !errors.Is(err, jwt.ErrInvalidExpiry) {
+			t.Errorf("GenerateTokenWithCustomExpiry(%d) err = %v, want ErrInvalidExpiry", seconds, err)
+		}
+	}
+}
+
+func TestInvalidateTokenByIDRejectsEmptyJTI(t *testing.T) {
+	setupTestConfig()
+
+	if err := jwt.InvalidateTokenByID("", time.Now().Add(time.Hour)); !errors.Is(err, jwt.ErrEmptyJTI) {
+		t.Errorf("InvalidateTokenByID empty err = %v, want ErrEmptyJTI", err)
+	}
+}
+
+func TestRefreshTokenRejectsEmptyJTI(t *testing.T) {
+	setupTestConfig()
+	setupMiniRedis(t)
+
+	token := signTokenForTest(t, jwt.Claims{
+		UserID:   1,
+		Username: "legacy",
+		Role:     "admin",
+		UserType: "admin",
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ExpiresAt: gojwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  gojwt.NewNumericDate(time.Now()),
+			NotBefore: gojwt.NewNumericDate(time.Now()),
+			Issuer:    "xlgo",
+		},
+	})
+
+	if _, err := jwt.RefreshToken(token); !errors.Is(err, jwt.ErrEmptyJTI) {
+		t.Errorf("RefreshToken empty JTI err = %v, want ErrEmptyJTI", err)
+	}
+}
+
+func TestInvalidateTokenRejectsEmptyJTI(t *testing.T) {
+	setupTestConfig()
+	setupMiniRedis(t)
+
+	token := signTokenForTest(t, jwt.Claims{
+		UserID:   1,
+		Username: "legacy",
+		Role:     "admin",
+		UserType: "admin",
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ExpiresAt: gojwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  gojwt.NewNumericDate(time.Now()),
+			NotBefore: gojwt.NewNumericDate(time.Now()),
+			Issuer:    "xlgo",
+		},
+	})
+
+	if err := jwt.InvalidateToken(token); !errors.Is(err, jwt.ErrEmptyJTI) {
+		t.Errorf("InvalidateToken empty JTI err = %v, want ErrEmptyJTI", err)
+	}
+}
+
+func signTokenForTest(t *testing.T, claims jwt.Claims) string {
+	t.Helper()
+	token, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, claims).SignedString([]byte("test-secret-key-1234567890123456789012"))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return token
+}

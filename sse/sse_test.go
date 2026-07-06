@@ -1,6 +1,7 @@
 package sse_test
 
 import (
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -138,5 +139,49 @@ func TestSSEHeaders(t *testing.T) {
 	}
 	if w.Header().Get("Connection") != "keep-alive" {
 		t.Error("Connection should be keep-alive")
+	}
+}
+
+func TestSSEWriterRejectsEventNewlineInjection(t *testing.T) {
+	r := setupTestRouter()
+	var writeErr error
+	r.GET("/sse", func(c *gin.Context) {
+		writer, _ := sse.NewSSEWriter(c)
+		writeErr = writer.WriteEvent("message\nevent: hacked", "safe")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/sse", nil)
+	r.ServeHTTP(w, req)
+
+	if !errors.Is(writeErr, sse.ErrInvalidEventName) {
+		t.Fatalf("WriteEvent newline err = %v, want ErrInvalidEventName", writeErr)
+	}
+	if strings.Contains(w.Body.String(), "event: hacked") {
+		t.Fatalf("response contains injected event: %q", w.Body.String())
+	}
+}
+
+func TestSSEWriterSplitsMultilineData(t *testing.T) {
+	r := setupTestRouter()
+	r.GET("/sse", func(c *gin.Context) {
+		writer, _ := sse.NewSSEWriter(c)
+		if err := writer.WriteMessage("first\nevent: injected\r\nsecond"); err != nil {
+			t.Errorf("WriteMessage: %v", err)
+		}
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/sse", nil)
+	r.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if strings.Contains(body, "\nevent: injected") {
+		t.Fatalf("data newline escaped into event field: %q", body)
+	}
+	for _, want := range []string{"data: first", "data: event: injected", "data: second"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body = %q, want %q", body, want)
+		}
 	}
 }

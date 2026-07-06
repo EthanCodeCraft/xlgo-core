@@ -298,7 +298,7 @@ func UnzipWithOptions(zipPath, dstDir string, opts DecompressOptions) error {
 	// 用绝对路径作目标锚定根，避免相对路径 + `..` 组合绕过前缀校验（C5a）。
 	absDst, err := filepath.Abs(dstDir)
 	if err != nil {
-		absDst = dstDir
+		return fmt.Errorf("resolve unzip destination failed: %w", err)
 	}
 	absDst = filepath.Clean(absDst)
 

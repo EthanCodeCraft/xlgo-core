@@ -244,7 +244,7 @@ func (s *LocalStorage) safeJoin(parts ...string) (string, error) {
 }
 
 // Upload 上传文件
-func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string, error) {
+func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (ret string, err error) {
 	// 上传安全策略校验（大小 / 扩展名）；file.Size 由 multipart 解析时填，无需打开文件（C4b）。
 	if err := validateUploadSize(s.policy, file.Size); err != nil {
 		return "", err
@@ -294,13 +294,18 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 	if err != nil {
 		return "", fmt.Errorf("创建文件失败: %w", err)
 	}
-	defer dstFile.Close()
+	defer func() {
+		if cerr := dstFile.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		if err != nil {
+			ret = ""
+			_ = os.Remove(dst)
+		}
+	}()
 
 	// 复制文件内容。按策略实测封顶（P0）：超限即报错并清理已落盘的部分文件。
 	if _, err := io.Copy(dstFile, enforceUploadSize(s.policy, srcReader)); err != nil {
-		// 先关闭再删除（Windows 下删除打开中的文件会失败）；defer 的 Close 随后成为无害 no-op。
-		_ = dstFile.Close()
-		_ = os.Remove(dst)
 		return "", fmt.Errorf("保存文件失败: %w", err)
 	}
 
@@ -314,7 +319,7 @@ func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (string
 }
 
 // UploadFromBytes 从字节数组上传文件
-func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (string, error) {
+func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (ret string, err error) {
 	// 上传安全策略校验（C4b）
 	if err := validateUploadSize(s.policy, int64(len(data))); err != nil {
 		return "", err
@@ -360,7 +365,15 @@ func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (st
 	if err != nil {
 		return "", fmt.Errorf("创建文件失败: %w", err)
 	}
-	defer dstFile.Close()
+	defer func() {
+		if cerr := dstFile.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		if err != nil {
+			ret = ""
+			_ = os.Remove(dst)
+		}
+	}()
 
 	// 写入文件内容
 	if _, err := io.Copy(dstFile, srcReader); err != nil {
@@ -571,7 +584,11 @@ func (s *OSSStorage) GetURL(path string) string {
 
 // GetSignedURL 获取带签名的临时访问 URL（用于私有文件）
 func (s *OSSStorage) GetSignedURL(path string, expire time.Duration) (string, error) {
-	return s.bucket.SignURL(path, oss.HTTPGet, int64(expire.Seconds()))
+	key, err := sanitizeObjectKey(path)
+	if err != nil {
+		return "", err
+	}
+	return s.bucket.SignURL(key, oss.HTTPGet, int64(expire.Seconds()))
 }
 
 // Delete 删除 OSS 文件

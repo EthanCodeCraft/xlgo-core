@@ -14,11 +14,15 @@ package sse
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
+
+var ErrInvalidEventName = errors.New("sse: event name must not contain CR or LF")
 
 // SSEWriter SSE 写入器
 type SSEWriter struct {
@@ -54,10 +58,13 @@ func NewSSEWriter(c *gin.Context) (*SSEWriter, error) {
 // 写错误向上传播（C3b 修复）：旧实现丢弃 fmt.Fprintf 错误且恒 return nil，
 // 导致客户端断连后 Stream 守卫永不触发、消费循环不退出、上游 LLM 流持续运行。
 func (w *SSEWriter) WriteEvent(event, data string) error {
+	if strings.ContainsAny(event, "\r\n") {
+		return ErrInvalidEventName
+	}
 	if _, err := fmt.Fprintf(w.writer, "event: %s\n", event); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w.writer, "data: %s\n\n", data); err != nil {
+	if err := w.writeDataLines(data); err != nil {
 		return err
 	}
 	w.flusher.Flush()
@@ -67,11 +74,23 @@ func (w *SSEWriter) WriteEvent(event, data string) error {
 // WriteMessage 写入消息（无事件类型）
 // 格式: data: <data>\n\n
 func (w *SSEWriter) WriteMessage(data string) error {
-	if _, err := fmt.Fprintf(w.writer, "data: %s\n\n", data); err != nil {
+	if err := w.writeDataLines(data); err != nil {
 		return err
 	}
 	w.flusher.Flush()
 	return nil
+}
+
+func (w *SSEWriter) writeDataLines(data string) error {
+	data = strings.ReplaceAll(data, "\r\n", "\n")
+	data = strings.ReplaceAll(data, "\r", "\n")
+	for _, line := range strings.Split(data, "\n") {
+		if _, err := fmt.Fprintf(w.writer, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprint(w.writer, "\n")
+	return err
 }
 
 // WriteJSON 写入 JSON 数据

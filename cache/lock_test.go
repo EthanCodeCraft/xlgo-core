@@ -51,6 +51,10 @@ func TestLockErrors(t *testing.T) {
 	if ttl != 0 {
 		t.Error("GetLockTTL should return 0 without Redis")
 	}
+
+	if err := cache.UnlockByKey(ctx, "test_key"); !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("UnlockByKey without Redis should return ErrRedisNotReady, got %v", err)
+	}
 }
 
 func TestIncrDecr(t *testing.T) {

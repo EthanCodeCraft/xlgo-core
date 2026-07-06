@@ -53,6 +53,10 @@ var (
 	// 本实现仅支持 HMAC 族（HS256/HS384/HS512）；RS256 等非对称算法暂不支持，
 	// 不再静默回退 HS256——避免用户误以为在用非对称算法、实则 HMAC，并助长算法混淆攻击。
 	ErrUnsupportedAlgorithm = errors.New("jwt: 不支持的签名算法（仅支持 HS256/HS384/HS512）")
+	// ErrInvalidExpiry 过期时间非法。签发非正过期时间的 token 会立即失效或产生不可预期会话语义。
+	ErrInvalidExpiry = errors.New("jwt: 过期时间必须大于 0")
+	// ErrEmptyJTI 空 JTI 无法匹配任何正常 token，却会写入 jwt_bl: 这种永不命中的黑名单键。
+	ErrEmptyJTI = errors.New("jwt: jti 不能为空")
 )
 
 // validMethods 允许的签名算法名（HMAC 族）。ParseWithClaims 传 jwt.WithValidMethods 固定算法，
@@ -125,6 +129,10 @@ func blacklistCtx() (context.Context, context.CancelFunc) {
 // 无 Redis 时返回 ErrBlacklistUnavailable（C9a 修复）：让调用方（RefreshToken/InvalidateToken）
 // 感知黑名单不可用并 fail-closed，避免无 Redis 时静默成功致撤销失效。
 func (tb *TokenBlacklist) Add(jti string, expiry time.Time) error {
+	if strings.TrimSpace(jti) == "" {
+		return ErrEmptyJTI
+	}
+
 	client := tb.redisClient()
 	if client == nil {
 		// Redis 未启用，黑名单不可用——fail-closed 让调用方决策。
@@ -230,7 +238,17 @@ func (m *Manager) Blacklist() *TokenBlacklist {
 // GenerateToken 生成 JWT Token
 func GenerateToken(userID uint, username, role, userType string) (string, error) {
 	cfg := config.Get()
+	var expiry time.Duration
+	if cfg != nil {
+		expiry = cfg.JWT.Expire
+	}
+	return generateTokenWithExpiry(cfg, userID, username, role, userType, expiry)
+}
 
+func generateTokenWithExpiry(cfg *config.Config, userID uint, username, role, userType string, expiry time.Duration) (string, error) {
+	if expiry <= 0 {
+		return "", ErrInvalidExpiry
+	}
 	// P0：先校验密钥非空与算法受支持（fail-closed）。secretKey 亦守卫 cfg==nil，
 	// 通过后 cfg 保证非空，后续访问 cfg.JWT.* 安全。
 	key, err := secretKey(cfg)
@@ -255,7 +273,7 @@ func GenerateToken(userID uint, username, role, userType string) (string, error)
 		UserType: userType,
 		JTI:      jti,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(cfg.JWT.Expire)),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiry)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			NotBefore: jwt.NewNumericDate(time.Now()),
 			Issuer:    issuerOrDefault(cfg.JWT.Issuer),
@@ -270,39 +288,10 @@ func GenerateToken(userID uint, username, role, userType string) (string, error)
 // GenerateTokenWithCustomExpiry 生成带自定义过期时间的 Token
 func GenerateTokenWithCustomExpiry(userID uint, username, role, userType string, expireSeconds int) (string, error) {
 	cfg := config.Get()
-
-	// P0：先校验密钥非空与算法受支持（fail-closed，见 GenerateToken）。
-	key, err := secretKey(cfg)
-	if err != nil {
-		return "", err
+	if expireSeconds <= 0 {
+		return "", ErrInvalidExpiry
 	}
-	method, err := signingMethod(cfg.JWT.Algorithm)
-	if err != nil {
-		return "", err
-	}
-
-	jti, err := generateJTI()
-	if err != nil {
-		return "", err
-	}
-
-	claims := Claims{
-		UserID:   userID,
-		Username: username,
-		Role:     role,
-		UserType: userType,
-		JTI:      jti,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expireSeconds) * time.Second)),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
-			NotBefore: jwt.NewNumericDate(time.Now()),
-			Issuer:    issuerOrDefault(cfg.JWT.Issuer),
-			ID:        jti,
-		},
-	}
-
-	token := jwt.NewWithClaims(method, claims)
-	return token.SignedString(key)
+	return generateTokenWithExpiry(cfg, userID, username, role, userType, time.Duration(expireSeconds)*time.Second)
 }
 
 // issuerOrDefault 返回配置的 issuer，未配置时回退 "xlgo"。
@@ -329,11 +318,33 @@ func signingMethod(algorithm string) (jwt.SigningMethod, error) {
 	}
 }
 
+func parseOptions(cfg *config.Config) []jwt.ParserOption {
+	issuer := "xlgo"
+	if cfg != nil {
+		issuer = issuerOrDefault(cfg.JWT.Issuer)
+	}
+	return []jwt.ParserOption{
+		jwt.WithValidMethods(validMethods),
+		jwt.WithIssuer(issuer),
+	}
+}
+
+func validateIssuer(cfg *config.Config, claims *Claims) error {
+	want := "xlgo"
+	if cfg != nil {
+		want = issuerOrDefault(cfg.JWT.Issuer)
+	}
+	if claims == nil || claims.Issuer != want {
+		return ErrTokenInvalid
+	}
+	return nil
+}
+
 // ParseToken 解析 JWT Token
 func ParseToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), jwt.WithValidMethods(validMethods))
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), parseOptions(cfg)...)
 
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired) {
@@ -363,15 +374,22 @@ func ParseToken(tokenString string) (*Claims, error) {
 func InvalidateToken(tokenString string) error {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), jwt.WithValidMethods(validMethods))
+	opts := append(parseOptions(cfg), jwt.WithoutClaimsValidation())
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), opts...)
 
 	if err != nil {
-		// Token 无效或已过期，无需加入黑名单
+		// Token 签名/格式/issuer 无效，无需加入黑名单。
 		return nil
 	}
 
 	if claims, ok := token.Claims.(*Claims); ok {
-		if claims.JTI != "" && claims.ExpiresAt != nil {
+		if err := validateIssuer(cfg, claims); err != nil {
+			return nil
+		}
+		if strings.TrimSpace(claims.JTI) == "" {
+			return ErrEmptyJTI
+		}
+		if claims.ExpiresAt != nil {
 			return currentBlacklist().Add(claims.JTI, claims.ExpiresAt.Time)
 		}
 	}
@@ -382,6 +400,9 @@ func InvalidateToken(tokenString string) error {
 // InvalidateTokenByID 直接通过 JTI 使 Token 失效
 // 参数: jti JWT ID，expiry 过期时间
 func InvalidateTokenByID(jti string, expiry time.Time) error {
+	if strings.TrimSpace(jti) == "" {
+		return ErrEmptyJTI
+	}
 	return currentBlacklist().Add(jti, expiry)
 }
 
@@ -397,13 +418,24 @@ func RefreshToken(tokenString string) (string, error) {
 	}
 
 	// 将旧 Token 加入黑名单；失败则不签发新 token（C9b：禁止吞 Add 错误）。
-	if claims.JTI != "" && claims.ExpiresAt != nil {
+	if strings.TrimSpace(claims.JTI) == "" {
+		return "", ErrEmptyJTI
+	}
+	if claims.ExpiresAt != nil {
 		if err := currentBlacklist().Add(claims.JTI, claims.ExpiresAt.Time); err != nil {
 			return "", fmt.Errorf("刷新令牌失败：旧令牌撤销失败: %w", err)
 		}
 	}
 
-	return GenerateToken(claims.UserID, claims.Username, claims.Role, claims.UserType)
+	cfg := config.Get()
+	var expiry time.Duration
+	if cfg != nil {
+		expiry = cfg.JWT.RefreshExpire
+	}
+	if expiry <= 0 && cfg != nil {
+		expiry = cfg.JWT.Expire
+	}
+	return generateTokenWithExpiry(cfg, claims.UserID, claims.Username, claims.Role, claims.UserType, expiry)
 }
 
 // GetJTI 从 Token 中提取 JTI（不验证签名）
@@ -431,14 +463,17 @@ func IsTokenRevoked(jti string) bool {
 func GetClaimsFromToken(tokenString string) (*Claims, error) {
 	cfg := config.Get()
 
-	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg),
-		jwt.WithValidMethods(validMethods), jwt.WithoutClaimsValidation())
+	opts := append(parseOptions(cfg), jwt.WithoutClaimsValidation())
+	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), opts...)
 
 	if err != nil {
 		return nil, err
 	}
 
 	if claims, ok := token.Claims.(*Claims); ok {
+		if err := validateIssuer(cfg, claims); err != nil {
+			return nil, err
+		}
 		return claims, nil
 	}
 

@@ -299,3 +299,82 @@ func TestTryLockRespectsCtxCancel(t *testing.T) {
 		t.Errorf("TryLock took %v, should return shortly after ctx cancel (C1c: time.Sleep ignored ctx)", elapsed)
 	}
 }
+
+func TestLockRejectsSubMillisecondTTL(t *testing.T) {
+	setupMiniRedis(t)
+	ctx := context.Background()
+
+	if token, err := cache.NewLock(ctx, "m10:ttl", time.Nanosecond); !errors.Is(err, cache.ErrInvalidLockTTL) || token != nil {
+		t.Fatalf("NewLock sub-ms ttl token=%v err=%v, want ErrInvalidLockTTL", token, err)
+	}
+
+	token, err := cache.NewLock(ctx, "m10:ttl-valid", time.Second)
+	if err != nil || token == nil {
+		t.Fatalf("NewLock valid setup token=%v err=%v", token, err)
+	}
+	defer cache.Unlock(ctx, token)
+
+	if err := cache.ExtendLock(ctx, token, 0); !errors.Is(err, cache.ErrInvalidLockTTL) {
+		t.Errorf("ExtendLock zero ttl err = %v, want ErrInvalidLockTTL", err)
+	}
+}
+
+func TestWithLockAutoExtendRejectsNonPositiveInterval(t *testing.T) {
+	setupMiniRedis(t)
+	called := false
+
+	err := cache.WithLockAutoExtend(context.Background(), "m10:interval", time.Second, 0, func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, cache.ErrInvalidLockRetryInterval) {
+		t.Fatalf("WithLockAutoExtend zero interval err = %v, want ErrInvalidLockRetryInterval", err)
+	}
+	if called {
+		t.Fatal("WithLockAutoExtend should not run fn with invalid interval")
+	}
+}
+
+func TestWithLockHeldReturnsErrLockNotAcquired(t *testing.T) {
+	setupMiniRedis(t)
+	ctx := context.Background()
+	key := "m10:not-acquired"
+
+	holder, err := cache.NewLock(ctx, key, time.Second)
+	if err != nil || holder == nil {
+		t.Fatalf("setup holder token=%v err=%v", holder, err)
+	}
+	defer cache.Unlock(ctx, holder)
+
+	called := false
+	err = cache.WithLock(ctx, key, time.Second, func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, cache.ErrLockNotAcquired) {
+		t.Fatalf("WithLock held err = %v, want ErrLockNotAcquired", err)
+	}
+	if called {
+		t.Fatal("WithLock should not run fn when lock is held")
+	}
+}
+
+func TestTryLockExhaustedReturnsErrLockNotAcquired(t *testing.T) {
+	setupMiniRedis(t)
+	ctx := context.Background()
+	key := "m10:try-exhausted"
+
+	holder, err := cache.NewLock(ctx, key, time.Second)
+	if err != nil || holder == nil {
+		t.Fatalf("setup holder token=%v err=%v", holder, err)
+	}
+	defer cache.Unlock(ctx, holder)
+
+	token, err := cache.TryLock(ctx, key, time.Second, time.Millisecond, 2)
+	if !errors.Is(err, cache.ErrLockNotAcquired) {
+		t.Fatalf("TryLock exhausted err = %v, want ErrLockNotAcquired", err)
+	}
+	if token != nil {
+		t.Fatalf("TryLock exhausted token = %v, want nil", token)
+	}
+}
