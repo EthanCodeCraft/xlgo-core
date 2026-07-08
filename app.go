@@ -528,7 +528,7 @@ func (a *App) rollbackReplacedResources() error {
 	var errs []error
 	if a.initializedMySQL {
 		if a.previousDB != nil {
-			database.SetDefaultManager(a.previousDB)
+			database.SwapDefaultManager(a.previousDB)
 		}
 		if a.dbManager != nil {
 			if err := a.dbManager.Close(); err != nil {
@@ -541,7 +541,7 @@ func (a *App) rollbackReplacedResources() error {
 	}
 	if a.initializedRedis {
 		if a.previousRedis != nil {
-			database.SetDefaultRedisManager(a.previousRedis)
+			database.SwapDefaultRedisManager(a.previousRedis)
 		}
 		if a.redisManager != nil {
 			if err := a.redisManager.Close(); err != nil {
@@ -632,8 +632,7 @@ func (a *App) doInit() error {
 		if err := dbm.InitDB(cfg); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
 		}
-		a.previousDB = database.GetDefaultManager()
-		database.SetDefaultManager(dbm)
+		a.previousDB = database.SwapDefaultManager(dbm)
 		a.dbManager = dbm
 		a.initializedMySQL = true
 		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "mysql", Check: func(ctx context.Context) error {
@@ -650,8 +649,7 @@ func (a *App) doInit() error {
 		if err := rm.Init(cfg); err != nil {
 			return fmt.Errorf("初始化 Redis 失败: %w", err)
 		}
-		a.previousRedis = database.GetDefaultRedisManager()
-		database.SetDefaultRedisManager(rm)
+		a.previousRedis = database.SwapDefaultRedisManager(rm)
 		a.redisManager = rm
 		a.initializedRedis = true
 		a.healthChecks = append(a.healthChecks, router.HealthCheck{Name: "redis", Check: rm.HealthCheck})

@@ -241,3 +241,70 @@ func TestC11HealthCheckLockedRead(t *testing.T) {
 		t.Fatal("expected error for gorm.DB without ConnPool")
 	}
 }
+
+func TestSetDefaultManagerClosesReplacedManager(t *testing.T) {
+	old := NewManager(nil)
+	old.mu.Lock()
+	old.master = sentinelDB()
+	old.replicas = []*gorm.DB{sentinelDB()}
+	old.replicaHealthy = make([]atomic.Bool, 1)
+	old.replicaHealthy[0].Store(true)
+	old.replicaHealthSet = true
+	old.mu.Unlock()
+	old.healthy.Store(true)
+
+	orig := SwapDefaultManager(old)
+	t.Cleanup(func() {
+		current := SwapDefaultManager(orig)
+		if current != nil && current != orig {
+			_ = current.Close()
+		}
+	})
+
+	next := NewManager(nil)
+	SetDefaultManager(next)
+	if GetDefaultManager() != next {
+		t.Fatal("SetDefaultManager 应安装新的默认 manager")
+	}
+
+	old.mu.Lock()
+	defer old.mu.Unlock()
+	if old.master != nil || old.replicas != nil || old.replicaHealthy != nil || old.replicaHealthSet {
+		t.Fatal("SetDefaultManager 应关闭并清空被替换的旧 manager，避免连接池泄漏")
+	}
+	if old.healthy.Load() {
+		t.Fatal("SetDefaultManager 关闭旧 manager 后健康状态应为 false")
+	}
+}
+
+func TestSwapDefaultManagerPreservesReplacedManager(t *testing.T) {
+	old := NewManager(nil)
+	old.mu.Lock()
+	old.master = sentinelDB()
+	old.replicas = []*gorm.DB{sentinelDB()}
+	old.mu.Unlock()
+
+	orig := SwapDefaultManager(old)
+	t.Cleanup(func() {
+		current := SwapDefaultManager(orig)
+		if current != nil && current != orig {
+			_ = current.Close()
+		}
+		_ = old.Close()
+	})
+
+	next := NewManager(nil)
+	previous := SwapDefaultManager(next)
+	if previous != old {
+		t.Fatal("SwapDefaultManager 应返回被替换的旧 manager")
+	}
+	if GetDefaultManager() != next {
+		t.Fatal("SwapDefaultManager 应安装新的默认 manager")
+	}
+
+	old.mu.Lock()
+	defer old.mu.Unlock()
+	if old.master == nil || len(old.replicas) != 1 {
+		t.Fatal("SwapDefaultManager 不应关闭旧 manager，旧资源需可用于失败回滚")
+	}
+}

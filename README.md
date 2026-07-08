@@ -20,7 +20,7 @@ db := database.GetDB()
 // 同一份代码，也能注入实例 / 跑多套 / 塞 mock
 myDB := database.NewManager(cfg)
 myDB.Open(ctx)                       // 独立实例，不受全局影响
-database.SetDefaultManager(myDB)     // 或提升为全局默认（并发安全）
+database.SetDefaultManager(myDB)     // 提升为全局默认，并关闭旧默认 manager
 mockCache := &fakeCacheSvc{}
 cache.SetDefaultCacheManager(&cache.CacheManager{}) // 测试注入
 ```
@@ -275,6 +275,8 @@ defer mgr.Close()
 // 从库选择策略：轮询（默认随机）
 database.SetReplicaPicker(&database.RoundRobinPicker{})
 ```
+
+`database.SetDefaultManager(m)` 表示把新 manager 接管为全局默认，并关闭被替换的旧 manager，避免连接池泄漏。需要失败回滚或延迟释放旧资源的初始化流程，请使用 `database.SwapDefaultManager(m)` 并自行决定何时关闭返回的旧 manager。
 
 #### 注册自定义 GORM 方言
 

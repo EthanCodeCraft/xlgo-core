@@ -414,11 +414,28 @@ func init() {
 	DefaultManager.Store(NewManager(nil))
 }
 
-// SetDefaultManager 提升指定 Manager 为全局默认（主线A 修复：atomic.Store，并发安全）。
+// SwapDefaultManager 将指定 Manager 置为全局默认，并返回被替换的旧 Manager。
+// 旧 Manager 不会被关闭，供 App 初始化这类需要失败回滚的生命周期流程暂存。
+// nil 被忽略，以防 facade Load 到 nil panic。
+func SwapDefaultManager(m *Manager) *Manager {
+	if m == nil {
+		return DefaultManager.Load()
+	}
+	return DefaultManager.Swap(m)
+}
+
+// SetDefaultManager 提升指定 Manager 为全局默认，并关闭被替换的旧 Manager。
 // 用于多实例场景或测试注入。nil 被忽略以防 facade Load 到 nil panic。
+// 若调用方需要保留旧 Manager 用于回滚，请使用 SwapDefaultManager。
 func SetDefaultManager(m *Manager) {
-	if m != nil {
-		DefaultManager.Store(m)
+	if m == nil {
+		return
+	}
+	old := SwapDefaultManager(m)
+	if old != nil && old != m {
+		if err := old.Close(); err != nil {
+			logger.Warnf("关闭被替换的旧数据库 manager 失败: %v", err)
+		}
 	}
 }
 

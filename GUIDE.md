@@ -334,6 +334,8 @@ mgr.SetPicker(&database.RoundRobinPicker{})
 db := mgr.FromContext(ctx)
 ```
 
+`database.SetDefaultManager(m)` 会把新 manager 提升为全局默认，并关闭被替换的旧 manager，避免连接池泄漏。需要失败回滚或延迟释放旧资源时，请使用 `database.SwapDefaultManager(m)` 并自行关闭其返回的旧 manager。
+
 ### 4.1.3 注册自定义 GORM 驱动
 
 `database.RegisterDialect` 一次注册即让 `database.driver: <name>` 生效，DSN 构建器同步登记到 `config` 包：

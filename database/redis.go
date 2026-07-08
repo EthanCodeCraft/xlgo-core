@@ -38,11 +38,28 @@ func init() {
 // NewRedisManager 创建 Redis 管理器实例。
 func NewRedisManager() *RedisManager { return &RedisManager{} }
 
-// SetDefaultRedisManager 提升指定 RedisManager 为全局默认，后续包级 facade 走它。
-// 用于多实例场景或测试注入 mock。并发安全（atomic.Store）。
+// SwapDefaultRedisManager 将指定 RedisManager 置为全局默认，并返回被替换的旧 Manager。
+// 旧 Manager 不会被关闭，供 App 初始化这类需要失败回滚的生命周期流程暂存。
+// nil 被忽略，以防 facade Load 到 nil panic。
+func SwapDefaultRedisManager(m *RedisManager) *RedisManager {
+	if m == nil {
+		return DefaultRedis.Load()
+	}
+	return DefaultRedis.Swap(m)
+}
+
+// SetDefaultRedisManager 提升指定 RedisManager 为全局默认，并关闭被替换的旧 Manager。
+// 用于多实例场景或测试注入 mock。并发安全。若调用方需要保留旧 Manager
+// 用于回滚，请使用 SwapDefaultRedisManager。
 func SetDefaultRedisManager(m *RedisManager) {
-	if m != nil {
-		DefaultRedis.Store(m)
+	if m == nil {
+		return
+	}
+	old := SwapDefaultRedisManager(m)
+	if old != nil && old != m {
+		if err := old.Close(); err != nil {
+			logger.Warnf("关闭被替换的旧 Redis manager 失败: %v", err)
+		}
 	}
 }
 
