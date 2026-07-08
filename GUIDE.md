@@ -896,16 +896,20 @@ r.Use(middleware.CSRFForAPI())
 token := middleware.GetCSRFToken(c)
 ```
 
-### 8.3 限流（支持 Redis 分布式限流）
+### 8.4 限流（支持 Redis 分布式限流）
 
 ```go
 // 初始化限流器
 middleware.InitRateLimiters()
 
 // 内存限流（单实例）
-r.POST("/login", middleware.LoginRateLimit(), handler.Login)     // 每分钟10次
-r.POST("/upload", middleware.UploadRateLimit(), handler.Upload)  // 每分钟20次
-r.Use(middleware.APIRateLimit())                                  // 每分钟100次
+r.POST("/login", middleware.LoginRateLimit(), func(c *gin.Context) {
+    response.Success(c, gin.H{"token": "..."})
+}) // 每分钟10次
+r.POST("/upload", middleware.UploadRateLimit(), func(c *gin.Context) {
+    response.Success(c, gin.H{"file": "..."})
+}) // 每分钟20次
+r.Use(middleware.APIRateLimit()) // 每分钟100次
 
 // 自定义内存限流
 r.Use(middleware.CustomRateLimit(50, time.Minute)) // 每分钟50次
@@ -938,7 +942,7 @@ defer middleware.StopRateLimiters()
 - 内存限流：单实例使用，简单高效
 - Redis 限流：多实例共享，滑动窗口算法，分布式场景必需
 
-### 8.4 路由架构
+### 8.5 路由架构
 
 框架提供灵活的路由系统，支持模块化、版本化 API 和中间件分组。
 

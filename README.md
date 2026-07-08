@@ -606,10 +606,14 @@ userType := middleware.GetUserType(c)
 
 ```go
 // 登录限流（每分钟 10 次）
-r.POST("/login", middleware.LoginRateLimit(), handler.Login)
+r.POST("/login", middleware.LoginRateLimit(), func(c *gin.Context) {
+    response.Success(c, gin.H{"token": "..."})
+})
 
 // 上传限流（每分钟 20 次）
-r.POST("/upload", middleware.UploadRateLimit(), handler.Upload)
+r.POST("/upload", middleware.UploadRateLimit(), func(c *gin.Context) {
+    response.Success(c, gin.H{"file": "..."})
+})
 
 // 自定义限流
 r.Use(middleware.CustomRateLimit(50, time.Minute))
