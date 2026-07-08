@@ -24,7 +24,7 @@ go run ./examples/minimal
 go run ./examples/full
 ```
 
-启动后自动迁移 user 表。接口：
+启动后自动迁移 user 表，并初始化示例用户 `alice/secret`（密码以 bcrypt 哈希保存）。接口：
 
 | 方法 | 路径 | 说明 | 认证 |
 |---|---|---|---|
@@ -39,4 +39,12 @@ curl -X POST http://localhost:8082/api/v1/login \
   -d '{"username":"alice","password":"secret"}'
 ```
 
-> 示例代码为演示用途，密码明文存储、未做参数校验，生产环境请使用 bcrypt 哈希密码并配合 `validation` 包校验入参。
+创建用户示例：
+```bash
+curl -X POST http://localhost:8082/api/v1/users \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"username":"bob","password":"s3cret"}'
+```
+
+> 示例代码为演示用途，已演示 bcrypt 密码哈希与登录校验；生产环境仍需配合 `validation` 包完善入参校验、密码强度策略与用户注册流程。

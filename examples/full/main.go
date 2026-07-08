@@ -10,12 +10,16 @@
 //	GET  /api/v1/users/:id       （需 Authorization: Bearer <token>）
 //	POST /api/v1/users           （创建用户）
 //
+// 示例会在启动时初始化 alice/secret，密码以 bcrypt 哈希保存。
+//
 // 运行：
 //
 //	go run ./examples/full
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 
@@ -26,6 +30,7 @@ import (
 	"github.com/EthanCodeCraft/xlgo-core/repository"
 	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/EthanCodeCraft/xlgo-core/router"
+	"github.com/EthanCodeCraft/xlgo-core/validation"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -34,7 +39,7 @@ import (
 type User struct {
 	gorm.Model
 	Username string `gorm:"uniqueIndex;size:64" json:"username"`
-	Password string `gorm:"size:128" json:"-"` // 实际项目应存 bcrypt 哈希
+	Password string `gorm:"size:128" json:"-"` // bcrypt 哈希，永不返回给客户端
 	UserType string `gorm:"size:32" json:"user_type"`
 }
 
@@ -46,6 +51,12 @@ func main() {
 		xlgo.WithModels(&User{}),
 		xlgo.WithMiddlewares(middleware.Logger(), middleware.CORS()),
 		xlgo.WithModules(router.ModuleFunc(registerRoutes)),
+		xlgo.WithHook(xlgo.Hook{
+			Name: "seed-example-user",
+			OnInit: func(*xlgo.App) error {
+				return ensureExampleUser(context.Background())
+			},
+		}),
 	)
 
 	// 初始化 user repository（App.Init 之后 master DB 才可用，这里在 registerRoutes 里延迟拿）
@@ -82,10 +93,13 @@ func login(c *gin.Context) {
 		return
 	}
 
-	// 示例简化：查询用户，不校验密码哈希
 	u, err := userRepo.FindOne(c.Request.Context(), "username = ?", req.Username)
 	if err != nil {
-		response.Fail(c, "用户不存在")
+		response.Fail(c, "用户名或密码错误")
+		return
+	}
+	if !validation.CheckPassword(u.Password, req.Password) {
+		response.Fail(c, "用户名或密码错误")
 		return
 	}
 
@@ -114,15 +128,51 @@ func getUser(c *gin.Context) {
 }
 
 func createUser(c *gin.Context) {
-	var u User
-	if err := c.ShouldBindJSON(&u); err != nil {
+	var req struct {
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
+		UserType string `json:"user_type"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Fail(c, "参数错误")
 		return
 	}
-	u.UserType = "user"
+
+	hash, err := validation.HashPassword(req.Password)
+	if err != nil {
+		response.ServerError(c, "密码加密失败")
+		return
+	}
+	u := User{
+		Username: req.Username,
+		Password: hash,
+		UserType: req.UserType,
+	}
+	if u.UserType == "" {
+		u.UserType = "user"
+	}
 	if err := userRepo.Create(c.Request.Context(), &u); err != nil {
 		response.Fail(c, "创建失败: "+err.Error())
 		return
 	}
 	response.Success(c, u)
+}
+
+func ensureExampleUser(ctx context.Context) error {
+	_, err := userRepo.FindOne(ctx, "username = ?", "alice")
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	hash, err := validation.HashPassword("secret")
+	if err != nil {
+		return err
+	}
+	return userRepo.Create(ctx, &User{
+		Username: "alice",
+		Password: hash,
+		UserType: "user",
+	})
 }
