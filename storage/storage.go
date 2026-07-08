@@ -41,8 +41,10 @@ var (
 	ErrPathTraversal = errors.New("path traversal detected")
 	// ErrInvalidPath 路径非法（空、含 NUL 等）。
 	ErrInvalidPath = errors.New("invalid path")
-	// ErrUploadTooLarge 上传实际字节数超过 MaxSizeBytes（P0）。客户端声明的 file.Size
-	// 不可信，故除前置校验外，拷贝阶段按实际字节封顶，防止声明小体积却流式发送大 body 撑爆磁盘/OSS。
+	// ErrInvalidFile 上传文件参数非法，例如 nil *multipart.FileHeader。
+	ErrInvalidFile = errors.New("invalid file")
+	// ErrUploadTooLarge 上传声明大小或实际字节数超过 MaxSizeBytes（P0）。客户端声明的 file.Size
+	// 不可信，故除前置校验外，拷贝阶段也按实际字节封顶，防止声明小体积却流式发送大 body 撑爆磁盘/OSS。
 	ErrUploadTooLarge = errors.New("upload exceeds max size")
 )
 
@@ -71,7 +73,7 @@ func resolveMaxRead(n int64) int64 {
 // 在拷贝阶段按实际字节数二次把关（P0）。
 func validateUploadSize(p config.UploadPolicy, size int64) error {
 	if p.MaxSizeBytes > 0 && size > p.MaxSizeBytes {
-		return fmt.Errorf("文件大小 %d 超过上限 %d: %w", size, p.MaxSizeBytes, ErrInvalidPath)
+		return fmt.Errorf("文件大小 %d 超过上限 %d: %w", size, p.MaxSizeBytes, ErrUploadTooLarge)
 	}
 	return nil
 }
@@ -186,6 +188,14 @@ func sanitizeObjectKey(key string) (string, error) {
 	return path.Clean(key), nil
 }
 
+func publicURL(baseURL, key string) string {
+	cleanKey, err := sanitizeObjectKey(key)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(baseURL, "/") + "/" + cleanKey
+}
+
 // LocalStorage 本地存储
 type LocalStorage struct {
 	rootAbs      string // 绝对根路径（已 Clean），前缀锚定用（C4a）
@@ -199,7 +209,12 @@ type LocalStorage struct {
 // 安全约束：Path 指向的根目录应为框架独占目录，不与用户可控内容混用。
 // safeJoin 已防 `..` 路径穿越，但若根目录内已存在指向外部的符号链接，
 // Get 会跟随 symlink 读到根外内容——需保证攻击者无法在根目录内创建 symlink。
+// cfg 为 nil、Path 无法解析或根目录本身是 symlink 时，实例 fail-closed：
+// 后续文件操作返回 ErrStorageNotInitialized。
 func NewLocalStorage(cfg *config.LocalStorageConfig) *LocalStorage {
+	if cfg == nil {
+		return &LocalStorage{maxReadBytes: resolveMaxRead(0)}
+	}
 	// 用绝对路径作根锚定，避免相对路径 + `..` 组合绕过前缀校验（C4a）。
 	var rootAbs string
 	abs, err := filepath.Abs(cfg.Path)
@@ -212,6 +227,12 @@ func NewLocalStorage(cfg *config.LocalStorageConfig) *LocalStorage {
 		rootAbs = ""
 	} else {
 		rootAbs = filepath.Clean(abs)
+	}
+	if rootAbs != "" {
+		if info, err := os.Lstat(rootAbs); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			logger.Error("storage: local storage root must not be a symlink", zap.String("path", rootAbs))
+			rootAbs = ""
+		}
 	}
 	return &LocalStorage{
 		rootAbs:      rootAbs,
@@ -245,6 +266,9 @@ func (s *LocalStorage) safeJoin(parts ...string) (string, error) {
 
 // Upload 上传文件
 func (s *LocalStorage) Upload(file *multipart.FileHeader, subdir string) (ret string, err error) {
+	if file == nil {
+		return "", ErrInvalidFile
+	}
 	// 上传安全策略校验（大小 / 扩展名）；file.Size 由 multipart 解析时填，无需打开文件（C4b）。
 	if err := validateUploadSize(s.policy, file.Size); err != nil {
 		return "", err
@@ -391,7 +415,7 @@ func (s *LocalStorage) UploadFromBytes(data []byte, filename, subdir string) (re
 
 // GetURL 获取文件访问 URL
 func (s *LocalStorage) GetURL(path string) string {
-	return fmt.Sprintf("%s/%s", s.baseURL, path)
+	return publicURL(s.baseURL, path)
 }
 
 // Delete 删除文件
@@ -462,6 +486,9 @@ type OSSStorage struct {
 
 // NewOSSStorage 创建 OSS 存储实例
 func NewOSSStorage(cfg *config.OSSStorageConfig) (*OSSStorage, error) {
+	if cfg == nil {
+		return nil, ErrStorageNotInitialized
+	}
 	client, err := oss.New(cfg.Endpoint, cfg.AccessKeyID, cfg.AccessKeySecret)
 	if err != nil {
 		return nil, fmt.Errorf("创建 OSS 客户端失败: %w", err)
@@ -485,6 +512,9 @@ func NewOSSStorage(cfg *config.OSSStorageConfig) (*OSSStorage, error) {
 
 // Upload 上传文件到 OSS
 func (s *OSSStorage) Upload(file *multipart.FileHeader, subdir string) (string, error) {
+	if file == nil {
+		return "", ErrInvalidFile
+	}
 	// 上传安全策略校验（C4b）
 	if err := validateUploadSize(s.policy, file.Size); err != nil {
 		return "", err
@@ -576,10 +606,14 @@ func (s *OSSStorage) UploadFromBytes(data []byte, filename, subdir string) (stri
 
 // GetURL 获取文件访问 URL
 func (s *OSSStorage) GetURL(path string) string {
-	if s.baseURL != "" {
-		return fmt.Sprintf("%s/%s", s.baseURL, path)
+	cleanKey, err := sanitizeObjectKey(path)
+	if err != nil {
+		return ""
 	}
-	return fmt.Sprintf("https://%s.%s/%s", s.bucketName, s.endpoint, path)
+	if s.baseURL != "" {
+		return strings.TrimRight(s.baseURL, "/") + "/" + cleanKey
+	}
+	return fmt.Sprintf("https://%s.%s/%s", s.bucketName, s.endpoint, cleanKey)
 }
 
 // GetSignedURL 获取带签名的临时访问 URL（用于私有文件）
@@ -674,6 +708,9 @@ func SetDefaultStorageManager(m *StorageManager) {
 
 // Init 初始化存储
 func (m *StorageManager) Init(cfg *config.StorageConfig) error {
+	if cfg == nil {
+		return ErrStorageNotInitialized
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

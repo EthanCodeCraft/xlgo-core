@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -62,5 +63,30 @@ func TestResolveMaxRead(t *testing.T) {
 	}
 	if got := resolveMaxRead(2048); got != 2048 {
 		t.Errorf("resolveMaxRead(2048) = %d, want 2048", got)
+	}
+}
+
+func TestNewOSSStorageNilConfig(t *testing.T) {
+	if _, err := NewOSSStorage(nil); !errors.Is(err, ErrStorageNotInitialized) {
+		t.Fatalf("NewOSSStorage(nil) err = %v, want ErrStorageNotInitialized", err)
+	}
+}
+
+func TestOSSStorageGetURLSanitizesPath(t *testing.T) {
+	s := &OSSStorage{
+		baseURL:    "https://cdn.example.com/",
+		bucketName: "bucket",
+		endpoint:   "oss.example.com",
+	}
+	if got := s.GetURL("docs//a.txt"); got != "https://cdn.example.com/docs/a.txt" {
+		t.Fatalf("GetURL clean path = %q", got)
+	}
+	if got := s.GetURL("../secret.txt"); got != "" {
+		t.Fatalf("GetURL traversal = %q, want empty", got)
+	}
+
+	s.baseURL = ""
+	if got := s.GetURL("docs/a.txt"); got != "https://bucket.oss.example.com/docs/a.txt" {
+		t.Fatalf("GetURL endpoint fallback = %q", got)
 	}
 }

@@ -196,8 +196,8 @@ func TestLocalStorageGetReadLimit(t *testing.T) {
 func TestLocalStorageUploadSizeLimit(t *testing.T) {
 	s := newLocalStorageWithPolicy(t, config.UploadPolicy{MaxSizeBytes: 5}, 0)
 	fh := makeFileHeader(t, "file", "big.txt", "text/plain", []byte("0123456789")) // 10 字节
-	if _, err := s.Upload(fh, "docs"); !errors.Is(err, storage.ErrInvalidPath) {
-		t.Errorf("Upload over size err = %v, want ErrInvalidPath", err)
+	if _, err := s.Upload(fh, "docs"); !errors.Is(err, storage.ErrUploadTooLarge) {
+		t.Errorf("Upload over size err = %v, want ErrUploadTooLarge", err)
 	}
 }
 
@@ -239,14 +239,14 @@ func TestLocalStorageUploadMIMESniff(t *testing.T) {
 // 回归 C4b：UploadFromBytes 同样受策略约束（大小 / 扩展名 / MIME）。
 func TestLocalStorageUploadFromBytesPolicy(t *testing.T) {
 	s := newLocalStorageWithPolicy(t, config.UploadPolicy{
-		MaxSizeBytes:  100,
-		AllowedExts:   []string{".txt"},
-		AllowedMIMEs:  []string{"text/plain"},
+		MaxSizeBytes: 100,
+		AllowedExts:  []string{".txt"},
+		AllowedMIMEs: []string{"text/plain"},
 	}, 0)
 
 	// 超限
-	if _, err := s.UploadFromBytes(make([]byte, 200), "ok.txt", "docs"); !errors.Is(err, storage.ErrInvalidPath) {
-		t.Errorf("UploadFromBytes over size err = %v, want ErrInvalidPath", err)
+	if _, err := s.UploadFromBytes(make([]byte, 200), "ok.txt", "docs"); !errors.Is(err, storage.ErrUploadTooLarge) {
+		t.Errorf("UploadFromBytes over size err = %v, want ErrUploadTooLarge", err)
 	}
 	// 扩展名不符
 	if _, err := s.UploadFromBytes([]byte("hi"), "evil.php", "docs"); !errors.Is(err, storage.ErrInvalidPath) {
@@ -293,5 +293,52 @@ func TestLocalStorageZeroPolicyAllowsAll(t *testing.T) {
 	fh := makeFileHeader(t, "file", "any.bin", "application/octet-stream", []byte("whatever"))
 	if _, err := s.Upload(fh, "docs"); err != nil {
 		t.Errorf("Upload with zero policy err = %v (must remain unrestricted for backward compat)", err)
+	}
+}
+
+func TestLocalStorageNilConfigFailsClosed(t *testing.T) {
+	s := storage.NewLocalStorage(nil)
+	if _, err := s.Get("x.txt"); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("Get with nil config err = %v, want ErrStorageNotInitialized", err)
+	}
+}
+
+func TestStorageInitNilConfigNoPanic(t *testing.T) {
+	if err := storage.NewStorageManager().Init(nil); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("Init(nil) err = %v, want ErrStorageNotInitialized", err)
+	}
+}
+
+func TestLocalStorageUploadNilFile(t *testing.T) {
+	s := newLocalStorageWithPolicy(t, config.UploadPolicy{}, 0)
+	if _, err := s.Upload(nil, "docs"); !errors.Is(err, storage.ErrInvalidFile) {
+		t.Fatalf("Upload(nil) err = %v, want ErrInvalidFile", err)
+	}
+}
+
+func TestLocalStorageRejectsSymlinkRoot(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "target")
+	if err := os.Mkdir(target, 0755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	link := filepath.Join(parent, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink not available on this system: %v", err)
+	}
+
+	s := storage.NewLocalStorage(&config.LocalStorageConfig{Path: link, BaseURL: "http://localhost/uploads"})
+	if _, err := s.Get("x.txt"); !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("Get with symlink root err = %v, want ErrStorageNotInitialized", err)
+	}
+}
+
+func TestLocalStorageGetURLSanitizesPath(t *testing.T) {
+	s := newLocalStorageWithPolicy(t, config.UploadPolicy{}, 0)
+	if got := s.GetURL("docs//a.txt"); got != "http://localhost/uploads/docs/a.txt" {
+		t.Fatalf("GetURL clean path = %q", got)
+	}
+	if got := s.GetURL("../secret.txt"); got != "" {
+		t.Fatalf("GetURL traversal = %q, want empty", got)
 	}
 }
