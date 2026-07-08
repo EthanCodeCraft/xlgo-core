@@ -329,3 +329,171 @@ func TestStartWatcherIdempotent(t *testing.T) {
 	}
 	m.StopWatcher()
 }
+
+func TestStopWatcherWaitsInFlightReload(t *testing.T) {
+	p := writeConfig(t, "c10_stop_wait.yaml", validConfigYAML(8091))
+	defer os.Remove(p)
+
+	m := config.NewManager(p)
+	if _, err := m.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	m.RegisterCallback(func(*config.Config) {
+		close(entered)
+		<-release
+	})
+	if err := m.StartWatcher(); err != nil {
+		t.Fatalf("StartWatcher: %v", err)
+	}
+
+	if err := os.WriteFile(p, []byte(validConfigYAML(8092)), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("热更新回调未触发")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		m.StopWatcher()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("StopWatcher 不应在 reload 回调结束前返回")
+	case <-time.After(120 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopWatcher 未等待到 reload 回调结束")
+	}
+}
+
+func TestLoadWithWatchFailureKeepsOldWatcher(t *testing.T) {
+	p := writeConfig(t, "c10_keep_old.yaml", validConfigYAML(8093))
+	defer os.Remove(p)
+
+	changes := make(chan int, 4)
+	if _, err := config.LoadWithWatch(p, func(c *config.Config) {
+		changes <- c.Server.Port
+	}); err != nil {
+		t.Fatalf("LoadWithWatch old: %v", err)
+	}
+	defer config.StopWatcher()
+
+	missing := filepath.Join(filepath.Dir(p), "missing.yaml")
+	if _, err := config.LoadWithWatch(missing, nil); err == nil {
+		t.Fatal("加载缺失配置应失败")
+	}
+
+	if err := os.WriteFile(p, []byte(validConfigYAML(8094)), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case port := <-changes:
+		if port != 8094 {
+			t.Fatalf("旧 watcher 回调端口错误: %d", port)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("加载失败后旧 watcher 不应被停止")
+	}
+}
+
+func TestSetDefaultManagerStopsOldWatcher(t *testing.T) {
+	oldPath := writeConfig(t, "c10_old_default.yaml", validConfigYAML(8095))
+	newPath := writeConfig(t, "c10_new_default.yaml", validConfigYAML(8096))
+	defer os.Remove(oldPath)
+	defer os.Remove(newPath)
+
+	oldManager := config.NewManager(oldPath)
+	if _, err := oldManager.Load(); err != nil {
+		t.Fatalf("old Load: %v", err)
+	}
+	changes := make(chan int, 4)
+	oldManager.RegisterCallback(func(c *config.Config) {
+		changes <- c.Server.Port
+	})
+	if err := oldManager.StartWatcher(); err != nil {
+		t.Fatalf("old StartWatcher: %v", err)
+	}
+	config.SetDefaultManager(oldManager)
+
+	newManager := config.NewManager(newPath)
+	if _, err := newManager.Load(); err != nil {
+		t.Fatalf("new Load: %v", err)
+	}
+	config.SetDefaultManager(newManager)
+	defer config.SetDefaultManager(nil)
+
+	if err := os.WriteFile(oldPath, []byte(validConfigYAML(8097)), 0644); err != nil {
+		t.Fatalf("WriteFile old: %v", err)
+	}
+	select {
+	case port := <-changes:
+		t.Fatalf("旧 watcher 已停止，不应收到端口 %d", port)
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+func TestSetGetAndViperReturnCopies(t *testing.T) {
+	cfg := &config.Config{
+		App: config.AppConfig{Name: "copy", Env: "dev"},
+		CORS: config.CORSConfig{
+			AllowedOrigins: []string{"https://a.example.com"},
+		},
+	}
+	if err := config.Set(cfg); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	defer config.SetDefaultManager(nil)
+
+	cfg.App.Name = "mutated-input"
+	cfg.CORS.AllowedOrigins[0] = "https://mutated-input.example.com"
+	got := config.Get()
+	if got.App.Name != "copy" {
+		t.Fatalf("Set 应保存副本，实际 App.Name=%q", got.App.Name)
+	}
+	if got.CORS.AllowedOrigins[0] != "https://a.example.com" {
+		t.Fatalf("Set 应深拷贝切片，实际 origin=%q", got.CORS.AllowedOrigins[0])
+	}
+
+	got.App.Name = "mutated-get"
+	got.CORS.AllowedOrigins[0] = "https://mutated-get.example.com"
+	gotAgain := config.Get()
+	if gotAgain.App.Name != "copy" || gotAgain.CORS.AllowedOrigins[0] != "https://a.example.com" {
+		t.Fatalf("Get 应返回副本，实际 %+v", gotAgain)
+	}
+
+	if err := config.Set(&config.Config{Server: config.ServerConfig{Port: 99999}}); err == nil {
+		t.Fatal("Set 非法配置应返回错误")
+	}
+	if got := config.Get().App.Name; got != "copy" {
+		t.Fatalf("Set 非法配置不应覆盖旧配置，实际 App.Name=%q", got)
+	}
+}
+
+func TestGetViperReturnsSnapshot(t *testing.T) {
+	p := writeConfig(t, "c10_viper_snapshot.yaml", validConfigYAML(8098))
+	defer os.Remove(p)
+
+	if _, err := config.Load(p); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer config.SetDefaultManager(nil)
+
+	v := config.GetViper()
+	if v == nil {
+		t.Fatal("GetViper returned nil")
+	}
+	v.Set("app.name", "mutated")
+	if got := config.GetString("app.name"); got != "c10" {
+		t.Fatalf("GetViper 应返回快照，不应污染内部 viper，实际 app.name=%q", got)
+	}
+}

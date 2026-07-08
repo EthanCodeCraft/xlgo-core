@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 // 配置错误
 var (
 	ErrConfigNotLoaded = fmt.Errorf("配置未加载")
+	ErrInvalidConfig   = fmt.Errorf("配置非法")
 )
 
 // Config 全局配置结构体
@@ -39,8 +41,7 @@ type Config struct {
 // 类型白名单、Storage.Local/OSS 上传策略的扩展名/MIME 白名单）深拷贝底层数组，使返回值
 // 可被调用方安全修改（含 append/sort/改元素）而不污染框架内部配置、不与其他读者竞态。
 //
-// 用于需要可变配置副本的场景。热路径的 Get() 为零分配仍返回内部只读指针——需要改配置时
-// 用 Clone() 或 Load()（Load 内部已返回 Clone）。
+// 用于需要可变配置副本的场景。Load/Get/回调均返回 Clone，避免调用方误改全局配置。
 func (c *Config) Clone() *Config {
 	if c == nil {
 		return nil
@@ -70,6 +71,34 @@ func cloneStrings(s []string) []string {
 	out := make([]string, len(s))
 	copy(out, s)
 	return out
+}
+
+func cloneStringAnyMap(in map[string]any) map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = cloneAny(v)
+	}
+	return out
+}
+
+func cloneAny(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		return cloneStringAnyMap(x)
+	case []any:
+		out := make([]any, len(x))
+		for i, item := range x {
+			out[i] = cloneAny(item)
+		}
+		return out
+	case []string:
+		return cloneStrings(x)
+	default:
+		return x
+	}
 }
 
 // AppConfig 应用配置
@@ -133,7 +162,7 @@ type TLSConfig struct {
 
 // ServerConfig 服务配置
 type ServerConfig struct {
-	Host            string        `mapstructure:"host"`              // 绑定地址，空=监听所有接口(0.0.0.0)；"127.0.0.1"=仅本机；内网IP=绑定指定网卡
+	Host            string        `mapstructure:"host"` // 绑定地址，空=监听所有接口(0.0.0.0)；"127.0.0.1"=仅本机；内网IP=绑定指定网卡
 	Port            int           `mapstructure:"port"`
 	Mode            string        `mapstructure:"mode"`             // development 或 production
 	ReadTimeout     time.Duration `mapstructure:"read_timeout"`     // 读超时，如 "15s"
@@ -142,7 +171,7 @@ type ServerConfig struct {
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"` // 优雅关闭超时，如 "30s"
 	MaxHeaderBytes  int           `mapstructure:"max_header_bytes"` // 最大请求头字节数
 	TLS             TLSConfig     `mapstructure:"tls"`
-	UnixSocket      string        `mapstructure:"unix_socket"` // 非空时优先于 Port，监听 unix socket
+	UnixSocket      string        `mapstructure:"unix_socket"`   // 非空时优先于 Port，监听 unix socket
 	ResponseMode    string        `mapstructure:"response_mode"` // business(默认) 或 rest，见 response.SetMode
 }
 
@@ -291,11 +320,25 @@ func (c *DatabaseConfig) DSN() string {
 	if c.CustomDSN != "" {
 		return c.CustomDSN
 	}
-	if builder, ok := LookupDSNBuilder(c.Driver); ok {
+	driver := c.Driver
+	if strings.TrimSpace(driver) == "" {
+		driver = DriverMySQL
+	}
+	if builder, ok := LookupDSNBuilder(driver); ok {
 		return builder(c)
 	}
 	// 未注册时回退到 MySQL（保持向后兼容）
 	return c.MySQLDSN()
+}
+
+func (c DatabaseConfig) isConfigured() bool {
+	return strings.TrimSpace(c.Driver) != "" ||
+		strings.TrimSpace(c.Host) != "" ||
+		c.Port != 0 ||
+		strings.TrimSpace(c.User) != "" ||
+		strings.TrimSpace(c.Password) != "" ||
+		strings.TrimSpace(c.Name) != "" ||
+		strings.TrimSpace(c.CustomDSN) != ""
 }
 
 // MySQLDSN 返回 MySQL 连接字符串。
@@ -307,19 +350,25 @@ func (c *DatabaseConfig) MySQLDSN() string {
 		loc = "Local"
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=%s",
-		c.User, url.QueryEscape(c.Password), c.Host, c.Port, c.Name, url.QueryEscape(loc))
+		url.QueryEscape(c.User), url.QueryEscape(c.Password), c.Host, c.Port, url.PathEscape(c.Name), url.QueryEscape(loc))
 }
 
 // PostgresDSN 返回 PostgreSQL 连接字符串。
-// 密码经单引号转义（内嵌单引号翻倍），避免含空格/引号/反斜杠破坏 key=value DSN（M9）。
+// 字符串字段统一用单引号包裹并转义，避免含空格/引号/反斜杠破坏 key=value DSN。
 // TimeZone 由 Timezone 配置，空则默认 "Asia/Shanghai"（向后兼容）。
 func (c *DatabaseConfig) PostgresDSN() string {
 	tz := c.Timezone
 	if tz == "" {
 		tz = "Asia/Shanghai"
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s password='%s' dbname=%s sslmode=disable TimeZone=%s",
-		c.Host, c.Port, c.User, strings.ReplaceAll(c.Password, "'", "''"), c.Name, tz)
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable TimeZone=%s",
+		postgresQuote(c.Host), c.Port, postgresQuote(c.User), postgresQuote(c.Password), postgresQuote(c.Name), postgresQuote(tz))
+}
+
+func postgresQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+	return "'" + s + "'"
 }
 
 // RedisConfig Redis 配置
@@ -499,6 +548,17 @@ func newViper(configPath string) *viper.Viper {
 	return v
 }
 
+func cloneViper(src *viper.Viper, configPath string) *viper.Viper {
+	if src == nil {
+		return nil
+	}
+	cp := newViper(configPath)
+	if err := cp.MergeConfigMap(src.AllSettings()); err != nil {
+		return nil
+	}
+	return cp
+}
+
 // unmarshalConfig 将 viper 解析到 Config，启用 string→time.Duration decode hook，
 // 使 ServerConfig/JWTConfig 的 Duration 字段可写 "24h"/"15s" 等字符串。
 func unmarshalConfig(v *viper.Viper, cfg *Config) error {
@@ -609,14 +669,12 @@ func (m *Manager) StartWatcher() error {
 func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct{}) {
 	defer close(done)
 	const debounce = 200 * time.Millisecond
-	var timer *time.Timer
-	// P1 #16：退出时停掉未触发的去抖 timer，避免 StopWatcher 之后 AfterFunc 仍
-	// reload() 一个调用方认为已停止的 manager。
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+	var timerC <-chan time.Time
 	for {
 		select {
 		case ev, ok := <-w.Events:
@@ -631,19 +689,24 @@ func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct
 				continue
 			}
 			// 去抖：合并编辑器/工具的连续写事件，仅最后一次触发重载。
-			if timer != nil {
-				timer.Stop()
+			if !timer.Stop() && timerC != nil {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			timer = time.AfterFunc(debounce, func() {
-				// reload 内部对非法配置保留旧配置（C10b），错误被忽略——
-				// 监听路径无法向上传播错误，保留旧配置即正确语义。
-				_ = m.reload()
-			})
+			timer.Reset(debounce)
+			timerC = timer.C
 		case _, ok := <-w.Errors:
 			if !ok {
 				return
 			}
 			// 非致命错误：继续监听。
+		case <-timerC:
+			timerC = nil
+			// reload 内部对非法配置保留旧配置（C10b），错误被忽略——
+			// 监听路径无法向上传播错误，保留旧配置即正确语义。
+			_ = m.reload()
 		}
 	}
 }
@@ -669,45 +732,98 @@ func (m *Manager) StopWatcher() {
 	}
 }
 
-// Get 获取配置。
-//
-// 返回的是 Manager 内部持有的配置指针（共享），调用方**必须视为只读**：
-// 修改返回值的标量或切片元素会污染全局配置并与其他读取 goroutine 竞态。需要可变副本时
-// 用 Clone()（返回深拷贝）或 Load()（重载并返回深拷贝）。
-//
-// M-G：热路径（jwt 鉴权等每请求调用）保持返回内部指针以零分配，可变副本走 Clone()。
-// 框架自身的 reload 创建新 Config 并替换 m.cfg 指针，不改写旧 Config 对象，故 Get()
-// 返回的旧指针在 reload 后仍指向一致的（旧）快照，reload 不引入对旧快照的竞态。
+// Get 获取配置副本。返回值可由调用方自由修改，不会污染 Manager 内部配置。
 func (m *Manager) Get() *Config {
 	if m == nil {
 		return nil
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg
+	return m.cfg.Clone()
 }
 
-// GetViper 获取 viper 实例
+// GetViper 获取 viper 的只读快照。
+//
+// 返回值不是 Manager 内部 viper 指针；调用方修改该快照不会影响全局配置。
+// 需要扩展配置读取时优先使用 GetString/GetInt/GetBool 等包级 helper。
 func (m *Manager) GetViper() *viper.Viper {
 	if m == nil {
 		return nil
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.v
+	return cloneViper(m.v, m.path)
 }
 
-// Set 手动设置配置
-func (m *Manager) Set(cfg *Config) {
+// GetString 获取字符串配置。
+func (m *Manager) GetString(key string) string {
 	if m == nil {
-		return
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.v == nil {
+		return ""
+	}
+	return m.v.GetString(key)
+}
+
+// GetInt 获取整数配置。
+func (m *Manager) GetInt(key string) int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.v == nil {
+		return 0
+	}
+	return m.v.GetInt(key)
+}
+
+// GetBool 获取布尔配置。
+func (m *Manager) GetBool(key string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.v == nil {
+		return false
+	}
+	return m.v.GetBool(key)
+}
+
+// GetStringMap 获取字符串映射配置副本。
+func (m *Manager) GetStringMap(key string) map[string]any {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.v == nil {
+		return nil
+	}
+	return cloneStringAnyMap(m.v.GetStringMap(key))
+}
+
+// Set 手动设置配置。非 nil 配置会先 Validate，并以深拷贝形式保存。
+func (m *Manager) Set(cfg *Config) error {
+	if m == nil {
+		return ErrConfigNotLoaded
+	}
+	if cfg != nil {
+		if err := cfg.Validate(); err != nil {
+			return errors.Join(ErrInvalidConfig, err)
+		}
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cfg = cfg
+	m.cfg = cfg.Clone()
 	if cfg == nil {
 		m.v = nil
 	}
+	return nil
 }
 
 // Reload 重新加载配置文件。读取、解析、校验（C10b）任一步失败均保留旧配置并返回错误；
@@ -760,39 +876,42 @@ func (m *Manager) reload() error {
 // 都 Store，遗留一个已 StartWatcher 的 manager 无引用可停（goroutine 泄漏）。
 var pkgLoadMu sync.Mutex
 
-// Load 加载配置文件（C3.5 修复：替换前停止旧 Manager 的 watcher，防止 goroutine 泄漏）。
-// P1 #8：全程持 pkgLoadMu 串行化，消除与并发 Load/LoadWithWatch 的 TOCTOU。
+// Load 加载配置文件。
+// P1 #8：全程持 pkgLoadMu 串行化。新配置加载成功后才替换默认 Manager 并停止旧 watcher；
+// 加载失败会保留旧 Manager 与旧 watcher，避免一次错误配置导致热更新链路断掉。
 func Load(configPath string) (*Config, error) {
 	pkgLoadMu.Lock()
 	defer pkgLoadMu.Unlock()
-	if old := defaultManager.Load(); old != nil {
-		old.StopWatcher()
-	}
 	m := NewManager(configPath)
 	cfg, err := m.Load()
 	if err != nil {
 		return nil, err
 	}
+	old := defaultManager.Load()
 	defaultManager.Store(m)
+	if old != nil && old != m {
+		old.StopWatcher()
+	}
 	return cfg, nil
 }
 
-// LoadWithWatch 加载配置文件并启用热更新（C3.5 修复：替换前停止旧 watcher）。
+// LoadWithWatch 加载配置文件并启用热更新。
 // P1 #8：全程持 pkgLoadMu 串行化，且新 manager 在其 watcher 成功启动后才置换为默认；
-// 启动失败则停掉半启动的 watcher 并不置换，避免遗留孤儿 watcher。
+// 启动失败则保留旧 Manager 与旧 watcher，并停掉新 manager 可能半启动的 watcher。
 func LoadWithWatch(configPath string, onChange func(*Config)) (*Config, error) {
 	pkgLoadMu.Lock()
 	defer pkgLoadMu.Unlock()
-	if old := defaultManager.Load(); old != nil {
-		old.StopWatcher()
-	}
 	m := NewManager(configPath)
 	cfg, err := m.LoadWithWatch(onChange)
 	if err != nil {
 		m.StopWatcher() // 清理可能已半启动的 watcher，避免孤儿 goroutine
 		return nil, err
 	}
+	old := defaultManager.Load()
 	defaultManager.Store(m)
+	if old != nil && old != m {
+		old.StopWatcher()
+	}
 	return cfg, nil
 }
 
@@ -821,9 +940,9 @@ func GetViper() *viper.Viper {
 	return defaultManager.Load().GetViper()
 }
 
-// Set 手动设置配置（用于测试或动态修改）
-func Set(cfg *Config) {
-	defaultManager.Load().Set(cfg)
+// Set 手动设置配置（用于测试或动态修改）。非 nil 配置会先校验并复制。
+func Set(cfg *Config) error {
+	return defaultManager.Load().Set(cfg)
 }
 
 // Reload 重新加载配置文件
@@ -837,48 +956,36 @@ func Reload() error {
 // 传入 nil 表示重置为空管理器。
 //
 // C10a：经 atomic.Pointer.Store 原子置换，消除与并发读取（Get 等）的数据竞争。
+// 置换后会停止旧 Manager 的 watcher，避免全局默认 manager 切换后遗留热更新 goroutine。
 func SetDefaultManager(m *Manager) {
+	old := defaultManager.Load()
 	if m == nil {
-		defaultManager.Store(NewManager(""))
-		return
+		m = NewManager("")
 	}
 	defaultManager.Store(m)
+	if old != nil && old != m {
+		old.StopWatcher()
+	}
 }
 
 // GetString 获取字符串配置
 func GetString(key string) string {
-	v := GetViper()
-	if v == nil {
-		return ""
-	}
-	return v.GetString(key)
+	return defaultManager.Load().GetString(key)
 }
 
 // GetInt 获取整数配置
 func GetInt(key string) int {
-	v := GetViper()
-	if v == nil {
-		return 0
-	}
-	return v.GetInt(key)
+	return defaultManager.Load().GetInt(key)
 }
 
 // GetBool 获取布尔配置
 func GetBool(key string) bool {
-	v := GetViper()
-	if v == nil {
-		return false
-	}
-	return v.GetBool(key)
+	return defaultManager.Load().GetBool(key)
 }
 
 // GetStringMap 获取字符串映射配置
 func GetStringMap(key string) map[string]any {
-	v := GetViper()
-	if v == nil {
-		return nil
-	}
-	return v.GetStringMap(key)
+	return defaultManager.Load().GetStringMap(key)
 }
 
 // IsDevelopment 是否开发环境

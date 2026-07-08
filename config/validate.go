@@ -39,15 +39,21 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// Database：仅当配置了 driver 时校验（未启用 mysql 的项目可留空）
-	if strings.TrimSpace(c.Database.Driver) != "" {
-		if c.Database.Host == "" {
+	// Database：出现任一数据库字段时视为启用；driver 为空按 MySQL 兼容处理。
+	if c.Database.isConfigured() {
+		driver := strings.TrimSpace(c.Database.Driver)
+		if driver != "" {
+			if _, ok := LookupDSNBuilder(driver); !ok {
+				problems = append(problems, fmt.Sprintf("database.driver 未注册: %s", driver))
+			}
+		}
+		if strings.TrimSpace(c.Database.CustomDSN) == "" && strings.TrimSpace(c.Database.Host) == "" {
 			problems = append(problems, "database.host 启用数据库后必填")
 		}
-		if c.Database.Name == "" {
+		if strings.TrimSpace(c.Database.CustomDSN) == "" && strings.TrimSpace(c.Database.Name) == "" {
 			problems = append(problems, "database.name 启用数据库后必填")
 		}
-		if c.Database.Port <= 0 || c.Database.Port > 65535 {
+		if strings.TrimSpace(c.Database.CustomDSN) == "" && (c.Database.Port <= 0 || c.Database.Port > 65535) {
 			problems = append(problems, fmt.Sprintf("database.port 超出范围(1-65535): %d", c.Database.Port))
 		}
 	}

@@ -102,7 +102,7 @@ func TestDatabaseConfigPostgresDSN(t *testing.T) {
 	}
 
 	dsn := db.DSN()
-	expected := "host=localhost port=5432 user=postgres password='password' dbname=testdb sslmode=disable TimeZone=Asia/Shanghai"
+	expected := "host='localhost' port=5432 user='postgres' password='password' dbname='testdb' sslmode=disable TimeZone='Asia/Shanghai'"
 	if dsn != expected {
 		t.Errorf("Postgres DSN = %s, want %s", dsn, expected)
 	}
@@ -140,13 +140,13 @@ func TestDatabaseConfigDSNPasswordEscape_M9(t *testing.T) {
 		Name:     "testdb",
 	}
 	pdsn := pg.PostgresDSN()
-	if !strings.Contains(pdsn, "password='p''ord'") {
+	if !strings.Contains(pdsn, `password='p\'ord'`) {
 		t.Errorf("Postgres DSN password not escaped: %s", pdsn)
 	}
 
 	// Timezone 可配置
 	pg2 := config.DatabaseConfig{Driver: config.DriverPostgres, Host: "h", Port: 5432, User: "u", Password: "p", Name: "n", Timezone: "UTC"}
-	if !strings.Contains(pg2.PostgresDSN(), "TimeZone=UTC") {
+	if !strings.Contains(pg2.PostgresDSN(), "TimeZone='UTC'") {
 		t.Errorf("Postgres DSN should honor Timezone=UTC: %s", pg2.PostgresDSN())
 	}
 	mysql2 := config.DatabaseConfig{Driver: config.DriverMySQL, Host: "h", Port: 3306, User: "u", Password: "p", Name: "n", Timezone: "UTC"}
@@ -350,7 +350,7 @@ func TestConfigManagerIsolation(t *testing.T) {
 func TestConfigSet(t *testing.T) {
 	cfg := &config.Config{
 		App: config.AppConfig{
-			Name:    "Manual",
+			Name:     "Manual",
 			SiteName: "manual_site",
 		},
 	}

@@ -93,11 +93,13 @@ func TestParseTokenWrongSecret(t *testing.T) {
 	// 修改 secret
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
-			Secret: "different-secret",
+			Secret: "different-secret-key-12345678901234567890",
 			Expire: 3600,
 		},
 	}
-	config.Set(cfg)
+	if err := config.Set(cfg); err != nil {
+		t.Fatalf("Set wrong secret config: %v", err)
+	}
 
 	// 应该解析失败
 	_, err := jwt.ParseToken(token)
