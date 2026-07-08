@@ -111,6 +111,62 @@ func TestDefaultManagerHealthCheckWithoutInit(t *testing.T) {
 	}
 }
 
+func TestNilContextHelpersDoNotPanic(t *testing.T) {
+	_ = database.CloseAll()
+
+	if ctx := database.UseMaster(nil); ctx == nil {
+		t.Fatal("UseMaster(nil) 应返回可用 context")
+	}
+	if ctx := database.UseReplica(nil); ctx == nil {
+		t.Fatal("UseReplica(nil) 应返回可用 context")
+	}
+	if db := database.GetDBFromContext(nil); db != nil {
+		t.Fatal("未初始化数据库时 GetDBFromContext(nil) 应返回 nil")
+	}
+	if ctx := database.WithTx(nil, nil); ctx == nil {
+		t.Fatal("WithTx(nil, nil) 应返回可用 context")
+	}
+	if tx := database.TxFromContext(nil); tx != nil {
+		t.Fatal("TxFromContext(nil) 应返回 nil")
+	}
+	if err := database.TransactionWithContext(nil, func(tx *gorm.DB) error { return nil }); err == nil {
+		t.Fatal("未初始化数据库时 TransactionWithContext(nil) 应返回错误")
+	}
+	if err := database.ReadQuery(nil, &struct{}{}, "1=1"); err == nil {
+		t.Fatal("未初始化数据库时 ReadQuery(nil) 应返回错误")
+	}
+	if err := database.WriteQuery(nil, &struct{}{}, "1=1"); err == nil {
+		t.Fatal("未初始化数据库时 WriteQuery(nil) 应返回错误")
+	}
+	if got := database.HealthCheck(); !got["master"] {
+		// HealthCheck 内部使用 background context；未初始化时 master=false 即可。
+		return
+	}
+	t.Fatal("未初始化数据库时 HealthCheck master 不应为 true")
+}
+
+func TestNilConfigInitializationReturnsError(t *testing.T) {
+	mgr := database.NewManager(nil)
+	if err := mgr.InitDB(nil); err == nil {
+		t.Fatal("InitDB(nil) 应返回错误")
+	}
+	if err := mgr.InitDBWithReplicas(nil, nil); err == nil {
+		t.Fatal("InitDBWithReplicas(nil) 应返回错误")
+	}
+	if err := database.InitDB(nil); err == nil {
+		t.Fatal("包级 InitDB(nil) 应返回错误")
+	}
+	if err := database.InitDBWithReplicas(nil, nil); err == nil {
+		t.Fatal("包级 InitDBWithReplicas(nil) 应返回错误")
+	}
+}
+
+func TestDialectorNilConfigDoesNotPanic(t *testing.T) {
+	if d := database.Dialector(nil); d == nil {
+		t.Fatal("Dialector(nil) 应返回兜底 dialector")
+	}
+}
+
 func TestDialectorSelectsByDriver(t *testing.T) {
 	mysqlCfg := &config.Config{Database: config.DatabaseConfig{
 		Driver: config.DriverMySQL, Host: "localhost", Port: 3306,
@@ -149,14 +205,14 @@ func TestDialectorSelectsByDriver(t *testing.T) {
 // stubDialector 是一个用于测试 RegisterDialect 的占位 Dialector。
 type stubDialector struct{ name string }
 
-func (s stubDialector) Name() string                                            { return s.name }
-func (s stubDialector) Initialize(_ *gorm.DB) error                             { return nil }
-func (s stubDialector) Migrator(db *gorm.DB) gorm.Migrator                      { return nil }
-func (s stubDialector) DataTypeOf(*schema.Field) string                         { return "" }
-func (s stubDialector) DefaultValueOf(*schema.Field) clause.Expression          { return nil }
+func (s stubDialector) Name() string                                             { return s.name }
+func (s stubDialector) Initialize(_ *gorm.DB) error                              { return nil }
+func (s stubDialector) Migrator(db *gorm.DB) gorm.Migrator                       { return nil }
+func (s stubDialector) DataTypeOf(*schema.Field) string                          { return "" }
+func (s stubDialector) DefaultValueOf(*schema.Field) clause.Expression           { return nil }
 func (s stubDialector) BindVarTo(writer clause.Writer, _ *gorm.Statement, _ any) {}
-func (s stubDialector) QuoteTo(writer clause.Writer, str string)                { _, _ = writer.WriteString(str) }
-func (s stubDialector) Explain(sql string, _ ...any) string                     { return sql }
+func (s stubDialector) QuoteTo(writer clause.Writer, str string)                 { _, _ = writer.WriteString(str) }
+func (s stubDialector) Explain(sql string, _ ...any) string                      { return sql }
 
 func TestRegisterDialectAndCustomDriver(t *testing.T) {
 	const driver = "stubdb"

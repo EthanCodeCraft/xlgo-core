@@ -23,6 +23,21 @@ func TestHealthCheckRedisWithoutInit(t *testing.T) {
 	}
 }
 
+func TestRedisNilConfigReturnsError(t *testing.T) {
+	prev := database.SetTestRedisClient(nil)
+	t.Cleanup(func() { database.SetTestRedisClient(prev) })
+
+	if err := database.NewRedisManager().Init(nil); err == nil {
+		t.Fatal("RedisManager.Init(nil) 应返回错误")
+	}
+	if err := database.InitRedis(nil); err == nil {
+		t.Fatal("包级 InitRedis(nil) 应返回错误")
+	}
+	if err := database.HealthCheckRedis(nil); err == nil {
+		t.Fatal("未初始化 Redis 时 HealthCheckRedis(nil) 应返回错误")
+	}
+}
+
 // TestDefaultRedisConcurrentSetAndGet C-1/H-4 回归：并发 SetDefaultRedisManager
 // 与 GetRedis/CloseRedis/HealthCheckRedis facade 读取不应触发数据竞争。
 // 修复前 DefaultRedis 是裸 *Redis.Pointer，SetDefaultRedisManager 无锁写、

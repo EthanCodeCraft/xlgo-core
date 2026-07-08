@@ -53,6 +53,9 @@ func GetDefaultRedisManager() *RedisManager {
 
 // Init 初始化 Redis 连接并 ping 验证。
 func (m *RedisManager) Init(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("Redis 配置未设置")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -118,6 +121,7 @@ func (m *RedisManager) setClientForTest(c *redis.Client) *redis.Client {
 
 // HealthCheck Redis 健康检查。
 func (m *RedisManager) HealthCheck(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
 	m.mu.Lock()
 	client := m.client
 	m.mu.Unlock()

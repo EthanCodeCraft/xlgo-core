@@ -31,6 +31,13 @@ const (
 	dbModeReplica = "replica"
 )
 
+func normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // ReplicaPicker 从库选择策略
 type ReplicaPicker interface {
 	Pick(replicas []*gorm.DB) *gorm.DB
@@ -212,6 +219,7 @@ func (m *Manager) resetReplicaHealth() {
 // 周期 ping 主库，连续失败达阈值后标记不健康（IsHealthy=false）；
 // 同时 ping 各从库，失败则从读流量剔除，恢复后自动重新纳入。
 func (m *Manager) StartProbing(ctx context.Context) {
+	ctx = normalizeContext(ctx)
 	m.initReplicaHealth()
 
 	cfg := m.getCfg() // P1 #11：锁内快照，避免与 InitDB 写 m.cfg 竞态
@@ -298,6 +306,7 @@ func (m *Manager) probeOnce(ctx context.Context, threshold int) {
 
 // FromContext 根据上下文选择数据库
 func (m *Manager) FromContext(ctx context.Context) *gorm.DB {
+	ctx = normalizeContext(ctx)
 	mode, ok := ctx.Value(dbModeContextKey{}).(string)
 	if !ok {
 		return m.Replica()
@@ -375,6 +384,7 @@ func (m *Manager) Close() error {
 
 // HealthCheck 健康检查，主库不可达时返回错误
 func (m *Manager) HealthCheck(ctx context.Context) error {
+	ctx = normalizeContext(ctx)
 	m.mu.Lock()
 	db := m.master
 	m.mu.Unlock()
@@ -421,6 +431,9 @@ func GetDefaultManager() *Manager {
 
 // InitDB 初始化数据库连接（带重试机制），驱动由配置决定
 func (m *Manager) InitDB(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("数据库配置未设置")
+	}
 	m.setCfg(cfg) // P1 #11：锁内写入，避免与 StartProbing/Open 读竞态
 
 	// GORM 日志配置
@@ -543,6 +556,9 @@ func replicaMaxOpenConns(masterMax int) int {
 // InitDBWithReplicas 初始化数据库主从连接，驱动由配置决定
 // replicaDSNs: 从库连接字符串列表（需与主库驱动匹配）
 func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) error {
+	if cfg == nil {
+		return errors.New("数据库配置未设置")
+	}
 	// 先初始化主库
 	if err := m.InitDB(cfg); err != nil {
 		return err
@@ -651,11 +667,13 @@ func SetReplicaPicker(p ReplicaPicker) {
 
 // UseMaster 强制使用主库（用于事务或需要实时数据的场景）
 func UseMaster(ctx context.Context) context.Context {
+	ctx = normalizeContext(ctx)
 	return context.WithValue(ctx, dbModeContextKey{}, dbModeMaster)
 }
 
 // UseReplica 强制使用从库（用于报表查询等场景）
 func UseReplica(ctx context.Context) context.Context {
+	ctx = normalizeContext(ctx)
 	return context.WithValue(ctx, dbModeContextKey{}, dbModeReplica)
 }
 
@@ -677,6 +695,7 @@ func GetDBFromContext(ctx context.Context) *gorm.DB {
 //
 // 注意：tx 仅在该 ctx 的生命周期内有效；事务提交/回滚后不得再用该 ctx 携带的 tx。
 func WithTx(ctx context.Context, tx *gorm.DB) context.Context {
+	ctx = normalizeContext(ctx)
 	if tx == nil {
 		return ctx
 	}
@@ -685,6 +704,7 @@ func WithTx(ctx context.Context, tx *gorm.DB) context.Context {
 
 // TxFromContext 取出 ctx 携带的外层事务；无则返回 nil。
 func TxFromContext(ctx context.Context) *gorm.DB {
+	ctx = normalizeContext(ctx)
 	if tx, ok := ctx.Value(txContextKey{}).(*gorm.DB); ok {
 		return tx
 	}
@@ -719,6 +739,7 @@ func Transaction(fn func(tx *gorm.DB) error) error {
 
 // TransactionWithContext 带上下文的事务操作
 func TransactionWithContext(ctx context.Context, fn func(tx *gorm.DB) error) error {
+	ctx = normalizeContext(ctx)
 	db := DefaultManager.Load().Master()
 	if db == nil {
 		return errors.New("数据库未初始化")
@@ -728,6 +749,7 @@ func TransactionWithContext(ctx context.Context, fn func(tx *gorm.DB) error) err
 
 // ReadQuery 读查询（自动路由到从库）
 func ReadQuery(ctx context.Context, model any, query string, args ...any) error {
+	ctx = normalizeContext(ctx)
 	db := GetDBFromContext(ctx)
 	if db == nil {
 		return errors.New("数据库未初始化")
@@ -739,6 +761,7 @@ func ReadQuery(ctx context.Context, model any, query string, args ...any) error 
 // 注意：命名沿用历史，实际用 .Find() 扫描结果集（读取语义），并非写操作——
 // 强制主库是为了读到刚写入的最新数据（read-your-writes）。命名误导见 M11。
 func WriteQuery(ctx context.Context, model any, query string, args ...any) error {
+	ctx = normalizeContext(ctx)
 	db := DefaultManager.Load().Master()
 	if db == nil {
 		return errors.New("数据库未初始化")
@@ -751,6 +774,7 @@ const healthCheckTimeout = 3 * time.Second
 
 // pingWithTimeout 带超时的 ping，ctx 由调用方传入时优先尊重其 deadline。
 func pingWithTimeout(sqlDB *sql.DB, parent context.Context) error {
+	parent = normalizeContext(parent)
 	ctx, cancel := context.WithTimeout(parent, healthCheckTimeout)
 	defer cancel()
 	return sqlDB.PingContext(ctx)

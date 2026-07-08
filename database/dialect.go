@@ -94,6 +94,10 @@ func RegisteredDialects() []string {
 // Dialector 根据配置返回 GORM Dialector。
 // 驱动由 cfg.Database.Driver 决定，未指定或未注册时按 MySQL 兜底（向后兼容）。
 func Dialector(cfg *config.Config) gorm.Dialector {
+	if cfg == nil {
+		logger.Warn("database: 配置为空，回退到 MySQL 空 DSN")
+		return mysql.Open("")
+	}
 	return dialectorForDSN(cfg.Database.Driver, cfg.Database.DSN())
 }
 
