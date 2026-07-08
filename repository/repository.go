@@ -2,9 +2,28 @@ package repository
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"unicode"
 
 	"github.com/EthanCodeCraft/xlgo-core/database"
 	"gorm.io/gorm"
+)
+
+const (
+	// DefaultFindAllLimit caps FindAll to avoid accidental full-table scans.
+	DefaultFindAllLimit = 1000
+	// DefaultPageSize is used when pageSize<=0.
+	DefaultPageSize = 20
+	// MaxPageSize caps page queries to avoid Limit(0)/huge-limit footguns.
+	MaxPageSize = 100
+	// MaxPage caps deep-offset queries; deeper traversal should use keyset pagination.
+	MaxPage = 10000
+)
+
+var (
+	ErrUnsafeOrder = errors.New("repository: unsafe order clause")
+	ErrUnsafeField = errors.New("repository: unsafe field name")
 )
 
 // BaseRepository 基础仓库接口
@@ -43,12 +62,26 @@ func NewBaseRepo[T any](db *gorm.DB) *BaseRepo[T] {
 	return &BaseRepo[T]{db: db}
 }
 
-// readConn 返回读连接：外层 ctx 事务 > 本 repo 事务 > 读写分离路由 > r.db 回退。
-// RP1 修复：r.db 为 nil 时 panic 并给出明确消息。
-func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
+func normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (r *BaseRepo[T]) requireDB() *gorm.DB {
 	if r.db == nil {
 		panic("repository.BaseRepo: db is nil. Use NewBaseRepo with a valid *gorm.DB")
 	}
+	return r.db
+}
+
+// readConn 返回读连接：先校验 repo 构造时注入的 r.db 非 nil，再按
+// 外层 ctx 事务 > 本 repo 事务 > 读写分离路由 > r.db 回退。
+// RP1 修复：r.db 为 nil 时 panic 并给出明确消息，即使 ctx 携带外层事务也要求 repo 构造合法。
+func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
+	ctx = normalizeContext(ctx)
+	base := r.requireDB()
 	if tx := database.TxFromContext(ctx); tx != nil {
 		return tx.WithContext(ctx)
 	}
@@ -58,16 +91,16 @@ func (r *BaseRepo[T]) readConn(ctx context.Context) *gorm.DB {
 	if gdb := database.GetDBFromContext(ctx); gdb != nil {
 		return gdb.WithContext(ctx)
 	}
-	return r.db.WithContext(ctx)
+	return base.WithContext(ctx)
 }
 
-// writeConn 返回写连接：外层 ctx 事务 > 本 repo 事务 > 主库 > r.db 回退。
+// writeConn 返回写连接：先校验 repo 构造时注入的 r.db 非 nil，再按
+// 外层 ctx 事务 > 本 repo 事务 > 主库 > r.db 回退。
 // 写操作始终走主库，不路由到只读从库。
-// RP1 修复：r.db 为 nil 时 panic 并给出明确消息。
+// RP1 修复：r.db 为 nil 时 panic 并给出明确消息，即使 ctx 携带外层事务也要求 repo 构造合法。
 func (r *BaseRepo[T]) writeConn(ctx context.Context) *gorm.DB {
-	if r.db == nil {
-		panic("repository.BaseRepo: db is nil. Use NewBaseRepo with a valid *gorm.DB")
-	}
+	ctx = normalizeContext(ctx)
+	base := r.requireDB()
 	if tx := database.TxFromContext(ctx); tx != nil {
 		return tx.WithContext(ctx)
 	}
@@ -77,7 +110,7 @@ func (r *BaseRepo[T]) writeConn(ctx context.Context) *gorm.DB {
 	if mdb := database.GetWriteDB(); mdb != nil {
 		return mdb.WithContext(ctx)
 	}
-	return r.db.WithContext(ctx)
+	return base.WithContext(ctx)
 }
 
 // FindByID 根据 ID 查询
@@ -135,13 +168,23 @@ func (r *BaseRepo[T]) HardDelete(ctx context.Context, id uint) error {
 
 // FindByIDs 批量查询
 func (r *BaseRepo[T]) FindByIDs(ctx context.Context, ids []uint) ([]T, error) {
+	if len(ids) == 0 {
+		return []T{}, nil
+	}
 	var models []T
 	err := r.readConn(ctx).Where("id IN ?", ids).Find(&models).Error
 	return models, err
 }
 
-// FindAll 查询所有记录
+// FindAll 查询记录，默认最多返回 DefaultFindAllLimit 条，避免误用导致全表扫描。
+// 需要明确全量扫描时使用 FindAllUnbounded。
 func (r *BaseRepo[T]) FindAll(ctx context.Context) ([]T, error) {
+	return r.FindLimited(ctx, DefaultFindAllLimit)
+}
+
+// FindAllUnbounded 查询所有记录（无默认 limit）。
+// 仅用于明确需要全表扫描的后台任务/小表场景；在线请求优先使用分页或 FindAll。
+func (r *BaseRepo[T]) FindAllUnbounded(ctx context.Context) ([]T, error) {
 	var models []T
 	err := r.readConn(ctx).Find(&models).Error
 	return models, err
@@ -196,6 +239,9 @@ func (r *BaseRepo[T]) FindWhere(ctx context.Context, query string, args ...any) 
 // (ctx, order, query string, args ...any)，与 FindWhere 等同类方法统一为变长 args。
 // Go 语法要求变长参数必须为最后一个，故 order 前置于 query。
 func (r *BaseRepo[T]) FindWhereOrdered(ctx context.Context, order, query string, args ...any) ([]T, error) {
+	if err := validateOrderClause(order); err != nil {
+		return nil, err
+	}
 	var models []T
 	err := r.readConn(ctx).Where(query, args...).Order(order).Find(&models).Error
 	return models, err
@@ -203,6 +249,9 @@ func (r *BaseRepo[T]) FindWhereOrdered(ctx context.Context, order, query string,
 
 // FindOrdered 查询并排序
 func (r *BaseRepo[T]) FindOrdered(ctx context.Context, order string, limit int) ([]T, error) {
+	if err := validateOrderClause(order); err != nil {
+		return nil, err
+	}
 	var models []T
 	query := r.readConn(ctx).Order(order)
 	if limit > 0 {
@@ -214,6 +263,9 @@ func (r *BaseRepo[T]) FindOrdered(ctx context.Context, order string, limit int) 
 
 // FindLimited 查询指定数量记录
 func (r *BaseRepo[T]) FindLimited(ctx context.Context, limit int) ([]T, error) {
+	if limit <= 0 {
+		return []T{}, nil
+	}
 	var models []T
 	err := r.readConn(ctx).Limit(limit).Find(&models).Error
 	return models, err
@@ -229,8 +281,25 @@ type PageResult[T any] struct {
 	PageSize int   `json:"page_size"`
 }
 
+func normalizePage(page, pageSize int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if page > MaxPage {
+		page = MaxPage
+	}
+	if pageSize <= 0 {
+		pageSize = DefaultPageSize
+	}
+	if pageSize > MaxPageSize {
+		pageSize = MaxPageSize
+	}
+	return page, pageSize
+}
+
 // pageOffset 计算 (page-1)*pageSize，负值归零。
 func pageOffset(page, pageSize int) int {
+	page, pageSize = normalizePage(page, pageSize)
 	offset := (page - 1) * pageSize
 	if offset < 0 {
 		offset = 0
@@ -248,6 +317,7 @@ func pageOffset(page, pageSize int) int {
 func (r *BaseRepo[T]) FindPage(ctx context.Context, page, pageSize int) (*PageResult[T], error) {
 	var models []T
 	var total int64
+	page, pageSize = normalizePage(page, pageSize)
 	offset := pageOffset(page, pageSize)
 	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(new(T)).Count(&total).Error; e != nil {
@@ -263,8 +333,12 @@ func (r *BaseRepo[T]) FindPage(ctx context.Context, page, pageSize int) (*PageRe
 
 // FindPageOrdered 分页查询并排序（count+list 单事务，H6d）
 func (r *BaseRepo[T]) FindPageOrdered(ctx context.Context, page, pageSize int, order string) (*PageResult[T], error) {
+	if err := validateOrderClause(order); err != nil {
+		return nil, err
+	}
 	var models []T
 	var total int64
+	page, pageSize = normalizePage(page, pageSize)
 	offset := pageOffset(page, pageSize)
 	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(new(T)).Count(&total).Error; e != nil {
@@ -282,6 +356,7 @@ func (r *BaseRepo[T]) FindPageOrdered(ctx context.Context, page, pageSize int, o
 func (r *BaseRepo[T]) FindPageWhere(ctx context.Context, page, pageSize int, query string, args ...any) (*PageResult[T], error) {
 	var models []T
 	var total int64
+	page, pageSize = normalizePage(page, pageSize)
 	offset := pageOffset(page, pageSize)
 	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(new(T)).Where(query, args...).Count(&total).Error; e != nil {
@@ -301,8 +376,12 @@ func (r *BaseRepo[T]) FindPageWhere(ctx context.Context, page, pageSize int, que
 // (ctx, page, pageSize, order, query string, args ...any)，与 FindPageWhere 统一为变长 args。
 // Go 语法要求变长参数必须为最后一个，故 order 前置于 query。
 func (r *BaseRepo[T]) FindPageWhereOrdered(ctx context.Context, page, pageSize int, order, query string, args ...any) (*PageResult[T], error) {
+	if err := validateOrderClause(order); err != nil {
+		return nil, err
+	}
 	var models []T
 	var total int64
+	page, pageSize = normalizePage(page, pageSize)
 	offset := pageOffset(page, pageSize)
 	err := r.readConn(ctx).Transaction(func(tx *gorm.DB) error {
 		if e := tx.Model(new(T)).Where(query, args...).Count(&total).Error; e != nil {
@@ -325,16 +404,28 @@ func (r *BaseRepo[T]) CreateBatch(ctx context.Context, models []T) error {
 
 // UpdateBatch 批量更新（指定字段）
 func (r *BaseRepo[T]) UpdateBatch(ctx context.Context, ids []uint, field string, value any) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := validateIdentifier(field); err != nil {
+		return err
+	}
 	return r.writeConn(ctx).Model(new(T)).Where("id IN ?", ids).Update(field, value).Error
 }
 
 // DeleteBatch 批量删除
 func (r *BaseRepo[T]) DeleteBatch(ctx context.Context, ids []uint) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	return r.writeConn(ctx).Delete(new(T), ids).Error
 }
 
 // HardDeleteBatch 批量硬删除
 func (r *BaseRepo[T]) HardDeleteBatch(ctx context.Context, ids []uint) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	return r.writeConn(ctx).Unscoped().Delete(new(T), ids).Error
 }
 
@@ -364,16 +455,28 @@ func (r *BaseRepo[T]) SoftDeleteColumn() string {
 
 // Restore 恢复软删除记录
 func (r *BaseRepo[T]) Restore(ctx context.Context, id uint) error {
+	if err := validateIdentifier(r.SoftDeleteColumn()); err != nil {
+		return err
+	}
 	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id = ?", id).Update(r.SoftDeleteColumn(), nil).Error
 }
 
 // RestoreBatch 批量恢复软删除记录
 func (r *BaseRepo[T]) RestoreBatch(ctx context.Context, ids []uint) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := validateIdentifier(r.SoftDeleteColumn()); err != nil {
+		return err
+	}
 	return r.writeConn(ctx).Model(new(T)).Unscoped().Where("id IN ?", ids).Update(r.SoftDeleteColumn(), nil).Error
 }
 
 // FindDeleted 查询已软删除的记录
 func (r *BaseRepo[T]) FindDeleted(ctx context.Context) ([]T, error) {
+	if err := validateIdentifier(r.SoftDeleteColumn()); err != nil {
+		return nil, err
+	}
 	var models []T
 	err := r.readConn(ctx).Unscoped().Where(r.SoftDeleteColumn() + " IS NOT NULL").Find(&models).Error
 	return models, err
@@ -425,11 +528,12 @@ func (r *BaseRepo[T]) WithTransaction(ctx context.Context, fn func(txRepo *BaseR
 type QueryBuilder[T any] struct {
 	db    *gorm.DB
 	limit int
+	err   error
 }
 
 // NewQueryBuilder 创建查询构建器
 func (r *BaseRepo[T]) NewQueryBuilder() *QueryBuilder[T] {
-	return &QueryBuilder[T]{db: r.db.Model(new(T))}
+	return &QueryBuilder[T]{db: r.requireDB().Model(new(T))}
 }
 
 // Where 添加条件
@@ -446,12 +550,22 @@ func (qb *QueryBuilder[T]) Or(query string, args ...any) *QueryBuilder[T] {
 
 // Order 设置排序
 func (qb *QueryBuilder[T]) Order(order string) *QueryBuilder[T] {
+	if qb.err != nil {
+		return qb
+	}
+	if err := validateOrderClause(order); err != nil {
+		qb.err = err
+		return qb
+	}
 	qb.db = qb.db.Order(order)
 	return qb
 }
 
 // Limit 设置数量限制
 func (qb *QueryBuilder[T]) Limit(limit int) *QueryBuilder[T] {
+	if limit < 0 {
+		limit = 0
+	}
 	qb.limit = limit
 	qb.db = qb.db.Limit(limit)
 	return qb
@@ -470,6 +584,10 @@ func (qb *QueryBuilder[T]) clone() *gorm.DB {
 
 // Find 执行查询
 func (qb *QueryBuilder[T]) Find(ctx context.Context) ([]T, error) {
+	if qb.err != nil {
+		return nil, qb.err
+	}
+	ctx = normalizeContext(ctx)
 	var models []T
 	err := qb.clone().WithContext(ctx).Find(&models).Error
 	return models, err
@@ -477,6 +595,10 @@ func (qb *QueryBuilder[T]) Find(ctx context.Context) ([]T, error) {
 
 // First 执行查询并返回第一条
 func (qb *QueryBuilder[T]) First(ctx context.Context) (*T, error) {
+	if qb.err != nil {
+		return nil, qb.err
+	}
+	ctx = normalizeContext(ctx)
 	var model T
 	err := qb.clone().WithContext(ctx).First(&model).Error
 	if err != nil {
@@ -488,6 +610,10 @@ func (qb *QueryBuilder[T]) First(ctx context.Context) (*T, error) {
 // Count 执行统计。
 // 克隆并剥离 Limit/Offset（H6e），避免先前 Limit()/Offset() 残留截断统计行数。
 func (qb *QueryBuilder[T]) Count(ctx context.Context) (int64, error) {
+	if qb.err != nil {
+		return 0, qb.err
+	}
+	ctx = normalizeContext(ctx)
 	var count int64
 	err := qb.clone().Limit(-1).Offset(-1).WithContext(ctx).Count(&count).Error
 	return count, err
@@ -498,8 +624,13 @@ func (qb *QueryBuilder[T]) Count(ctx context.Context) (int64, error) {
 // 注意：与 FindPage 不同，Page 的 count+list 不包单事务（QueryBuilder 为轻量构建器）；
 // 需要 total/items 快照一致请用 BaseRepo.FindPage。
 func (qb *QueryBuilder[T]) Page(ctx context.Context, page, pageSize int) (*PageResult[T], error) {
+	if qb.err != nil {
+		return nil, qb.err
+	}
+	ctx = normalizeContext(ctx)
 	var models []T
 	var total int64
+	page, pageSize = normalizePage(page, pageSize)
 
 	// count 克隆并剥离 Limit/Offset
 	countDB := qb.clone().Limit(-1).Offset(-1)
@@ -518,4 +649,70 @@ func (qb *QueryBuilder[T]) Page(ctx context.Context, page, pageSize int) (*PageR
 		Page:     page,
 		PageSize: pageSize,
 	}, nil
+}
+
+func validateIdentifier(field string) error {
+	if !isIdentifierPath(field) {
+		return ErrUnsafeField
+	}
+	return nil
+}
+
+func isIdentifierPath(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	parts := strings.Split(s, ".")
+	for _, part := range parts {
+		if !isIdentifier(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func isIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateOrderClause(order string) error {
+	order = strings.TrimSpace(order)
+	if order == "" {
+		return ErrUnsafeOrder
+	}
+	for _, raw := range strings.Split(order, ",") {
+		item := strings.TrimSpace(raw)
+		if item == "" {
+			return ErrUnsafeOrder
+		}
+		fields := strings.Fields(item)
+		if len(fields) == 0 || len(fields) > 2 {
+			return ErrUnsafeOrder
+		}
+		if !isIdentifierPath(fields[0]) {
+			return ErrUnsafeOrder
+		}
+		if len(fields) == 2 {
+			dir := strings.ToUpper(fields[1])
+			if dir != "ASC" && dir != "DESC" {
+				return ErrUnsafeOrder
+			}
+		}
+	}
+	return nil
 }

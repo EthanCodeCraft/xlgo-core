@@ -1,10 +1,11 @@
 package response
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/url"
 
-	"github.com/EthanCodeCraft/xlgo-core/utils"
 	"github.com/gin-gonic/gin"
 )
 
@@ -127,18 +128,31 @@ func asciiFallbackName(filename string) string {
 
 // Download 文件下载响应
 func Download(c *gin.Context, filename string, data []byte) {
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Disposition", contentDisposition(filename))
-	c.Header("Content-Length", utils.ToString(len(data)))
-	c.Data(http.StatusOK, "application/octet-stream", data)
+	DownloadReader(c, filename, "application/octet-stream", int64(len(data)), bytesReader(data))
 }
 
 // DownloadWithContentType 文件下载（自定义Content-Type）
 func DownloadWithContentType(c *gin.Context, filename string, contentType string, data []byte) {
-	c.Header("Content-Type", contentType)
-	c.Header("Content-Disposition", contentDisposition(filename))
-	c.Header("Content-Length", utils.ToString(len(data)))
-	c.Data(http.StatusOK, contentType, data)
+	DownloadReader(c, filename, contentType, int64(len(data)), bytesReader(data))
+}
+
+// DownloadReader 流式下载响应。
+//
+// 对大文件/对象存储下载优先使用此函数，避免先把完整内容读入 []byte 驻留内存。
+// contentLength 传 -1 表示未知长度；Gin 会省略 Content-Length。
+func DownloadReader(c *gin.Context, filename, contentType string, contentLength int64, r io.Reader) {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	headers := map[string]string{
+		"Content-Disposition": contentDisposition(filename),
+	}
+	c.DataFromReader(http.StatusOK, contentLength, contentType, r, headers)
+}
+
+// bytesReader 避免在公开 API 中暴露 bytes 包细节，同时让旧 []byte API 复用流式写路径。
+func bytesReader(data []byte) io.Reader {
+	return bytes.NewReader(data)
 }
 
 // HTML HTML内容响应

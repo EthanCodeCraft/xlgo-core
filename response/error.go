@@ -107,6 +107,13 @@ func (e *Error) WithDetail(detail string) *Error {
 // P1 #15：仅当 detailExposed()（默认 true；App 生产环境置 false）时才向客户端输出 Detail，
 // 避免内部错误细节在生产泄露。
 func (e *Error) ToResponse() Response {
+	if e == nil {
+		return Response{
+			Code: CodeServerError,
+			Msg:  ErrServerError.Message,
+			Data: nil,
+		}
+	}
 	if e.Detail != "" && detailExposed() {
 		return Response{
 			Code: e.Code,
@@ -211,6 +218,10 @@ func FailWithError(c *gin.Context, err *Error) {
 // FailWithDetail 使用预定义错误并添加详细信息。
 // P1 #15：detail 仅在 detailExposed()（默认 true；App 生产环境置 false）时输出给客户端。
 func FailWithDetail(c *gin.Context, err *Error, detail string) {
+	if err == nil {
+		FailWithError(c, nil)
+		return
+	}
 	if detailExposed() {
 		writeResp(c, err.Code, err.Message, gin.H{"detail": detail})
 		return

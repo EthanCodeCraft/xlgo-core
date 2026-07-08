@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/router"
 )
@@ -57,6 +59,81 @@ func TestRegisterHealthRouteWithFailingCheck(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"status":"error"`) {
 		t.Fatalf("expected error health response, got %s", w.Body.String())
+	}
+}
+
+func TestRegisterHealthRouteTimesOutStuckCheck_M7(t *testing.T) {
+	r := setupTestRouter()
+	router.RegisterHealthRoute(r, router.HealthCheck{
+		Name:    "stuck",
+		Timeout: 10 * time.Millisecond,
+		Check: func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+
+	w := httptest.NewRecorder()
+	start := time.Now()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("health check took %s, want bounded timeout", elapsed)
+	}
+	if !strings.Contains(w.Body.String(), `"stuck":"timeout"`) {
+		t.Fatalf("body = %s, want timeout status", w.Body.String())
+	}
+}
+
+func TestRegisterHealthRouteRecoversCheckPanic_M7(t *testing.T) {
+	r := setupTestRouter()
+	router.RegisterHealthRoute(r, router.HealthCheck{
+		Name: "panic",
+		Check: func(context.Context) error {
+			panic("boom")
+		},
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"panic":"error"`) {
+		t.Fatalf("body = %s, want panic check error status", w.Body.String())
+	}
+}
+
+func TestRegisterHealthRouteLimitsNonCooperativeCheckConcurrency_M7(t *testing.T) {
+	var started atomic.Int32
+	release := make(chan struct{})
+	defer close(release)
+
+	r := setupTestRouter()
+	router.RegisterHealthRoute(r, router.HealthCheck{
+		Name:    "stuck",
+		Timeout: 10 * time.Millisecond,
+		Check: func(context.Context) error {
+			started.Add(1)
+			<-release
+			return nil
+		},
+	})
+
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d status = %d, want 503", i+1, w.Code)
+		}
+	}
+
+	if got := started.Load(); got != 1 {
+		t.Fatalf("check started %d times, want 1 while first non-cooperative check is still running", got)
 	}
 }
 

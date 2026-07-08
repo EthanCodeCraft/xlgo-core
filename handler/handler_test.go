@@ -62,8 +62,8 @@ func TestQueryInt(t *testing.T) {
 		expected int
 	}{
 		{"?page=10", 10},
-		{"?page=abc", 1},  // 无效返回默认
-		{"", 1},           // 无参数返回默认
+		{"?page=abc", 1}, // 无效返回默认
+		{"", 1},          // 无参数返回默认
 	}
 
 	for _, tt := range tests {
@@ -185,9 +185,9 @@ func TestGetPage(t *testing.T) {
 		expectedSize int
 	}{
 		{"?page=2&page_size=50", 2, 50},
-		{"?page=0&page_size=0", 1, 20},  // 边界修正
+		{"?page=0&page_size=0", 1, 20},     // 边界修正
 		{"?page=-1&page_size=200", 1, 100}, // 超限修正
-		{"", 1, 20}, // 默认值
+		{"", 1, 20},                        // 默认值
 	}
 
 	for _, tt := range tests {
@@ -386,5 +386,29 @@ func TestBindJSON(t *testing.T) {
 
 	if w.Code != 200 {
 		t.Errorf("BindJSON valid status = %d", w.Code)
+	}
+}
+
+func TestBindJSONWithMaxBytesRejectsOversizedBody_M6(t *testing.T) {
+	r := setupTestRouter()
+	r.POST("/test", func(c *gin.Context) {
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := handler.BindJSONWithMaxBytes(c, &req, 8); err == nil {
+			c.JSON(http.StatusOK, req)
+			return
+		}
+		handler.BadRequest(c, "绑定失败")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/test", strings.NewReader(`{"name":"body-too-large"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	body := decodeBody(t, w)
+	if body.Code != response.CodeFail {
+		t.Fatalf("oversized BindJSON code = %d, want %d", body.Code, response.CodeFail)
 	}
 }

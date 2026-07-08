@@ -1,7 +1,9 @@
 package response_test
 
 import (
+	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/EthanCodeCraft/xlgo-core/response"
@@ -82,6 +84,34 @@ func TestFailWithCode(t *testing.T) {
 
 	if w.Code != 200 {
 		t.Errorf("FailWithCode status = %d", w.Code)
+	}
+}
+
+func TestFailWithErrorNilDoesNotPanic_M6(t *testing.T) {
+	r := setupTestRouter()
+	r.Use(func(c *gin.Context) {
+		c.Set("request_id", "req-m6")
+		c.Next()
+	})
+	r.GET("/test", func(c *gin.Context) {
+		response.FailWithError(c, nil)
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+
+	if w.Code != 200 {
+		t.Fatalf("FailWithError(nil) status = %d, want 200 in business mode", w.Code)
+	}
+	var body response.Response
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Code != response.CodeServerError {
+		t.Fatalf("code = %d, want %d", body.Code, response.CodeServerError)
+	}
+	if body.RequestID != "req-m6" {
+		t.Fatalf("request_id = %q, want req-m6", body.RequestID)
 	}
 }
 
@@ -239,6 +269,29 @@ func TestDownloadWithContentType(t *testing.T) {
 	contentType := w.Header().Get("Content-Type")
 	if contentType != "application/pdf" {
 		t.Errorf("DownloadWithContentType = %s, want application/pdf", contentType)
+	}
+}
+
+func TestDownloadReaderStreamsContent_M6(t *testing.T) {
+	r := setupTestRouter()
+	r.GET("/test", func(c *gin.Context) {
+		response.DownloadReader(c, "big.txt", "text/plain", 11, strings.NewReader("hello world"))
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+
+	if w.Code != 200 {
+		t.Fatalf("DownloadReader status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); !contains(got, "text/plain") {
+		t.Fatalf("Content-Type = %q, want text/plain", got)
+	}
+	if got := w.Header().Get("Content-Length"); got != "11" {
+		t.Fatalf("Content-Length = %q, want 11", got)
+	}
+	if got := w.Body.String(); got != "hello world" {
+		t.Fatalf("body = %q, want hello world", got)
 	}
 }
 

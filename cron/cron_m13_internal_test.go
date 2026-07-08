@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+func mustPanicM13(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("%s should panic", name)
+		}
+	}()
+	fn()
+}
+
 // TestCronRunTaskPanicRecovered_M13 回归：RunTask handler panic 时，executeTask 边界
 // recover 转为 error 返回调用方并记入 LastError，不崩进程；running 守卫随后释放。
 // 修复前：panic 直接上抛 → 测试进程崩溃。
@@ -81,5 +91,78 @@ func TestCronCheckAndRunPanicRecovered_M13(t *testing.T) {
 	}
 	if ran.Load() == 0 {
 		t.Fatal("canary did not run — sibling goroutine killed by panic?")
+	}
+}
+
+func TestCronAddTaskRejectsNilScheduleOrHandler_M13(t *testing.T) {
+	s := NewScheduler()
+	mustPanicM13(t, "nil schedule", func() {
+		s.AddTask("nil-schedule", nil, func(context.Context) error { return nil })
+	})
+	mustPanicM13(t, "nil handler", func() {
+		s.AddTask("nil-handler", Every(time.Minute), nil)
+	})
+}
+
+func TestCronScheduleConstructorsRejectInvalidBounds_M13(t *testing.T) {
+	mustPanicM13(t, "Every(0)", func() { Every(0) })
+	mustPanicM13(t, "Every(negative)", func() { Every(-time.Second) })
+	mustPanicM13(t, "Daily hour", func() { Daily(24, 0) })
+	mustPanicM13(t, "Daily minute", func() { Daily(23, 60) })
+	mustPanicM13(t, "Weekly day", func() { Weekly(time.Weekday(9), 9, 0) })
+	mustPanicM13(t, "Weekly hour", func() { Weekly(time.Monday, -1, 0) })
+	mustPanicM13(t, "Weekly minute", func() { Weekly(time.Monday, 9, -1) })
+}
+
+func TestCronAddTaskRejectsInvalidExportedScheduleValues_M13(t *testing.T) {
+	s := NewScheduler()
+	mustPanicM13(t, "invalid interval schedule", func() {
+		s.AddTask("bad-interval", &IntervalSchedule{}, func(context.Context) error { return nil })
+	})
+	mustPanicM13(t, "invalid daily schedule", func() {
+		s.AddTask("bad-daily", &DailySchedule{Hour: 99}, func(context.Context) error { return nil })
+	})
+	mustPanicM13(t, "invalid weekly schedule", func() {
+		s.AddTask("bad-weekly", &WeeklySchedule{Day: time.Weekday(8)}, func(context.Context) error { return nil })
+	})
+}
+
+func TestCronStartAfterStopRebuildsContext_M13(t *testing.T) {
+	s := NewScheduler()
+	s.AddTask("ctx", Every(time.Hour), func(ctx context.Context) error {
+		return ctx.Err()
+	})
+
+	s.Start()
+	s.Stop()
+	s.Start()
+	t.Cleanup(s.Stop)
+
+	if err := s.RunTask("ctx"); err != nil {
+		t.Fatalf("RunTask after Stop/Start got ctx err = %v, want nil", err)
+	}
+}
+
+func TestCronCheckAndRunSkipsAfterStopContextCanceled_M13(t *testing.T) {
+	s := NewScheduler()
+	var ran atomic.Int32
+	s.AddTask("due", Every(time.Minute), func(context.Context) error {
+		ran.Add(1)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	s.mu.Lock()
+	s.running = false
+	s.tasks["due"].NextRun = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+
+	s.checkAndRun(ctx)
+	s.wg.Wait()
+
+	if got := ran.Load(); got != 0 {
+		t.Fatalf("task ran %d times after stopped/canceled ctx, want 0", got)
 	}
 }

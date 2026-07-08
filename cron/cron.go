@@ -40,19 +40,57 @@ type Schedule interface {
 	Next(now time.Time) time.Time
 }
 
+func validateSchedule(schedule Schedule) {
+	switch s := schedule.(type) {
+	case *IntervalSchedule:
+		validateInterval(s.Interval)
+	case *DailySchedule:
+		validateClock(s.Hour, s.Minute, "Daily")
+	case *WeeklySchedule:
+		validateWeekday(s.Day)
+		validateClock(s.Hour, s.Minute, "Weekly")
+	}
+}
+
+func validateInterval(interval time.Duration) {
+	if interval <= 0 {
+		panic("cron: interval must be positive")
+	}
+}
+
+func validateClock(hour, minute int, name string) {
+	if hour < 0 || hour > 23 {
+		panic(fmt.Sprintf("cron: %s hour must be in [0,23]", name))
+	}
+	if minute < 0 || minute > 59 {
+		panic(fmt.Sprintf("cron: %s minute must be in [0,59]", name))
+	}
+}
+
+func validateWeekday(day time.Weekday) {
+	if day < time.Sunday || day > time.Saturday {
+		panic("cron: Weekly day must be in [Sunday,Saturday]")
+	}
+}
+
 // Scheduler 调度器
 type Scheduler struct {
-	tasks   map[string]*Task
-	mu      sync.RWMutex
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	running bool
+	tasks       map[string]*Task
+	mu          sync.RWMutex
+	lifecycleMu sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	running     bool
+}
+
+func newSchedulerContext() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
 }
 
 // NewScheduler 创建调度器
 func NewScheduler() *Scheduler {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := newSchedulerContext()
 	return &Scheduler{
 		tasks:  make(map[string]*Task),
 		ctx:    ctx,
@@ -62,6 +100,14 @@ func NewScheduler() *Scheduler {
 
 // AddTask 添加任务
 func (s *Scheduler) AddTask(name string, schedule Schedule, handler TaskHandler) *Task {
+	if schedule == nil {
+		panic("cron: AddTask requires a non-nil schedule")
+	}
+	if handler == nil {
+		panic("cron: AddTask requires a non-nil handler")
+	}
+	validateSchedule(schedule)
+
 	task := &Task{
 		Name:     name,
 		Schedule: schedule,
@@ -146,12 +192,19 @@ func (s *Scheduler) ListTasks() []*Task {
 // 共用此边界，panic 一律转为 error 记入 LastError 并向上返回，不破坏 running 守卫与 wg.Done
 // （recover 在本函数内部完成，外侧 defer 仍正常执行）。
 func (s *Scheduler) executeTask(t *Task) (err error) {
+	s.mu.RLock()
+	ctx := s.ctx
+	s.mu.RUnlock()
+	return s.executeTaskWithContext(ctx, t)
+}
+
+func (s *Scheduler) executeTaskWithContext(ctx context.Context, t *Task) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("cron task %q panic recovered: %v\n%s", t.Name, r, debug.Stack())
 		}
 	}()
-	return t.Handler(s.ctx)
+	return t.Handler(ctx)
 }
 
 // RunTask 立即运行任务（手动触发，同步返回 handler 错误）。
@@ -194,16 +247,25 @@ func (s *Scheduler) RunTask(name string) error {
 
 // Start 启动调度器
 func (s *Scheduler) Start() {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
 	if s.running {
 		s.mu.Unlock()
 		return
 	}
+	select {
+	case <-s.ctx.Done():
+		s.ctx, s.cancel = newSchedulerContext()
+	default:
+	}
+	ctx := s.ctx
 	s.running = true
+	s.wg.Add(1)
 	s.mu.Unlock()
 
-	s.wg.Add(1)
-	go s.run()
+	go s.run(ctx)
 }
 
 // Stop 停止调度器并无限等待在跑任务退出（要求 handler 尊重 ctx.Done）。
@@ -216,15 +278,19 @@ func (s *Scheduler) Stop() {
 // 返回 true 表示所有任务已退出；false 表示超时（仍有任务未响应 ctx.Done 而运行）。
 // timeout<=0 等价于无限等待（同 Stop）。幂等：未运行时直接返回 true。
 func (s *Scheduler) StopWithTimeout(timeout time.Duration) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+
 	s.mu.Lock()
 	if !s.running {
 		s.mu.Unlock()
 		return true
 	}
 	s.running = false
+	cancel := s.cancel
 	s.mu.Unlock()
 
-	s.cancel()
+	cancel()
 	if timeout <= 0 {
 		s.wg.Wait()
 		return true
@@ -240,7 +306,7 @@ func (s *Scheduler) StopWithTimeout(timeout time.Duration) bool {
 }
 
 // run 运行调度循环
-func (s *Scheduler) run() {
+func (s *Scheduler) run(ctx context.Context) {
 	defer s.wg.Done()
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -248,10 +314,10 @@ func (s *Scheduler) run() {
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.checkAndRun()
+			s.checkAndRun(ctx)
 		}
 	}
 }
@@ -272,10 +338,23 @@ func (s *Scheduler) run() {
 // 一定能等到本批全部 goroutine。收集阶段已 CAS 占用守卫并推进 NextRun，故 spawn 必须
 // 执行（否则守卫不释放、NextRun 已推进却未跑）。spawn 用 s.ctx——Stop 后 ctx 已取消，
 // handler 收到 canceled ctx 应及时退出。
-func (s *Scheduler) checkAndRun() {
+func (s *Scheduler) checkAndRun(ctxs ...context.Context) {
 	now := time.Now()
+	var ctx context.Context
+	enforceRunning := len(ctxs) > 0 && ctxs[0] != nil
+	if len(ctxs) > 0 && ctxs[0] != nil {
+		ctx = ctxs[0]
+	} else {
+		s.mu.RLock()
+		ctx = s.ctx
+		s.mu.RUnlock()
+	}
 
 	s.mu.Lock()
+	if enforceRunning && (!s.running || ctx.Err() != nil) {
+		s.mu.Unlock()
+		return
+	}
 	var due []*Task
 	for _, task := range s.tasks {
 		if !task.Enabled || task.NextRun.IsZero() || !now.After(task.NextRun) {
@@ -301,7 +380,7 @@ func (s *Scheduler) checkAndRun() {
 				}
 			}()
 
-			err := s.executeTask(t)
+			err := s.executeTaskWithContext(ctx, t)
 
 			s.mu.Lock()
 			t.LastRun = time.Now()
@@ -329,6 +408,7 @@ func (s *IntervalSchedule) Next(now time.Time) time.Time {
 
 // Every 每隔指定时间运行
 func Every(interval time.Duration) *IntervalSchedule {
+	validateInterval(interval)
 	return &IntervalSchedule{Interval: interval}
 }
 
@@ -349,6 +429,7 @@ func (s *DailySchedule) Next(now time.Time) time.Time {
 
 // Daily 每日指定时间运行
 func Daily(hour, minute int) *DailySchedule {
+	validateClock(hour, minute, "Daily")
 	return &DailySchedule{Hour: hour, Minute: minute}
 }
 
@@ -377,6 +458,8 @@ func (s *WeeklySchedule) Next(now time.Time) time.Time {
 
 // Weekly 每周指定时间运行
 func Weekly(day time.Weekday, hour, minute int) *WeeklySchedule {
+	validateWeekday(day)
+	validateClock(hour, minute, "Weekly")
 	return &WeeklySchedule{Day: day, Hour: hour, Minute: minute}
 }
 

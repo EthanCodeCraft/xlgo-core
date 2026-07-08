@@ -28,6 +28,9 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`logger.DefaultLogger = m` 直接赋值不再驱动包级 facade**（logger/logger.go，M3）：为消除 `SetDefaultLogManager()` 与包级 facade 并发读取默认 manager 的裸全局指针竞态，facade 改为读取内部 atomic 快照。`logger.DefaultLogger` 仍保持 `*LogManager` 类型，旧的 `logger.DefaultLogger.Init/Close/SetLevel/GetLevel` 直接调用仍可用；替换默认 manager 请使用 `logger.SetDefaultLogManager(m)`。
 - **`logger.Init` 拒绝明显非法日志配置**（logger/logger.go，M3）：空日志目录、负数 `MaxSize/MaxBackups/MaxAge` 现在直接返回错误。依赖零值日志配置启动 `WithLogger()` 的下游需显式设置 `Log.Dir` 与非负轮转参数。
 - **限流器非法配置改为 fail-fast**（middleware/ratelimit.go，M8）：`NewRateLimiter` / `NewRedisRateLimiter` / `NewRedisRateLimiterFailClosed` 现在对 `rate <= 0` 或 `window <= 0` 直接 panic，避免零值窗口/零值配额静默产生不确定限流语义。下游应在配置加载阶段校验限流参数。
+- **`handler.BindJSON` 默认限制 JSON body 为 1MiB**（handler/handler.go，M6）：防止入口层无上限读取请求体导致 OOM。需要更大 JSON 的接口请改用 `handler.BindJSONWithMaxBytes(c, req, maxBytes)` 显式声明上限。
+- **cron 非法任务配置改为 fail-fast**（cron/cron.go，M13）：`AddTask` 拒绝 nil schedule / nil handler；`Every(<=0)`、`Daily`/`Weekly` 越界时间、非法 weekday 会 panic，避免静默生成不推进或归一化跑偏的调度。
+- **repository 查询保护默认开启**（repository/repository.go，M5/N5）：`FindAll` 默认最多返回 `DefaultFindAllLimit=1000` 条；明确需要全表扫描时改用 `FindAllUnbounded`。`FindPage*` / `QueryBuilder.Page` 会归一化 `page/pageSize` 并限制 `MaxPageSize=100`、`MaxPage=10000`。`Find*Ordered` / `QueryBuilder.Order` 只接受简单字段排序（如 `created_at DESC, id ASC`），复杂表达式/raw SQL 会返回 `ErrUnsafeOrder`；`UpdateBatch` 字段名不合法返回 `ErrUnsafeField`。
 
 ### Fixed 🐛
 
@@ -37,6 +40,10 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
 
 - **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
+- **M6 response/handler 入口防护**（response/error.go，response/response.go，handler/handler.go）：`FailWithError(nil)` / `FailWithDetail(nil, ...)` 回退统一服务器错误响应，不再 nil deref panic；新增 `response.DownloadReader` 支持大文件/对象存储流式下载，旧 `Download` / `DownloadWithContentType` 保持兼容并复用同一响应头逻辑。
+- **M7 health/readiness 探活超时**（router/router.go）：`HealthCheck` 新增 `Timeout` 字段，默认每个依赖检查 2s 超时；超时项返回 `"timeout"` 并使 `/health` / `/readyz` 返回 503。单个 check 同时最多一个执行中，panic 会 recover 为错误，避免 k8s/LB/监控探活被挂死依赖无限卡住或无限堆积 goroutine。
+- **M13 cron 剩余边界收口**（cron/cron.go）：Stop 后再次 Start 会重建调度器 context，手动和调度执行不再收到已取消 ctx；Start/Stop 生命周期串行化，避免 Stop 等待期间重新 Start 触发 WaitGroup Add/Wait 交错。
+- **M5 repository 安全边界收口**（repository/repository.go）：nil ctx 统一按 `context.Background()` 处理；`FindByIDs(nil)` 返回非 nil 空切片；`NewQueryBuilder` 复用 nil DB 明确 panic；批量空 ids 写操作 no-op；默认 `FindAll` 加上限并新增 `FindAllUnbounded`；排序/字段名白名单避免便捷 API 误接 raw SQL。
 - **M1 App 生命周期三类缺陷统一治理**（app.go）：
   - **Init 失败无资源回滚** → 新增 `failAfterInit`：markStopping → cancel rootCtx → wg.Wait(10s) → cron 5s 显式超时停止 → `closeResources` 幂等关闭 db/redis/logger，回滚错误 `errors.Join` 进 `initErr` 不吞；先停 goroutine 再关资源，避免"关 DB 时探活 goroutine 仍在用"的竞态。
   - **App.Go 与 wg.Wait race** → `lifecycleMu.RLock` 包住 `wg.Add`，`Shutdown` 持写锁翻 `stateStopping`，保证 Add happens-before Wait。

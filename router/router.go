@@ -2,12 +2,15 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
@@ -19,6 +22,76 @@ type HealthCheck struct {
 	Name     string
 	Check    func(context.Context) error
 	Disabled bool
+	Timeout  time.Duration
+}
+
+// DefaultHealthCheckTimeout bounds each dependency check so /health and /readyz
+// do not hang behind a stuck database/client call.
+const DefaultHealthCheckTimeout = 2 * time.Second
+
+type healthCheckRunner struct {
+	check   HealthCheck
+	running chan struct{}
+}
+
+func newHealthCheckRunners(checks []HealthCheck) []healthCheckRunner {
+	runners := make([]healthCheckRunner, len(checks))
+	for i, check := range checks {
+		runners[i] = healthCheckRunner{
+			check:   check,
+			running: make(chan struct{}, 1),
+		}
+	}
+	return runners
+}
+
+func healthCheckTimeout(check HealthCheck) time.Duration {
+	if check.Timeout > 0 {
+		return check.Timeout
+	}
+	return DefaultHealthCheckTimeout
+}
+
+func healthCheckStatusFromContext(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "error"
+}
+
+func (r healthCheckRunner) run(ctx context.Context) (string, error) {
+	check := r.check
+	checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout(check))
+	defer cancel()
+
+	select {
+	case r.running <- struct{}{}:
+	case <-checkCtx.Done():
+		return healthCheckStatusFromContext(checkCtx.Err()), checkCtx.Err()
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		defer func() {
+			<-r.running
+		}()
+		defer func() {
+			if rec := recover(); rec != nil {
+				errCh <- fmt.Errorf("health check %q panic recovered: %v\n%s", check.Name, rec, debug.Stack())
+			}
+		}()
+		errCh <- check.Check(checkCtx)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			return "ok", nil
+		}
+		return healthCheckStatusFromContext(err), err
+	case <-checkCtx.Done():
+		return healthCheckStatusFromContext(checkCtx.Err()), checkCtx.Err()
+	}
 }
 
 // registerGETOnce 幂等注册 GET 路由（H8d 收尾：消除 defaultModule 与 Register* 系列
@@ -59,14 +132,15 @@ func registerGETOnce(r gin.IRoutes, path string, h gin.HandlerFunc) {
 
 // runHealthChecks 执行所有检查项，返回总体状态、HTTP code 与逐项结果。
 // 无检查项时视为健康（用于 /livez 与无依赖场景）。
-func runHealthChecks(ctx context.Context, checks []HealthCheck) (string, int, map[string]string) {
-	if len(checks) == 0 {
+func runHealthChecks(ctx context.Context, runners []healthCheckRunner) (string, int, map[string]string) {
+	if len(runners) == 0 {
 		return "ok", http.StatusOK, nil
 	}
 	status := "ok"
 	code := http.StatusOK
-	result := make(map[string]string, len(checks))
-	for _, check := range checks {
+	result := make(map[string]string, len(runners))
+	for _, runner := range runners {
+		check := runner.check
 		if check.Name == "" {
 			continue
 		}
@@ -74,13 +148,13 @@ func runHealthChecks(ctx context.Context, checks []HealthCheck) (string, int, ma
 			result[check.Name] = "disabled"
 			continue
 		}
-		if err := check.Check(ctx); err != nil {
-			result[check.Name] = "error"
+		checkStatus, err := runner.run(ctx)
+		result[check.Name] = checkStatus
+		if err != nil {
 			status = "error"
 			code = http.StatusServiceUnavailable
 			continue
 		}
-		result[check.Name] = "ok"
 	}
 	return status, code, result
 }
@@ -90,8 +164,9 @@ func runHealthChecks(ctx context.Context, checks []HealthCheck) (string, int, ma
 // 并附逐项结果。RegisterHealthRoute / RegisterReadinessRoute / defaultModule
 // 均委托此实现，避免三个 /health 行为与响应体不一致。
 func healthHandler(checks []HealthCheck) gin.HandlerFunc {
+	runners := newHealthCheckRunners(checks)
 	return func(c *gin.Context) {
-		status, code, result := runHealthChecks(c.Request.Context(), checks)
+		status, code, result := runHealthChecks(c.Request.Context(), runners)
 		if result == nil {
 			c.JSON(http.StatusOK, gin.H{"status": status})
 			return
@@ -188,10 +263,10 @@ type MiddlewareGroup struct {
 
 // Registry 路由注册中心
 type Registry struct {
-	engine       *gin.Engine
-	modules      []Module
-	versions     map[string]*VersionedAPI
-	middlewareGroups map[string]*MiddlewareGroup
+	engine            *gin.Engine
+	modules           []Module
+	versions          map[string]*VersionedAPI
+	middlewareGroups  map[string]*MiddlewareGroup
 	globalMiddlewares []gin.HandlerFunc
 
 	// metricsMiddleware 在 Apply 时作为首个全局中间件装入（H8c），
@@ -209,9 +284,9 @@ type Registry struct {
 // NewRegistry 创建路由注册中心
 func NewRegistry(engine *gin.Engine) *Registry {
 	return &Registry{
-		engine:       engine,
-		modules:      make([]Module, 0),
-		versions:     make(map[string]*VersionedAPI),
+		engine:           engine,
+		modules:          make([]Module, 0),
+		versions:         make(map[string]*VersionedAPI),
 		middlewareGroups: make(map[string]*MiddlewareGroup),
 	}
 }
@@ -239,7 +314,7 @@ type namedModule struct {
 	fn   func(r *gin.RouterGroup)
 }
 
-func (m *namedModule) Name() string { return m.name }
+func (m *namedModule) Name() string                { return m.name }
 func (m *namedModule) Register(r *gin.RouterGroup) { m.fn(r) }
 
 // RegisterVersion 注册版本化 API

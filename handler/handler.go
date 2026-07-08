@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -9,6 +10,11 @@ import (
 	"github.com/EthanCodeCraft/xlgo-core/utils"
 	"github.com/gin-gonic/gin"
 )
+
+// DefaultMaxJSONBodyBytes 是 BindJSON 的默认请求体上限。
+// 入口层无上限读 JSON 会让任意 handler 暴露 OOM 面；需要更大请求体的业务可改用
+// BindJSONWithMaxBytes 显式声明上限。
+const DefaultMaxJSONBodyBytes int64 = 1 << 20 // 1 MiB
 
 // HealthCheck 健康检查
 // @Summary 健康检查
@@ -28,6 +34,16 @@ func HealthCheck(c *gin.Context) {
 
 // BindJSON 绑定 JSON 请求
 func BindJSON(c *gin.Context, req any) error {
+	return BindJSONWithMaxBytes(c, req, DefaultMaxJSONBodyBytes)
+}
+
+// BindJSONWithMaxBytes 绑定 JSON 请求，并限制最大 body 大小。
+// maxBytes<=0 时返回明确错误，避免 http.MaxBytesReader 的非正上限产生不可读语义。
+func BindJSONWithMaxBytes(c *gin.Context, req any, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return errors.New("handler: max JSON body bytes must be positive")
+	}
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
 	return c.ShouldBindJSON(req)
 }
 
