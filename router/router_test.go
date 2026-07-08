@@ -430,7 +430,7 @@ func TestGroupWithMiddlewareGroup(t *testing.T) {
 
 	registry.RegisterMiddlewareGroup(router.NewMiddlewareGroup("auth", func(c *gin.Context) { c.Next() }))
 
-	group := router.GroupWithMiddlewareGroup(engine, "/api", "auth")
+	group := registry.GroupWithMiddlewareGroup(engine, "/api", "auth")
 	if group == nil {
 		t.Error("GroupWithMiddlewareGroup should not return nil")
 	}

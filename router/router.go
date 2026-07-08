@@ -12,10 +12,32 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"github.com/gin-gonic/gin"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 )
+
+var routerWarnf atomic.Value // stores func(string, ...any)
+
+func warnf(format string, args ...any) {
+	if fn, ok := routerWarnf.Load().(func(string, ...any)); ok && fn != nil {
+		fn(format, args...)
+		return
+	}
+	logger.Warnf(format, args...)
+}
+
+func isDuplicateRoutePanic(msg, path string) bool {
+	if strings.Contains(msg, "already registered") {
+		return true
+	}
+	if !strings.Contains(msg, "conflicts with existing wildcard") {
+		return false
+	}
+	return strings.Contains(msg, fmt.Sprintf("new path '%s'", path)) &&
+		strings.Contains(msg, fmt.Sprintf("existing prefix '%s'", path))
+}
 
 // HealthCheck 健康检查项
 type HealthCheck struct {
@@ -108,20 +130,40 @@ func (r healthCheckRunner) run(ctx context.Context) (string, error) {
 //
 // 注册期单线程调用，无并发问题。
 func registerGETOnce(r gin.IRoutes, path string, h gin.HandlerFunc) {
-	if eng, ok := r.(*gin.Engine); ok {
+	if r == nil {
+		warnf("router: skip GET %q because routes is nil", path)
+		return
+	}
+	if h == nil {
+		warnf("router: skip GET %q because handler is nil", path)
+		return
+	}
+	switch route := r.(type) {
+	case *gin.Engine:
+		eng := route
+		if eng == nil {
+			warnf("router: skip GET %q because engine is nil", path)
+			return
+		}
 		for _, ri := range eng.Routes() {
 			if ri.Method == http.MethodGet && ri.Path == path {
+				warnf("router: duplicate GET %q skipped", path)
 				return
 			}
 		}
 		eng.GET(path, h)
 		return
+	case *gin.RouterGroup:
+		if route == nil {
+			warnf("router: skip GET %q because router group is nil", path)
+			return
+		}
 	}
 	defer func() {
 		if rec := recover(); rec != nil {
 			msg := fmt.Sprint(rec)
-			if strings.Contains(msg, "already registered") ||
-				strings.Contains(msg, "conflicts with existing wildcard") {
+			if isDuplicateRoutePanic(msg, path) {
+				warnf("router: duplicate GET %q skipped: %v", path, rec)
 				return // 重复路由，静默跳过
 			}
 			panic(rec) // 非重复路由 panic，原样抛出
@@ -263,6 +305,7 @@ type MiddlewareGroup struct {
 
 // Registry 路由注册中心
 type Registry struct {
+	mu                sync.Mutex
 	engine            *gin.Engine
 	modules           []Module
 	versions          map[string]*VersionedAPI
@@ -279,6 +322,7 @@ type Registry struct {
 	// 原实现用裸 bool 无同步，并发 Apply 会竞态并可能重复 engine.Use/重复注册致 gin panic；
 	// 改用 sync.Once，二次/并发 Apply 均安全幂等。
 	applyOnce sync.Once
+	applied   atomic.Bool
 }
 
 // NewRegistry 创建路由注册中心
@@ -291,20 +335,64 @@ func NewRegistry(engine *gin.Engine) *Registry {
 	}
 }
 
+func (r *Registry) lockForMutation(action string) (func(), bool) {
+	if r == nil {
+		warnf("router: skip %s because registry is nil", action)
+		return nil, false
+	}
+	r.mu.Lock()
+	if r.applied.Load() {
+		r.mu.Unlock()
+		warnf("router: %s called after Apply; registration will not take effect", action)
+		return nil, false
+	}
+	return r.mu.Unlock, true
+}
+
+func filterNilHandlers(action string, handlers []gin.HandlerFunc) []gin.HandlerFunc {
+	out := make([]gin.HandlerFunc, 0, len(handlers))
+	for _, h := range handlers {
+		if h == nil {
+			warnf("router: nil middleware skipped in %s", action)
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // Use 注册全局中间件
 func (r *Registry) Use(middlewares ...gin.HandlerFunc) *Registry {
-	r.globalMiddlewares = append(r.globalMiddlewares, middlewares...)
+	unlock, ok := r.lockForMutation("Use")
+	if !ok {
+		return r
+	}
+	defer unlock()
+	r.globalMiddlewares = append(r.globalMiddlewares, filterNilHandlers("Use", middlewares)...)
 	return r
 }
 
 // RegisterModule 注册模块（无版本）
 func (r *Registry) RegisterModule(module Module) *Registry {
+	unlock, ok := r.lockForMutation("RegisterModule")
+	if !ok {
+		return r
+	}
+	defer unlock()
+	if module == nil {
+		warnf("router: nil module skipped")
+		return r
+	}
 	r.modules = append(r.modules, module)
 	return r
 }
 
 // RegisterModuleFunc 注册函数式模块
 func (r *Registry) RegisterModuleFunc(name string, fn func(r *gin.RouterGroup)) *Registry {
+	if fn == nil {
+		warnf("router: module func %q skipped because function is nil", name)
+		return r
+	}
 	return r.RegisterModule(&namedModule{name: name, fn: fn})
 }
 
@@ -319,20 +407,52 @@ func (m *namedModule) Register(r *gin.RouterGroup) { m.fn(r) }
 
 // RegisterVersion 注册版本化 API
 func (r *Registry) RegisterVersion(version *VersionedAPI) *Registry {
+	unlock, ok := r.lockForMutation("RegisterVersion")
+	if !ok {
+		return r
+	}
+	defer unlock()
+	if version == nil {
+		warnf("router: nil version skipped")
+		return r
+	}
+	version.Middlewares = filterNilHandlers("RegisterVersion "+version.Version, version.Middlewares)
+	if _, exists := r.versions[version.Version]; exists {
+		warnf("router: duplicate version %q overwritten", version.Version)
+	}
 	r.versions[version.Version] = version
 	return r
 }
 
 // RegisterMiddlewareGroup 注册中间件分组
 func (r *Registry) RegisterMiddlewareGroup(group *MiddlewareGroup) *Registry {
+	unlock, ok := r.lockForMutation("RegisterMiddlewareGroup")
+	if !ok {
+		return r
+	}
+	defer unlock()
+	if group == nil {
+		warnf("router: nil middleware group skipped")
+		return r
+	}
+	group.Middlewares = filterNilHandlers("RegisterMiddlewareGroup "+group.Name, group.Middlewares)
+	if _, exists := r.middlewareGroups[group.Name]; exists {
+		warnf("router: duplicate middleware group %q overwritten", group.Name)
+	}
 	r.middlewareGroups[group.Name] = group
 	return r
 }
 
 // GetMiddlewareGroup 获取中间件分组
 func (r *Registry) GetMiddlewareGroup(name string) []gin.HandlerFunc {
+	if r == nil {
+		warnf("router: GetMiddlewareGroup(%q) on nil registry", name)
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if group, ok := r.middlewareGroups[name]; ok {
-		return group.Middlewares
+		return append([]gin.HandlerFunc(nil), group.Middlewares...)
 	}
 	return nil
 }
@@ -341,7 +461,20 @@ func (r *Registry) GetMiddlewareGroup(name string) []gin.HandlerFunc {
 // 装入 engine，使所有经注册中心注册的路由都被采集，不再依赖注册顺序。
 // 传入 nil 清除。须在 Apply 之前调用。
 func (r *Registry) SetMetricsMiddleware(mw gin.HandlerFunc) {
+	unlock, ok := r.lockForMutation("SetMetricsMiddleware")
+	if !ok {
+		return
+	}
+	defer unlock()
 	r.metricsMiddleware = mw
+}
+
+type versionApplySnapshot struct {
+	isNil       bool
+	version     string
+	basePath    string
+	middlewares []gin.HandlerFunc
+	modules     []Module
 }
 
 // Apply 应用所有路由注册。
@@ -350,22 +483,21 @@ func (r *Registry) SetMetricsMiddleware(mw gin.HandlerFunc) {
 // 装入顺序：metrics 中间件（若有）→ 用户全局中间件 → 模块/版本路由。
 // metrics 置于首位保证全量业务路由被采集，且不依赖 RegisterMetricsRoute 调用顺序。
 func (r *Registry) Apply() {
+	if r == nil {
+		warnf("router: Apply called on nil registry")
+		return
+	}
+	if r.engine == nil {
+		warnf("router: Apply skipped because engine is nil")
+		return
+	}
 	r.applyOnce.Do(func() {
-		// 指标采集中间件首个装入，统计所有经注册中心注册的业务路由
-		if r.metricsMiddleware != nil {
-			r.engine.Use(r.metricsMiddleware)
-		}
-
-		// 应用全局中间件
-		r.engine.Use(r.globalMiddlewares...)
-
-		// 注册无版本模块
-		for _, module := range r.modules {
-			module.Register(r.engine.Group(""))
-		}
-
-		// 注册版本化 API。P1 #13：按 version 键排序遍历，使跨版本注册顺序确定，
-		// 避免 map 随机序导致重叠路径"谁先胜出"（配合 registerGETOnce）每次运行不一致。
+		r.mu.Lock()
+		r.applied.Store(true)
+		metricsMiddleware := r.metricsMiddleware
+		globalMiddlewares := append([]gin.HandlerFunc(nil), r.globalMiddlewares...)
+		modules := append([]Module(nil), r.modules...)
+		versions := make([]versionApplySnapshot, 0, len(r.versions))
 		versionKeys := make([]string, 0, len(r.versions))
 		for k := range r.versions {
 			versionKeys = append(versionKeys, k)
@@ -373,11 +505,52 @@ func (r *Registry) Apply() {
 		sort.Strings(versionKeys)
 		for _, k := range versionKeys {
 			v := r.versions[k]
-			group := r.engine.Group(v.BasePath)
-			if len(v.Middlewares) > 0 {
-				group.Use(v.Middlewares...)
+			if v == nil {
+				versions = append(versions, versionApplySnapshot{isNil: true, version: k})
+				continue
 			}
-			for _, module := range v.Modules {
+			versions = append(versions, versionApplySnapshot{
+				version:     v.Version,
+				basePath:    v.BasePath,
+				middlewares: append([]gin.HandlerFunc(nil), v.Middlewares...),
+				modules:     append([]Module(nil), v.Modules...),
+			})
+		}
+		r.mu.Unlock()
+
+		// 指标采集中间件首个装入，统计所有经注册中心注册的业务路由
+		if metricsMiddleware != nil {
+			r.engine.Use(metricsMiddleware)
+		}
+
+		// 应用全局中间件
+		r.engine.Use(globalMiddlewares...)
+
+		// 注册无版本模块
+		for _, module := range modules {
+			if module == nil {
+				warnf("router: nil module skipped during Apply")
+				continue
+			}
+			module.Register(r.engine.Group(""))
+		}
+
+		// 注册版本化 API。P1 #13：按 version 键排序遍历，使跨版本注册顺序确定，
+		// 避免 map 随机序导致重叠路径"谁先胜出"（配合 registerGETOnce）每次运行不一致。
+		for _, v := range versions {
+			if v.isNil {
+				warnf("router: nil version %q skipped during Apply", v.version)
+				continue
+			}
+			group := r.engine.Group(v.basePath)
+			if len(v.middlewares) > 0 {
+				group.Use(v.middlewares...)
+			}
+			for _, module := range v.modules {
+				if module == nil {
+					warnf("router: nil module skipped in version %q", v.version)
+					continue
+				}
 				module.Register(group)
 			}
 		}
@@ -444,19 +617,31 @@ func NewVersion(version, basePath string, middlewares ...gin.HandlerFunc) *Versi
 	return &VersionedAPI{
 		Version:     version,
 		BasePath:    basePath,
-		Middlewares: middlewares,
+		Middlewares: filterNilHandlers("NewVersion "+version, middlewares),
 		Modules:     make([]Module, 0),
 	}
 }
 
 // AddModule 为版本添加模块
 func (v *VersionedAPI) AddModule(module Module) *VersionedAPI {
+	if v == nil {
+		warnf("router: AddModule called on nil version")
+		return v
+	}
+	if module == nil {
+		warnf("router: nil module skipped in version %q", v.Version)
+		return v
+	}
 	v.Modules = append(v.Modules, module)
 	return v
 }
 
 // AddModuleFunc 为版本添加函数式模块
 func (v *VersionedAPI) AddModuleFunc(name string, fn func(r *gin.RouterGroup)) *VersionedAPI {
+	if fn == nil {
+		warnf("router: module func %q skipped because function is nil", name)
+		return v
+	}
 	return v.AddModule(&namedModule{name: name, fn: fn})
 }
 
@@ -464,7 +649,7 @@ func (v *VersionedAPI) AddModuleFunc(name string, fn func(r *gin.RouterGroup)) *
 func NewMiddlewareGroup(name string, middlewares ...gin.HandlerFunc) *MiddlewareGroup {
 	return &MiddlewareGroup{
 		Name:        name,
-		Middlewares: middlewares,
+		Middlewares: filterNilHandlers("NewMiddlewareGroup "+name, middlewares),
 	}
 }
 
@@ -472,7 +657,11 @@ func NewMiddlewareGroup(name string, middlewares ...gin.HandlerFunc) *Middleware
 
 // Group 创建路由组（带中间件分组）
 func Group(engine *gin.Engine, path string, middlewares ...gin.HandlerFunc) *gin.RouterGroup {
-	return engine.Group(path, middlewares...)
+	if engine == nil {
+		warnf("router: Group(%q) skipped because engine is nil", path)
+		return nil
+	}
+	return engine.Group(path, filterNilHandlers("Group "+path, middlewares)...)
 }
 
 // GroupWithMiddlewareGroup 使用中间件分组创建路由组。
@@ -480,9 +669,16 @@ func Group(engine *gin.Engine, path string, middlewares ...gin.HandlerFunc) *gin
 // H-B 修复：改走 ensureRegistry()（与 Use/RegisterModule/Apply 等所有全局 helper 一致），
 // 把"未初始化"从 nil 解引用 panic 转成可定位的明确 panic（H8a 目标）。原实现用 GetRegistry()
 // 可返回 nil，nil.GetMiddlewareGroup 即 panic，错误信息晦涩。
+func (r *Registry) GroupWithMiddlewareGroup(engine *gin.Engine, path string, groupName string) *gin.RouterGroup {
+	if engine == nil {
+		warnf("router: GroupWithMiddlewareGroup(%q) skipped because engine is nil", path)
+		return nil
+	}
+	return engine.Group(path, r.GetMiddlewareGroup(groupName)...)
+}
+
 func GroupWithMiddlewareGroup(engine *gin.Engine, path string, groupName string) *gin.RouterGroup {
-	middlewares := ensureRegistry().GetMiddlewareGroup(groupName)
-	return engine.Group(path, middlewares...)
+	return ensureRegistry().GroupWithMiddlewareGroup(engine, path, groupName)
 }
 
 // RESTfulRoute RESTful 路由快捷注册
@@ -496,28 +692,61 @@ func NewRESTful(group *gin.RouterGroup, path string) *RESTfulRoute {
 	return &RESTfulRoute{Group: group, Path: path}
 }
 
+func (r *RESTfulRoute) prepareHandlers(method string, handlers []gin.HandlerFunc) []gin.HandlerFunc {
+	if r == nil || r.Group == nil {
+		warnf("router: RESTful %s skipped because route/group is nil", method)
+		return nil
+	}
+	filtered := filterNilHandlers("RESTful "+method+" "+r.Path, handlers)
+	if len(filtered) == 0 {
+		warnf("router: RESTful %s %q skipped because handlers are empty", method, r.Path)
+		return nil
+	}
+	return filtered
+}
+
 // GET 注册 GET 路由
 func (r *RESTfulRoute) GET(handlers ...gin.HandlerFunc) {
+	handlers = r.prepareHandlers(http.MethodGet, handlers)
+	if handlers == nil {
+		return
+	}
 	r.Group.GET(r.Path, handlers...)
 }
 
 // POST 注册 POST 路由
 func (r *RESTfulRoute) POST(handlers ...gin.HandlerFunc) {
+	handlers = r.prepareHandlers(http.MethodPost, handlers)
+	if handlers == nil {
+		return
+	}
 	r.Group.POST(r.Path, handlers...)
 }
 
 // PUT 注册 PUT 路由
 func (r *RESTfulRoute) PUT(handlers ...gin.HandlerFunc) {
+	handlers = r.prepareHandlers(http.MethodPut, handlers)
+	if handlers == nil {
+		return
+	}
 	r.Group.PUT(r.Path, handlers...)
 }
 
 // DELETE 注册 DELETE 路由
 func (r *RESTfulRoute) DELETE(handlers ...gin.HandlerFunc) {
+	handlers = r.prepareHandlers(http.MethodDelete, handlers)
+	if handlers == nil {
+		return
+	}
 	r.Group.DELETE(r.Path, handlers...)
 }
 
 // PATCH 注册 PATCH 路由
 func (r *RESTfulRoute) PATCH(handlers ...gin.HandlerFunc) {
+	handlers = r.prepareHandlers(http.MethodPatch, handlers)
+	if handlers == nil {
+		return
+	}
 	r.Group.PATCH(r.Path, handlers...)
 }
 
@@ -528,6 +757,10 @@ func (r *RESTfulRoute) PATCH(handlers ...gin.HandlerFunc) {
 // PUT /path/:id - 更新
 // DELETE /path/:id - 删除
 func (r *RESTfulRoute) CRUD(list, detail, create, update, delete gin.HandlerFunc) {
+	if r == nil || r.Group == nil {
+		warnf("router: RESTful CRUD skipped because route/group is nil")
+		return
+	}
 	if list != nil {
 		r.Group.GET(r.Path, list)
 	}
