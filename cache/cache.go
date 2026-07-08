@@ -33,6 +33,12 @@ type CacheExistChecker interface {
 	ExistsE(ctx context.Context, key string) (bool, error)
 }
 
+// CacheGetter is implemented by cache backends that can distinguish a cache
+// miss from a backend failure while loading a value.
+type CacheGetter interface {
+	GetE(ctx context.Context, key string, dest any) (bool, error)
+}
+
 // redisCache Redis 缓存实现。
 //
 // 不在构造时快照 redis.Client（M12 修复：原 NewRedisCache 构造时取 database.GetRedis()，
@@ -71,6 +77,29 @@ func (c *redisCache) Get(ctx context.Context, key string, dest any) bool {
 	}
 
 	return true
+}
+
+// GetE loads a cached JSON value and returns backend/deserialize errors to
+// callers that need to distinguish a cache miss from Redis or data failures.
+func (c *redisCache) GetE(ctx context.Context, key string, dest any) (bool, error) {
+	cli := c.client()
+	if cli == nil {
+		return false, ErrRedisNotReady
+	}
+
+	val, err := cli.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return false, nil
+		}
+		return false, err
+	}
+
+	if err := json.Unmarshal([]byte(val), dest); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // Set 设置缓存值
@@ -254,4 +283,18 @@ func ExistsE(ctx context.Context, key string) (bool, error) {
 		return checker.ExistsE(ctx, key)
 	}
 	return svc.Exists(ctx, key), nil
+}
+
+// GetE loads a cached JSON value and returns backend/deserialize errors. It
+// complements the legacy bool-only CacheService.Get method without changing
+// that public interface for downstream custom cache implementations.
+func GetE(ctx context.Context, key string, dest any) (bool, error) {
+	svc := GetCache()
+	if svc == nil {
+		return false, ErrRedisNotReady
+	}
+	if getter, ok := svc.(CacheGetter); ok {
+		return getter.GetE(ctx, key, dest)
+	}
+	return svc.Get(ctx, key, dest), nil
 }

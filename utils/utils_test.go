@@ -261,9 +261,29 @@ func TestToIntDefault(t *testing.T) {
 	}
 }
 
+func TestToIntE(t *testing.T) {
+	n, err := utils.ToIntE("123")
+	if err != nil || n != 123 {
+		t.Fatalf("ToIntE valid = %d, err=%v; want 123,nil", n, err)
+	}
+	if _, err := utils.ToIntE("abc"); err == nil {
+		t.Fatal("ToIntE invalid should return error")
+	}
+}
+
 func TestToInt64(t *testing.T) {
 	if utils.ToInt64("1234567890123") != 1234567890123 {
 		t.Error("ToInt64 failed")
+	}
+}
+
+func TestToInt64E(t *testing.T) {
+	n, err := utils.ToInt64E("1234567890123")
+	if err != nil || n != 1234567890123 {
+		t.Fatalf("ToInt64E valid = %d, err=%v; want 1234567890123,nil", n, err)
+	}
+	if _, err := utils.ToInt64E("abc"); err == nil {
+		t.Fatal("ToInt64E invalid should return error")
 	}
 }
 

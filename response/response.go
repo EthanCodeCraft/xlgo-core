@@ -127,6 +127,8 @@ func asciiFallbackName(filename string) string {
 }
 
 // Download 文件下载响应
+// Compatibility note: for large files or object-storage streams, prefer
+// DownloadReader so the whole object is not buffered in []byte first.
 func Download(c *gin.Context, filename string, data []byte) {
 	DownloadReader(c, filename, "application/octet-stream", int64(len(data)), bytesReader(data))
 }
@@ -156,6 +158,7 @@ func bytesReader(data []byte) io.Reader {
 }
 
 // HTML HTML内容响应
+// Security note: HTML writes raw markup and does not escape untrusted input.
 func HTML(c *gin.Context, data string) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.String(http.StatusOK, data)

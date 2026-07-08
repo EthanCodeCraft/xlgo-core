@@ -774,9 +774,11 @@ response.FailWithDetail(c, response.ErrPasswordWrong, "连续错误3次将锁定
 ```go
 // 文件下载
 response.Download(c, "report.xlsx", fileData)
+// 大文件/对象存储流式下载优先使用 DownloadReader
 
 // HTML响应
 response.HTML(c, "<html>...</html>")
+// HTML 会原样输出；只传入可信或已清洗的 markup
 
 // 页面跳转
 response.Redirect(c, 302, "https://example.com")
@@ -1545,6 +1547,9 @@ cron.AddTask("noon", cron.Cron("0", "12"), doSomething) // 每天12:00
 cron.AddTask("complex", cron.ParseCron("*/15 * * * *"), doSomething) // 每15分钟
 cron.AddTask("monthly", cron.ParseCron("0 0 1 * *"), doSomething)    // 每月1号凌晨
 cron.AddTask("workday", cron.ParseCron("0 9-17 * * 1-5"), doSomething) // 工作日9-17点
+
+// ParseCron 对非法表达式 fail-fast panic；动态输入请用 ParseCronStrict 处理 error。
+// 如需旧版“非法表达式回退为每分钟”的兼容语义，请显式使用 ParseCronOrDefault。
 ```
 
 ### 13.2 启动与停止

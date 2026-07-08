@@ -118,6 +118,16 @@ func (tb *TokenBlacklist) redisClient() *redis.Client {
 // 注：ctx 超时只约束命令往返，不影响 Set 的服务端 TTL（ttl 可远大于 1s）。
 const blacklistOpTimeout = 1 * time.Second
 
+// BlacklistPolicy 控制解析 Token 时遇到黑名单查询错误的处理策略。
+// ParseToken 为兼容未启用 Redis 的存量部署默认 fail-open；安全敏感路由应使用
+// ParseTokenFailClosed 或 ParseTokenWithBlacklistPolicy(..., BlacklistFailClosed)。
+type BlacklistPolicy int
+
+const (
+	BlacklistFailOpen BlacklistPolicy = iota
+	BlacklistFailClosed
+)
+
 // blacklistCtx 创建带超时的 context 用于黑名单 Redis 操作（M-A）。
 func blacklistCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), blacklistOpTimeout)
@@ -172,6 +182,24 @@ func (tb *TokenBlacklist) IsBlacklisted(jti string) bool {
 		return false
 	}
 	return n > 0
+}
+
+// IsBlacklistedE 检查 JTI 是否在黑名单中，并返回 Redis/后端错误。
+// 当黑名单可用性属于路由安全契约时使用它；IsBlacklisted 保留旧版 fail-open bool API。
+func (tb *TokenBlacklist) IsBlacklistedE(jti string) (bool, error) {
+	client := tb.redisClient()
+	if client == nil {
+		return false, ErrBlacklistUnavailable
+	}
+
+	ctx, cancel := blacklistCtx()
+	defer cancel()
+	key := fmt.Sprintf("jwt_bl:%s", jti)
+	n, err := client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // Manager JWT 管理器（#10）。持有独立的 TokenBlacklist，
@@ -340,29 +368,67 @@ func validateIssuer(cfg *config.Config, claims *Claims) error {
 	return nil
 }
 
+func mapParseTokenError(err error) error {
+	if errors.Is(err, jwt.ErrTokenExpired) {
+		return ErrTokenExpired
+	}
+	if errors.Is(err, jwt.ErrTokenMalformed) {
+		return ErrTokenMalformed
+	}
+	if errors.Is(err, jwt.ErrTokenNotValidYet) {
+		return ErrTokenNotValidYet
+	}
+	if errors.Is(err, ErrEmptySecret) {
+		return ErrEmptySecret
+	}
+	if errors.Is(err, ErrUnsupportedAlgorithm) {
+		return ErrUnsupportedAlgorithm
+	}
+	return fmt.Errorf("%w: %w", ErrTokenInvalid, err)
+}
+
+func checkTokenBlacklist(claims *Claims, policy BlacklistPolicy) error {
+	if claims == nil || claims.JTI == "" {
+		return nil
+	}
+	revoked, err := currentBlacklist().IsBlacklistedE(claims.JTI)
+	if err != nil {
+		if policy == BlacklistFailClosed {
+			return err
+		}
+		logger.Warn("JWT 黑名单检查失败，fail-open 策略放行 token", zap.String("jti", claims.JTI), zap.Error(err))
+		return nil
+	}
+	if revoked {
+		return ErrTokenRevoked
+	}
+	return nil
+}
+
 // ParseToken 解析 JWT Token
 func ParseToken(tokenString string) (*Claims, error) {
+	return ParseTokenWithBlacklistPolicy(tokenString, BlacklistFailOpen)
+}
+
+// ParseTokenFailClosed 解析 JWT Token；若黑名单后端不可检查，则拒绝该 Token。
+func ParseTokenFailClosed(tokenString string) (*Claims, error) {
+	return ParseTokenWithBlacklistPolicy(tokenString, BlacklistFailClosed)
+}
+
+// ParseTokenWithBlacklistPolicy 使用显式黑名单查询策略解析 JWT Token。
+func ParseTokenWithBlacklistPolicy(tokenString string, policy BlacklistPolicy) (*Claims, error) {
 	cfg := config.Get()
 
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, hmacKeyfunc(cfg), parseOptions(cfg)...)
 
 	if err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, ErrTokenExpired
-		}
-		if errors.Is(err, jwt.ErrTokenMalformed) {
-			return nil, ErrTokenMalformed
-		}
-		if errors.Is(err, jwt.ErrTokenNotValidYet) {
-			return nil, ErrTokenNotValidYet
-		}
-		return nil, ErrTokenInvalid
+		return nil, mapParseTokenError(err)
 	}
 
 	if claims, ok := token.Claims.(*Claims); ok && token.Valid {
 		// 使用 JTI 检查黑名单（更高效）
-		if claims.JTI != "" && currentBlacklist().IsBlacklisted(claims.JTI) {
-			return nil, ErrTokenRevoked
+		if err := checkTokenBlacklist(claims, policy); err != nil {
+			return nil, err
 		}
 		return claims, nil
 	}

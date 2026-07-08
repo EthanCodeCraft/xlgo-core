@@ -232,10 +232,14 @@ func TestParseCron(t *testing.T) {
 	}
 
 	// 无效表达式返回默认
-	schedule = cron.ParseCron("invalid")
-	if schedule.Minute != "*" || schedule.Hour != "*" {
-		t.Error("ParseCron invalid should return default")
-	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("ParseCron invalid should panic")
+			}
+		}()
+		_ = cron.ParseCron("invalid")
+	}()
 }
 
 func TestFullCronScheduleMatch(t *testing.T) {

@@ -477,6 +477,9 @@ func (h *Hub) closeAll() {
 // H-9 修复：仅在 runStarted 为 true 时等待 runDone；Run 未启动时直接返回，
 // 避免 WaitGroup Add/Wait 竞态，且 Stop 先于 Run 调用后误再调 Run 也不会 panic。
 // 幂等：重复/并发调用安全。
+// Stop discards pending broadcast messages instead of guaranteeing delivery;
+// it is a shutdown boundary. Pending register/unregister entries are drained
+// and all live connections are closed before Stop returns.
 func (h *Hub) Stop() {
 	h.stopOnce.Do(func() {
 		h.lifecycleMu.Lock()

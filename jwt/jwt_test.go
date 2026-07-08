@@ -505,6 +505,66 @@ func TestInvalidateTokenRejectsEmptyJTI(t *testing.T) {
 	}
 }
 
+func TestParseTokenEmptySecretReturnsSentinel(t *testing.T) {
+	setupTestConfig()
+	token, err := jwt.GenerateToken(1, "u", "admin", "admin")
+	if err != nil {
+		t.Fatalf("GenerateToken before empty secret: %v", err)
+	}
+
+	config.Set(&config.Config{JWT: config.JWTConfig{Secret: "", Expire: time.Hour}})
+	t.Cleanup(setupTestConfig)
+
+	if _, err := jwt.ParseToken(token); !errors.Is(err, jwt.ErrEmptySecret) {
+		t.Fatalf("ParseToken empty secret err = %v, want ErrEmptySecret", err)
+	}
+}
+
+func TestParseTokenBlacklistPolicy(t *testing.T) {
+	setupTestConfig()
+	jwt.SetDefaultJWTManager(jwt.NewJWTManager())
+	t.Cleanup(func() { jwt.SetDefaultJWTManager(jwt.NewJWTManager()) })
+
+	token, err := jwt.GenerateToken(1, "test", "admin", "admin")
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+	if _, err := jwt.ParseToken(token); err != nil {
+		t.Fatalf("ParseToken default fail-open should pass without Redis: %v", err)
+	}
+	if _, err := jwt.ParseTokenFailClosed(token); !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Fatalf("ParseTokenFailClosed err = %v, want ErrBlacklistUnavailable", err)
+	}
+}
+
+func TestInvalidateTokenAllowsFutureNotBeforeToken(t *testing.T) {
+	setupTestConfig()
+	mr := setupMiniRedis(t)
+
+	claims := jwt.Claims{
+		UserID:   1,
+		Username: "external",
+		Role:     "admin",
+		UserType: "admin",
+		JTI:      "future-jti",
+		RegisteredClaims: gojwt.RegisteredClaims{
+			ExpiresAt: gojwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  gojwt.NewNumericDate(time.Now()),
+			NotBefore: gojwt.NewNumericDate(time.Now().Add(10 * time.Minute)),
+			Issuer:    "xlgo",
+			ID:        "future-jti",
+		},
+	}
+	token := signTokenForTest(t, claims)
+
+	if err := jwt.InvalidateToken(token); err != nil {
+		t.Fatalf("InvalidateToken future nbf: %v", err)
+	}
+	if !mr.Exists("jwt_bl:future-jti") {
+		t.Fatal("future nbf token JTI should be blacklisted")
+	}
+}
+
 func signTokenForTest(t *testing.T, claims jwt.Claims) string {
 	t.Helper()
 	token, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, claims).SignedString([]byte("test-secret-key-1234567890123456789012"))

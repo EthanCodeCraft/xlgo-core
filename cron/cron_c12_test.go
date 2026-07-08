@@ -264,15 +264,15 @@ func TestC12eParseCronStrict(t *testing.T) {
 		{"0 12 * * *", true},
 		{"*/15 * * * *", true},
 		{"0 9-17 * * 1-5", true},
-		{"0 0 1 * 7", true},  // 周日 7 合法
+		{"0 0 1 * 7", true}, // 周日 7 合法
 		{"0 0 * * 0-7", false},
 		{"invalid", false},
 		{"1-5,8 0 * * *", true},
-		{"60 0 * * *", false},  // 分钟越界
-		{"0 25 * * *", false},  // 小时越界
-		{"0 0 0 * *", false},   // 日越界
-		{"0 0 * 13 *", false},  // 月越界
-		{"0 0 * * 9", false},   // 周越界
+		{"60 0 * * *", false}, // 分钟越界
+		{"0 25 * * *", false}, // 小时越界
+		{"0 0 0 * *", false},  // 日越界
+		{"0 0 * 13 *", false}, // 月越界
+		{"0 0 * * 9", false},  // 周越界
 		{"garbage 0 * * *", false},
 		{"*/0 * * * *", false}, // step=0 非法
 	}
@@ -287,11 +287,20 @@ func TestC12eParseCronStrict(t *testing.T) {
 	}
 }
 
-// TestC12eParseCronFallback 验证 ParseCron 非法回退默认全 *（保持原行为）。
+// TestC12eParseCronFallback verifies ParseCron now fails fast on invalid input.
 func TestC12eParseCronFallback(t *testing.T) {
-	s := cron.ParseCron("invalid")
+	defer func() {
+		if recover() == nil {
+			t.Fatal("ParseCron(invalid) should panic")
+		}
+	}()
+	_ = cron.ParseCron("invalid")
+}
+
+func TestC12eParseCronOrDefaultFallback(t *testing.T) {
+	s := cron.ParseCronOrDefault("invalid")
 	if s.Minute != "*" || s.Hour != "*" || s.Day != "*" || s.Month != "*" || s.Weekday != "*" {
-		t.Errorf("ParseCron(invalid) should fall back to all-*, got %+v", s)
+		t.Errorf("ParseCronOrDefault(invalid) should fall back to all-*, got %+v", s)
 	}
 	// 合法表达式不回退。
 	s = cron.ParseCron("1-5,8 0 * * *")

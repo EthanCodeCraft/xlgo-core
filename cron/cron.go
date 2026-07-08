@@ -621,8 +621,21 @@ func parseCronRange(s string, min, max int) (int, int, error) {
 //	"0 0 1 * *"        - 每月1号凌晨
 //	"0 0 * * 0"        - 每周日凌晨
 //
-// 非法表达式回退默认全 "*"（每分钟执行）。需要严格校验请用 ParseCronStrict。
+// 非法表达式会 panic（fail-fast），动态输入请用 ParseCronStrict 处理 error。
+// 如需旧版“非法表达式回退为每分钟”的兼容语义，请显式使用 ParseCronOrDefault。
 func ParseCron(expr string) *FullCronSchedule {
+	if sched, err := ParseCronStrict(expr); err == nil {
+		return sched
+	} else {
+		panic(err)
+	}
+}
+
+// ParseCronOrDefault parses a Cron expression and falls back to all "*" (every
+// minute) when expr is invalid. Prefer ParseCronStrict or ParseCron for new
+// code; this helper exists for callers that intentionally want legacy fallback
+// semantics.
+func ParseCronOrDefault(expr string) *FullCronSchedule {
 	if sched, err := ParseCronStrict(expr); err == nil {
 		return sched
 	}

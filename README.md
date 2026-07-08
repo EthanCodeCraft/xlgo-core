@@ -357,6 +357,18 @@ if cacheService.Get(ctx, "user:1", &user) {
     // 缓存命中
 }
 
+// 严格区分缓存未命中与 Redis/反序列化错误
+if hit, err := cache.GetE(ctx, "user:1", &user); err != nil {
+    return err
+} else if hit {
+    // 缓存命中
+}
+if exists, err := cache.ExistsE(ctx, "user:1"); err != nil {
+    return err
+} else if exists {
+    // key 存在
+}
+
 // 删除缓存
 cacheService.Delete(ctx, "user:1")
 
@@ -372,6 +384,9 @@ token, err := jwt.GenerateToken(userID, username, "admin", "admin")
 
 // 解析 Token
 claims, err := jwt.ParseToken(tokenString)
+
+// 安全敏感路由可要求黑名单检查 fail-closed
+claims, err = jwt.ParseTokenFailClosed(tokenString)
 
 // 使 Token 失效（使用 JTI，高效）
 jwt.InvalidateToken(tokenString)
@@ -530,6 +545,9 @@ cron.AddTask("weekly", cron.Weekly(time.Monday, 9, 0), weeklyTask)
 // 完整 Cron 表达式
 cron.AddTask("every15min", cron.ParseCron("*/15 * * * *"), doSomething)
 cron.AddTask("monthly", cron.ParseCron("0 0 1 * *"), doSomething) // 每月1号
+
+// ParseCron 对非法表达式 fail-fast panic；动态输入请用 ParseCronStrict 处理 error。
+// 如需旧版“非法表达式回退为每分钟”的兼容语义，请显式使用 ParseCronOrDefault。
 
 // 启动调度器
 cron.Start()

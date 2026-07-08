@@ -10,6 +10,12 @@ func ToInt(s string) int {
 	return n
 }
 
+// ToIntE converts a string to int and returns parse errors. Prefer it when 0
+// is a meaningful value and parse failure must be distinguishable.
+func ToIntE(s string) (int, error) {
+	return strconv.Atoi(s)
+}
+
 // ToIntDefault 字符串转 int，失败返回默认值
 func ToIntDefault(s string, def int) int {
 	n, err := strconv.Atoi(s)
@@ -23,6 +29,12 @@ func ToIntDefault(s string, def int) int {
 func ToInt64(s string) int64 {
 	n, _ := strconv.ParseInt(s, 10, 64)
 	return n
+}
+
+// ToInt64E converts a string to int64 and returns parse errors. Prefer it when
+// 0 is a meaningful value and parse failure must be distinguishable.
+func ToInt64E(s string) (int64, error) {
+	return strconv.ParseInt(s, 10, 64)
 }
 
 // ToInt64Default 字符串转 int64，失败返回默认值
