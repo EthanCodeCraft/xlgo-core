@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// HTTPClient wraps an http.Client with shared runtime configuration.
+// HTTPClient 封装可运行期调整配置的 HTTP 客户端。
 type HTTPClient struct {
 	mu        sync.RWMutex
 	client    *http.Client
@@ -29,17 +29,17 @@ type HTTPClient struct {
 	headers   map[string]string
 	cookies   map[string]string
 	skipTLS   bool
-	// maxRespBodySize caps response bodies read by do. 0 uses the default, -1 disables the cap.
+	// maxRespBodySize 限制 do 读取的响应体大小；0 使用默认值，-1 表示不限制。
 	maxRespBodySize int64
 }
 
-// UploadFile describes a file field in a multipart upload.
+// UploadFile 描述 multipart 上传中的文件字段。
 type UploadFile struct {
 	FieldName string
 	FilePath  string
 }
 
-// HTTPClientConfig configures HTTPClient.
+// HTTPClientConfig 是 HTTPClient 的配置。
 type HTTPClientConfig struct {
 	Timeout              time.Duration
 	MaxIdleConns         int
@@ -51,10 +51,10 @@ type HTTPClientConfig struct {
 	BlockPrivateNetworks bool
 }
 
-// ErrSSRFBlocked indicates that SSRF protection blocked the target IP.
-var ErrSSRFBlocked = errors.New("ssrf guard: target IP is in a blocked network range")
+// ErrSSRFBlocked 表示 SSRF 防护拦截了目标 IP。
+var ErrSSRFBlocked = errors.New("ssrf guard: 目标 IP 属于被拦截的网络范围")
 
-// isBlockedIP reports whether ip belongs to a blocked network range.
+// isBlockedIP 判断 ip 是否属于应被 SSRF 防护拦截的网络范围。
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -64,7 +64,7 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsUnspecified() || ip.IsMulticast() || ip.IsInterfaceLocalMulticast()
 }
 
-// ssrfControl blocks connections to private, loopback, link-local, unspecified, and multicast IPs.
+// ssrfControl 在拨号前拦截私有、回环、链路本地、未指定和多播 IP。
 func ssrfControl(network, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -72,7 +72,7 @@ func ssrfControl(network, address string, _ syscall.RawConn) error {
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		return fmt.Errorf("%w: cannot parse address %q", ErrSSRFBlocked, address)
+		return fmt.Errorf("%w: 无法解析地址 %q", ErrSSRFBlocked, address)
 	}
 	if isBlockedIP(ip) {
 		return fmt.Errorf("%w: %s", ErrSSRFBlocked, ip)
@@ -80,7 +80,7 @@ func ssrfControl(network, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// DefaultHTTPClientConfig is the package default HTTP client configuration.
+// DefaultHTTPClientConfig 是包级默认 HTTP 客户端配置。
 var DefaultHTTPClientConfig = HTTPClientConfig{
 	Timeout:             30 * time.Second,
 	MaxIdleConns:        100,
@@ -91,20 +91,20 @@ var DefaultHTTPClientConfig = HTTPClientConfig{
 	MaxResponseBodySize: 32 * 1024 * 1024,
 }
 
-// NewHTTPClient creates an HTTP client with the default configuration.
+// NewHTTPClient 使用默认配置创建 HTTP 客户端。
 func NewHTTPClient() *HTTPClient {
 	cfg := DefaultHTTPClientConfig
 	return NewHTTPClientWithConfig(cfg)
 }
 
-// NewSSRFSafeHTTPClient creates an HTTP client with SSRF protection enabled.
+// NewSSRFSafeHTTPClient 创建启用 SSRF 防护的 HTTP 客户端。
 func NewSSRFSafeHTTPClient() *HTTPClient {
 	cfg := DefaultHTTPClientConfig
 	cfg.BlockPrivateNetworks = true
 	return NewHTTPClientWithConfig(cfg)
 }
 
-// NewHTTPClientWithConfig creates an HTTP client with cfg.
+// NewHTTPClientWithConfig 使用 cfg 创建 HTTP 客户端。
 func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 	transport, client := buildHTTPClientPair(cfg)
 	return &HTTPClient{
@@ -119,10 +119,10 @@ func NewHTTPClientWithConfig(cfg HTTPClientConfig) *HTTPClient {
 	}
 }
 
-// buildHTTPClientPair builds a transport/client pair from cfg.
+// buildHTTPClientPair 根据 cfg 构造 transport/client 对。
 func buildHTTPClientPair(cfg HTTPClientConfig) (*http.Transport, *http.Client) {
 	transport := &http.Transport{
-		// #nosec G402 -- SkipTLSVerify is opt-in; the default verifies TLS.
+		// #nosec G402 -- SkipTLSVerify 仅在调用方显式配置时启用，默认校验 TLS。
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: cfg.SkipTLSVerify,
 		},
@@ -147,21 +147,21 @@ func buildHTTPClientPair(cfg HTTPClientConfig) (*http.Transport, *http.Client) {
 	return transport, client
 }
 
-// currentClient returns the current client snapshot.
+// currentClient 返回当前 client 快照。
 func (c *HTTPClient) currentClient() *http.Client {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.client
 }
 
-// currentTransport returns the current transport snapshot.
+// currentTransport 返回当前 transport 快照。
 func (c *HTTPClient) currentTransport() *http.Transport {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.transport
 }
 
-// SetTimeout updates request timeout while preserving the current transport.
+// SetTimeout 更新请求超时时间，并保留当前 transport。
 func (c *HTTPClient) SetTimeout(timeout time.Duration) *HTTPClient {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -173,7 +173,7 @@ func (c *HTTPClient) SetTimeout(timeout time.Duration) *HTTPClient {
 	return c
 }
 
-// SetHeader sets a request header for future requests.
+// SetHeader 设置后续请求使用的请求头。
 func (c *HTTPClient) SetHeader(key, value string) *HTTPClient {
 	c.mu.Lock()
 	c.headers[key] = value
@@ -181,7 +181,7 @@ func (c *HTTPClient) SetHeader(key, value string) *HTTPClient {
 	return c
 }
 
-// SetHeaders sets request headers for future requests.
+// SetHeaders 批量设置后续请求使用的请求头。
 func (c *HTTPClient) SetHeaders(headers map[string]string) *HTTPClient {
 	c.mu.Lock()
 	for k, v := range headers {
@@ -191,7 +191,7 @@ func (c *HTTPClient) SetHeaders(headers map[string]string) *HTTPClient {
 	return c
 }
 
-// SetCookie sets a cookie for future requests.
+// SetCookie 设置后续请求使用的 Cookie。
 func (c *HTTPClient) SetCookie(key, value string) *HTTPClient {
 	c.mu.Lock()
 	c.cookies[key] = value
@@ -199,7 +199,7 @@ func (c *HTTPClient) SetCookie(key, value string) *HTTPClient {
 	return c
 }
 
-// snapshotHeadersCookies copies mutable header and cookie maps under lock.
+// snapshotHeadersCookies 在锁内复制可变的 headers/cookies。
 func (c *HTTPClient) snapshotHeadersCookies() (headers, cookies map[string]string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -214,7 +214,7 @@ func (c *HTTPClient) snapshotHeadersCookies() (headers, cookies map[string]strin
 	return headers, cookies
 }
 
-// SetSkipTLS toggles TLS certificate verification for future requests.
+// SetSkipTLS 切换后续请求是否校验 TLS 证书。
 func (c *HTTPClient) SetSkipTLS(skip bool) *HTTPClient {
 	c.mu.Lock()
 	c.skipTLS = skip
@@ -224,14 +224,14 @@ func (c *HTTPClient) SetSkipTLS(skip bool) *HTTPClient {
 	c.transport = transport
 	c.client = client
 	c.mu.Unlock()
-	// Release idle connections from the old transport outside the lock.
+	// 在锁外释放旧 transport 的空闲连接。
 	if oldTransport != nil {
 		oldTransport.CloseIdleConnections()
 	}
 	return c
 }
 
-// SetBlockPrivateNetworks toggles SSRF protection for future requests.
+// SetBlockPrivateNetworks 切换后续请求的 SSRF 防护。
 func (c *HTTPClient) SetBlockPrivateNetworks(block bool) *HTTPClient {
 	c.mu.Lock()
 	c.cfg.BlockPrivateNetworks = block
@@ -246,7 +246,7 @@ func (c *HTTPClient) SetBlockPrivateNetworks(block bool) *HTTPClient {
 	return c
 }
 
-// Get sends a GET request.
+// Get 发送 GET 请求。
 func (c *HTTPClient) Get(urlStr string, params map[string]string) ([]byte, error) {
 	if len(params) > 0 {
 		u, err := url.Parse(urlStr)
@@ -268,7 +268,7 @@ func (c *HTTPClient) Get(urlStr string, params map[string]string) ([]byte, error
 	return c.do(req)
 }
 
-// Post sends a form-encoded POST request.
+// Post 发送表单编码的 POST 请求。
 func (c *HTTPClient) Post(urlStr string, params map[string]string) ([]byte, error) {
 	data := url.Values{}
 	for k, v := range params {
@@ -283,7 +283,7 @@ func (c *HTTPClient) Post(urlStr string, params map[string]string) ([]byte, erro
 	return c.do(req)
 }
 
-// PostJSON sends a JSON POST request.
+// PostJSON 发送 JSON POST 请求。
 func (c *HTTPClient) PostJSON(urlStr string, data any) ([]byte, error) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -298,7 +298,7 @@ func (c *HTTPClient) PostJSON(urlStr string, data any) ([]byte, error) {
 	return c.do(req)
 }
 
-// Put sends a JSON PUT request.
+// Put 发送 JSON PUT 请求。
 func (c *HTTPClient) Put(urlStr string, data any) ([]byte, error) {
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -313,7 +313,7 @@ func (c *HTTPClient) Put(urlStr string, data any) ([]byte, error) {
 	return c.do(req)
 }
 
-// Delete sends a DELETE request.
+// Delete 发送 DELETE 请求。
 func (c *HTTPClient) Delete(urlStr string) ([]byte, error) {
 	req, err := http.NewRequest("DELETE", urlStr, nil)
 	if err != nil {
@@ -322,7 +322,7 @@ func (c *HTTPClient) Delete(urlStr string) ([]byte, error) {
 	return c.do(req)
 }
 
-// Upload streams multipart files without buffering the full request body in memory.
+// Upload 以流式 multipart 上传文件，避免把完整请求体缓存在内存中。
 func (c *HTTPClient) Upload(urlStr string, files []UploadFile, params map[string]string) ([]byte, error) {
 	pr, pw := io.Pipe()
 	writer := multipart.NewWriter(pw)
@@ -400,7 +400,7 @@ func writeMultipartFile(writer *multipart.Writer, f UploadFile) (err error) {
 	return err
 }
 
-// UploadFromBytes uploads an in-memory byte slice as a multipart file.
+// UploadFromBytes 将内存中的字节切片作为 multipart 文件上传。
 func (c *HTTPClient) UploadFromBytes(urlStr string, fieldName string, filename string, data []byte, params map[string]string) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -431,7 +431,7 @@ func (c *HTTPClient) UploadFromBytes(urlStr string, fieldName string, filename s
 	return c.do(req)
 }
 
-// Request sends a request with a caller-provided method and JSON body.
+// Request 使用调用方指定的方法和 JSON 请求体发送请求。
 func (c *HTTPClient) Request(method, urlStr string, body []byte) ([]byte, error) {
 	req, err := http.NewRequest(method, urlStr, bytes.NewReader(body))
 	if err != nil {
@@ -443,37 +443,37 @@ func (c *HTTPClient) Request(method, urlStr string, body []byte) ([]byte, error)
 	return c.do(req)
 }
 
-// do executes req and reads a bounded response body.
+// do 执行 req，并按配置封顶读取响应体。
 func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
 	headers, cookies := c.snapshotHeadersCookies()
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range cookies {
-		// #nosec G124 -- this builds outbound Cookie request headers; Secure/HttpOnly/SameSite apply to Set-Cookie responses.
+		// #nosec G124 -- 这里构造的是出站 Cookie 请求头；Secure/HttpOnly/SameSite 适用于响应 Set-Cookie。
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	// #nosec G704 -- default client intentionally allows caller-supplied URLs for compatibility; use NewSSRFSafeHTTPClient/BlockPrivateNetworks for untrusted URLs.
+	// #nosec G704 -- 默认客户端为兼容性允许调用方传入 URL；不可信 URL 请使用 NewSSRFSafeHTTPClient/BlockPrivateNetworks。
 	resp, err := c.currentClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Treat 4xx/5xx responses as request errors.
+	// 将 4xx/5xx 响应视为请求错误。
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("http error: %d %s", resp.StatusCode, resp.Status)
+		return nil, fmt.Errorf("HTTP 请求失败: %d %s", resp.StatusCode, resp.Status)
 	}
 
-	// maxRespBodySize: 0 uses the default 32MiB cap; -1 disables the cap.
+	// maxRespBodySize: 0 使用默认 32MiB 上限；-1 表示不限制。
 	limit := c.maxRespBodySize
 	if limit == 0 {
 		limit = 32 * 1024 * 1024
 	}
 	var reader io.Reader = resp.Body
 	if limit > 0 {
-		// Read one extra byte so over-limit responses can be detected.
+		// 多读 1 字节用于判断响应体是否超限。
 		reader = io.LimitReader(resp.Body, limit+1)
 	}
 	data, err := io.ReadAll(reader)
@@ -481,43 +481,43 @@ func (c *HTTPClient) do(req *http.Request) ([]byte, error) {
 		return nil, err
 	}
 	if limit > 0 && int64(len(data)) > limit {
-		return nil, fmt.Errorf("response body exceeds limit %d bytes", limit)
+		return nil, fmt.Errorf("响应体超过限制 %d 字节", limit)
 	}
 	return data, nil
 }
 
-// DoWithResponse executes req and returns the raw response; caller must close resp.Body.
+// DoWithResponse 执行 req 并返回原始响应；调用方必须关闭 resp.Body。
 func (c *HTTPClient) DoWithResponse(req *http.Request) (*http.Response, error) {
 	headers, cookies := c.snapshotHeadersCookies()
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	for k, v := range cookies {
-		// #nosec G124 -- this builds outbound Cookie request headers; Secure/HttpOnly/SameSite apply to Set-Cookie responses.
+		// #nosec G124 -- 这里构造的是出站 Cookie 请求头；Secure/HttpOnly/SameSite 适用于响应 Set-Cookie。
 		req.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	// #nosec G704 -- default client intentionally allows caller-supplied URLs for compatibility; use NewSSRFSafeHTTPClient/BlockPrivateNetworks for untrusted URLs.
+	// #nosec G704 -- 默认客户端为兼容性允许调用方传入 URL；不可信 URL 请使用 NewSSRFSafeHTTPClient/BlockPrivateNetworks。
 	return c.currentClient().Do(req)
 }
 
-// Close releases idle connections held by the client transport.
+// Close 释放客户端 transport 持有的空闲连接。
 func (c *HTTPClient) Close() {
 	if t := c.currentTransport(); t != nil {
 		t.CloseIdleConnections()
 	}
 }
 
-// JSONMarshal marshals v as JSON.
+// JSONMarshal 将 v 序列化为 JSON。
 func JSONMarshal(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
-// defaultClient is the package-level shared HTTP client.
+// defaultClient 是包级共享 HTTP 客户端。
 var defaultClient *HTTPClient
 var defaultClientOnce sync.Once
 
-// DefaultHTTPClient returns the package-level shared HTTP client.
+// DefaultHTTPClient 返回包级共享 HTTP 客户端。
 func DefaultHTTPClient() *HTTPClient {
 	defaultClientOnce.Do(func() {
 		defaultClient = NewHTTPClient()
@@ -525,17 +525,17 @@ func DefaultHTTPClient() *HTTPClient {
 	return defaultClient
 }
 
-// HTTPGet sends a GET request with the default client.
+// HTTPGet 使用默认客户端发送 GET 请求。
 func HTTPGet(url string, params map[string]string) ([]byte, error) {
 	return DefaultHTTPClient().Get(url, params)
 }
 
-// HTTPPost sends a form POST request with the default client.
+// HTTPPost 使用默认客户端发送表单 POST 请求。
 func HTTPPost(url string, params map[string]string) ([]byte, error) {
 	return DefaultHTTPClient().Post(url, params)
 }
 
-// HTTPPostJSON sends a JSON POST request with the default client.
+// HTTPPostJSON 使用默认客户端发送 JSON POST 请求。
 func HTTPPostJSON(url string, data any) ([]byte, error) {
 	return DefaultHTTPClient().PostJSON(url, data)
 }
