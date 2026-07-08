@@ -25,6 +25,9 @@ type KeyBuilderOption func(*KeyBuilder)
 // 示例: WithPrefix("site_a") -> 所有 key 自动添加 "site_a" 前缀
 func WithPrefix(prefix string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
+		if kb == nil {
+			return
+		}
 		kb.prefix = prefix
 	}
 }
@@ -33,6 +36,9 @@ func WithPrefix(prefix string) KeyBuilderOption {
 // 示例: WithSeparator(":") -> "site_a:user:1"
 func WithSeparator(separator string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
+		if kb == nil {
+			return
+		}
 		kb._separator = separator
 	}
 }
@@ -41,6 +47,9 @@ func WithSeparator(separator string) KeyBuilderOption {
 // 示例: WithCacheType("session") -> "session_site_a_user:1"
 func WithCacheType(cacheType string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
+		if kb == nil {
+			return
+		}
 		kb._cacheType = cacheType
 	}
 }
@@ -53,6 +62,9 @@ func NewKeyBuilder(opts ...KeyBuilderOption) *KeyBuilder {
 		_cacheType: "cache",
 	}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(kb)
 	}
 	return kb

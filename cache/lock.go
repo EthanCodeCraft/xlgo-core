@@ -360,7 +360,7 @@ func ForceUnlock(ctx context.Context, key string) error {
 func Incr(ctx context.Context, key string) (int64, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return 0, nil
+		return 0, ErrRedisNotReady
 	}
 	return rdb.Incr(ctx, key).Result()
 }
@@ -369,7 +369,7 @@ func Incr(ctx context.Context, key string) (int64, error) {
 func IncrBy(ctx context.Context, key string, value int64) (int64, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return 0, nil
+		return 0, ErrRedisNotReady
 	}
 	return rdb.IncrBy(ctx, key, value).Result()
 }
@@ -378,7 +378,7 @@ func IncrBy(ctx context.Context, key string, value int64) (int64, error) {
 func Decr(ctx context.Context, key string) (int64, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return 0, nil
+		return 0, ErrRedisNotReady
 	}
 	return rdb.Decr(ctx, key).Result()
 }
@@ -387,7 +387,7 @@ func Decr(ctx context.Context, key string) (int64, error) {
 func GetTTL(ctx context.Context, key string) (time.Duration, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return 0, nil
+		return 0, ErrRedisNotReady
 	}
 	return rdb.TTL(ctx, key).Result()
 }
@@ -396,7 +396,7 @@ func GetTTL(ctx context.Context, key string) (time.Duration, error) {
 func SetExpire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return false, nil
+		return false, ErrRedisNotReady
 	}
 	return rdb.Expire(ctx, key, ttl).Result()
 }
@@ -405,7 +405,7 @@ func SetExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
 func GetRaw(ctx context.Context, key string) (string, error) {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return "", nil
+		return "", ErrRedisNotReady
 	}
 	return rdb.Get(ctx, key).Result()
 }
@@ -414,7 +414,7 @@ func GetRaw(ctx context.Context, key string) (string, error) {
 func SetRaw(ctx context.Context, key string, value string, ttl time.Duration) error {
 	rdb := database.GetRedis()
 	if rdb == nil {
-		return nil
+		return ErrRedisNotReady
 	}
 	return rdb.Set(ctx, key, value, ttl).Err()
 }

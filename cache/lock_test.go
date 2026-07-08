@@ -60,28 +60,26 @@ func TestLockErrors(t *testing.T) {
 func TestIncrDecr(t *testing.T) {
 	ctx := context.Background()
 
-	// Test Incr without Redis
+	// Redis 未初始化时应显式返回 ErrRedisNotReady，避免调用方误判为计数器值为 0。
 	n, err := cache.Incr(ctx, "counter")
-	if err != nil {
-		t.Errorf("Incr error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("Incr without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if n != 0 {
 		t.Error("Incr should return 0 without Redis")
 	}
 
-	// Test IncrBy
 	n, err = cache.IncrBy(ctx, "counter", 10)
-	if err != nil {
-		t.Errorf("IncrBy error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("IncrBy without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if n != 0 {
 		t.Error("IncrBy should return 0 without Redis")
 	}
 
-	// Test Decr
 	n, err = cache.Decr(ctx, "counter")
-	if err != nil {
-		t.Errorf("Decr error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("Decr without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if n != 0 {
 		t.Error("Decr should return 0 without Redis")
@@ -92,8 +90,8 @@ func TestSetExpire(t *testing.T) {
 	ctx := context.Background()
 
 	ok, err := cache.SetExpire(ctx, "test_key", time.Minute)
-	if err != nil {
-		t.Errorf("SetExpire error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("SetExpire without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if ok {
 		t.Error("SetExpire should return false without Redis")
@@ -105,14 +103,14 @@ func TestGetRawSetRaw(t *testing.T) {
 
 	// Test SetRaw
 	err := cache.SetRaw(ctx, "test_key", "test_value", time.Minute)
-	if err != nil {
-		t.Errorf("SetRaw error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("SetRaw without Redis should return ErrRedisNotReady, got %v", err)
 	}
 
 	// Test GetRaw
 	val, err := cache.GetRaw(ctx, "test_key")
-	if err != nil {
-		t.Errorf("GetRaw error: %v", err)
+	if !errors.Is(err, cache.ErrRedisNotReady) {
+		t.Errorf("GetRaw without Redis should return ErrRedisNotReady, got %v", err)
 	}
 	if val != "" {
 		t.Error("GetRaw should return empty string without Redis")

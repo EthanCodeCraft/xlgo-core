@@ -62,6 +62,17 @@ func TestKeyBuilderNoPrefix(t *testing.T) {
 	}
 }
 
+func TestKeyBuilderNilOptionIgnored(t *testing.T) {
+	kb := cache.NewKeyBuilder(nil, cache.WithPrefix("site"))
+	if got := kb.Build("user:1"); got != "cache:site:user:1" {
+		t.Fatalf("Build with nil option = %q, want cache:site:user:1", got)
+	}
+
+	cache.WithPrefix("ignored")(nil)
+	cache.WithSeparator("_")(nil)
+	cache.WithCacheType("ignored")(nil)
+}
+
 func TestKeyBuilderSetPrefix(t *testing.T) {
 	kb := cache.NewKeyBuilder(cache.WithPrefix("site_a"))
 

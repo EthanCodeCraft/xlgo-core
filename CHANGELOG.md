@@ -20,6 +20,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ### Breaking ⚠️
 
+- **cache 写操作与计数器/原始 Redis helper 在 Redis 未初始化时返回 `ErrRedisNotReady`**：`Set` / `Delete` / `DeleteByPattern` / `Incr` / `IncrBy` / `Decr` / `GetTTL` / `SetExpire` / `GetRaw` / `SetRaw` 旧行为会静默返回成功或零值，调用方容易误判缓存写入、计数器更新或过期时间设置已经生效；现在统一显式返回错误。公共接口签名不变，但依赖“未启用 Redis 时当作成功”的下游需要改为忽略 `errors.Is(err, cache.ErrRedisNotReady)` 或显式启用 Redis。
 - **`cache.WithLock` / `cache.WithLockAutoExtend` 未获取到锁时返回 `ErrLockNotAcquired`**：旧行为返回 `nil` 并跳过业务函数，调用方无法区分“业务执行成功”和“根本没有执行”。同时锁 TTL 小于 1ms、续期/重试间隔非正会返回显式错误，避免 Redis PX=0 或 `time.NewTicker(0)` 崩溃。
 - **`jwt.ParseToken` 开始校验 issuer，`RefreshToken` 使用 `jwt.refresh_expire`**：签发者与当前配置不一致的 token 会被拒绝；刷新后的 token 过期时间优先使用 `refresh_expire`，未配置时回退 `expire`。`GenerateTokenWithCustomExpiry` 现在拒绝非正过期时间，`InvalidateTokenByID("")` 返回 `ErrEmptyJTI`。
 - **`App.Init()` 由 `sync.Once` 改为生命周期状态机**（app.go，M1）：5 态 `stateCreated/Initializing/Initialized/Stopping/Stopped` + `lifecycleMu`(RWMutex) + `initMu`(Mutex)。`Shutdown` 后或 `Init` 失败后再调 `Init()` 返回新增导出错误 **`xlgo.ErrAppClosed`**（原 `sync.Once` "多次调用返回首次结果"语义不再适用——已关闭的 App 不可再 Init，需新建 App）。
@@ -36,6 +37,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 - **M9 JWT issuer / refresh expiry 契约修复**：`ParseToken`、`InvalidateToken`、`GetClaimsFromToken` 统一按当前配置校验 issuer；`RefreshToken` 不再忽略 `refresh_expire`；空 JTI 不再写入永不命中的 `jwt_bl:` 黑名单键。
 - **M10 分布式锁参数与未获锁语义修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`。
+- **M10 cache 剩余错误语义收口**：新增 `cache.ExistsE` 与可选 `CacheExistChecker`，让调用方能区分 key 不存在和 Redis/backend 故障；保留旧 `Exists` bool-only 兼容方法但记录后端错误；`KeyBuilder` 现在忽略 nil option，`WithPrefix` / `WithSeparator` / `WithCacheType` 直接作用于 nil builder 时 no-op，避免扩展配置路径 panic。
 - **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
 

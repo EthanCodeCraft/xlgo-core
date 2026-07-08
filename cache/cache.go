@@ -7,10 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/EthanCodeCraft/xlgo-core/logger"
-
 	"github.com/EthanCodeCraft/xlgo-core/database"
-
+	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 )
@@ -27,6 +25,12 @@ type CacheService interface {
 	DeleteByPattern(ctx context.Context, pattern string) error
 	// Exists 检查缓存是否存在
 	Exists(ctx context.Context, key string) bool
+}
+
+// CacheExistChecker is implemented by cache backends that can distinguish a
+// missing key from a backend failure.
+type CacheExistChecker interface {
+	ExistsE(ctx context.Context, key string) (bool, error)
 }
 
 // redisCache Redis 缓存实现。
@@ -73,7 +77,7 @@ func (c *redisCache) Get(ctx context.Context, key string, dest any) bool {
 func (c *redisCache) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
 	cli := c.client()
 	if cli == nil {
-		return nil // Redis 未启用，跳过缓存
+		return ErrRedisNotReady
 	}
 
 	data, err := json.Marshal(value)
@@ -94,7 +98,7 @@ func (c *redisCache) Set(ctx context.Context, key string, value any, ttl time.Du
 func (c *redisCache) Delete(ctx context.Context, key string) error {
 	cli := c.client()
 	if cli == nil {
-		return nil
+		return ErrRedisNotReady
 	}
 
 	if err := cli.Del(ctx, key).Err(); err != nil {
@@ -109,7 +113,7 @@ func (c *redisCache) Delete(ctx context.Context, key string) error {
 func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error {
 	cli := c.client()
 	if cli == nil {
-		return nil
+		return ErrRedisNotReady
 	}
 
 	var cursor uint64
@@ -150,12 +154,27 @@ func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error 
 
 // Exists 检查缓存是否存在
 func (c *redisCache) Exists(ctx context.Context, key string) bool {
-	cli := c.client()
-	if cli == nil {
+	ok, err := c.ExistsE(ctx, key)
+	if err != nil {
+		logger.Warn("缓存存在性检查失败", zap.String("key", key), zap.Error(err))
 		return false
 	}
+	return ok
+}
 
-	return cli.Exists(ctx, key).Val() > 0
+// ExistsE checks whether key exists and returns Redis/backend errors to callers
+// that need to distinguish a missing key from a cache outage.
+func (c *redisCache) ExistsE(ctx context.Context, key string) (bool, error) {
+	cli := c.client()
+	if cli == nil {
+		return false, ErrRedisNotReady
+	}
+
+	n, err := cli.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // CacheManager 缓存管理器（#10）。照 database.Manager 模式：
@@ -221,4 +240,18 @@ func Init() {
 // GetCache 获取全局缓存实例
 func GetCache() CacheService {
 	return GetDefaultCache().Get()
+}
+
+// ExistsE checks whether key exists and returns backend errors. It complements
+// the legacy bool-only CacheService.Exists method without changing that public
+// interface for downstream custom cache implementations.
+func ExistsE(ctx context.Context, key string) (bool, error) {
+	svc := GetCache()
+	if svc == nil {
+		return false, ErrRedisNotReady
+	}
+	if checker, ok := svc.(CacheExistChecker); ok {
+		return checker.ExistsE(ctx, key)
+	}
+	return svc.Exists(ctx, key), nil
 }
