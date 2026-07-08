@@ -5,7 +5,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/config"
+	"github.com/EthanCodeCraft/xlgo-core/jwt"
 	"github.com/EthanCodeCraft/xlgo-core/middleware"
 	"github.com/gin-gonic/gin"
 )
@@ -35,6 +38,40 @@ func setAuthUser(userType, role string) func(*gin.Context) {
 		c.Set(middleware.ContextKeyUsername, "tester")
 		c.Set(middleware.ContextKeyRole, role)
 		c.Set(middleware.ContextKeyUserType, userType)
+	}
+}
+
+func TestAuthRequiredAcceptsCaseInsensitiveBearer_M8(t *testing.T) {
+	if err := config.Set(&config.Config{
+		JWT: config.JWTConfig{
+			Secret: "test-secret-key-1234567890123456789012",
+			Expire: time.Hour,
+		},
+	}); err != nil {
+		t.Fatalf("set config: %v", err)
+	}
+	token, err := jwt.GenerateToken(1, "tester", "owner", "tenant_admin")
+	if err != nil {
+		t.Fatalf("GenerateToken: %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middleware.AuthRequired())
+	r.GET("/test", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "bearer "+token)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d, body %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"ok":true`) {
+		t.Fatalf("expected request to pass, got body %s", w.Body.String())
 	}
 }
 

@@ -198,12 +198,23 @@ func shouldSkipPath(path string, cfg LoggerConfig) bool {
 
 	// 检查路径前缀
 	for _, prefix := range cfg.SkipPathPrefixes {
-		if strings.HasPrefix(path, prefix) {
+		if pathPrefixMatch(path, prefix) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func pathPrefixMatch(path, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	cleanPrefix := strings.TrimRight(prefix, "/")
+	if cleanPrefix == "" {
+		return path == "/"
+	}
+	return path == cleanPrefix || strings.HasPrefix(path, cleanPrefix+"/")
 }
 
 // filterSensitiveFields 过滤敏感字段（密码、token等）
@@ -278,7 +289,7 @@ func LoggerMinimal() gin.HandlerFunc {
 		path := c.Request.URL.Path
 
 		// 跳过健康检查和静态资源
-		if path == "/health" || strings.HasPrefix(path, "/public") || strings.HasPrefix(path, "/static") {
+		if path == "/health" || pathPrefixMatch(path, "/public") || pathPrefixMatch(path, "/static") {
 			c.Next()
 			return
 		}

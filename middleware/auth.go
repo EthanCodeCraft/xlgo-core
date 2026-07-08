@@ -49,7 +49,7 @@ func AuthRequired() gin.HandlerFunc {
 
 		// 解析 Bearer Token
 		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			response.Unauthorized(c, "认证格式错误")
 			c.Abort()
 			return

@@ -53,6 +53,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M16 测试工具、脚手架与示例闭环修复**：`MockDB` / `MockCache` / `MockStorage` 改为并发安全；`MockCache` 与 `MockStorage.UploadFromBytes` 复制字节切片，避免调用方修改污染内部状态；`MockStorage` 拒绝 nil 文件与超过 32MiB 的输入，避免测试 helper 被误用成无上限内存缓冲；`xlgo make` 对资源名做显式标识符校验，非法名称（路径穿越、连字符、数字开头等）直接返回中文错误，不再静默转义后生成不可预期代码；`examples/full` 启动时初始化 `alice/secret`，登录校验 bcrypt 哈希，创建用户也保存哈希，避免示例首次运行无法登录或传播不验密/明文密码模式；README/GUIDE 限流示例不再引用不存在的 `handler.Login` / `handler.Upload`。
 - **M16 GUIDE/test API 不一致修复**：GUIDE 测试示例不再调用不存在的 `AssertCode` / `AssertJSONKeyExists`，统一改用现有 `AssertJSONContains`，避免照文档编写测试直接编译失败。
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
+- **M8 middleware 边界收口**：`AuthRequired` 的 `Authorization` scheme 改为大小写不敏感，符合 Bearer 语义；`LoggerConfig.SkipPathPrefixes` 与 `SimpleLogger` 静态路径跳过改为路径边界匹配（`/api` 仅匹配 `/api` 和 `/api/...`，不再误跳过 `/api2`）。
 
 - **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
 - **M6 response/handler 入口防护**（response/error.go，response/response.go，handler/handler.go）：`FailWithError(nil)` / `FailWithDetail(nil, ...)` 回退统一服务器错误响应，不再 nil deref panic；新增 `response.DownloadReader` 支持大文件/对象存储流式下载，旧 `Download` / `DownloadWithContentType` 保持兼容并复用同一响应头逻辑。

@@ -260,3 +260,16 @@ func TestLoggerWithConfig_NormalizesMaxBodyLength(t *testing.T) {
 		t.Fatalf("downstream body corrupted")
 	}
 }
+
+func TestLoggerSkipPathPrefixesAnchorsBoundary_M8(t *testing.T) {
+	cfg := LoggerConfig{SkipPathPrefixes: []string{"/api"}}
+	if !shouldSkipPath("/api", cfg) {
+		t.Fatal("/api should be skipped")
+	}
+	if !shouldSkipPath("/api/users", cfg) {
+		t.Fatal("/api/users should be skipped")
+	}
+	if shouldSkipPath("/api2/users", cfg) {
+		t.Fatal("/api2/users should not be skipped by /api prefix")
+	}
+}
