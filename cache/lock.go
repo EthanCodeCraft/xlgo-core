@@ -23,6 +23,8 @@ var (
 	ErrInvalidLockRetryInterval = errors.New("锁重试/续期间隔必须大于 0")
 	// ErrLockUnexpectedResult Lua 脚本返回了非预期的结果类型（C1b：裸类型断言防护）。
 	ErrLockUnexpectedResult = errors.New("锁脚本返回非预期结果")
+	// ErrLockFuncNil 表示分布式锁业务函数为空。
+	ErrLockFuncNil = errors.New("锁业务函数不能为空")
 )
 
 // toInt64 将 Lua 脚本返回值安全断言为 int64（C1b：禁止裸断言 panic）。
@@ -231,7 +233,10 @@ func TryLock(ctx context.Context, key string, ttl time.Duration, retryInterval t
 //
 // 解锁用独立 Background ctx（C1a 一致性修复）：fn 返回或 panic 后，原 ctx 可能已被
 // 调用方取消，用其解锁会失败导致锁泄漏到 TTL。fn panic 时 defer 也保证解锁执行。
-func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() error) error {
+func WithLock(ctx context.Context, key string, ttl time.Duration, fn func(context.Context) error) error {
+	if fn == nil {
+		return ErrLockFuncNil
+	}
 	token, err := NewLock(ctx, key, ttl)
 	if err != nil {
 		return err
@@ -245,7 +250,7 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 		_ = Unlock(unlockCtx, token)
 	}()
 
-	return fn()
+	return fn(ctx)
 }
 
 // WithLockAutoExtend 使用分布式锁执行函数（自动续期）。
@@ -256,7 +261,10 @@ func WithLock(ctx context.Context, key string, ttl time.Duration, fn func() erro
 // 避免旧实现 done 无缓冲 + 子 defer close(done) + 父 done<-struct{}{} 的 send-on-closed panic
 // （ctx 取消或 ExtendLock 失败时 done 已 closed，父再 send 即 panic，Unlock 不执行、锁泄漏到 TTL）。
 // Unlock 用 context.Background() 派生超时，避免原 ctx 已取消致 Unlock 失败再泄漏。
-func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duration, extendInterval time.Duration, fn func() error) error {
+func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duration, extendInterval time.Duration, fn func(context.Context) error) error {
+	if fn == nil {
+		return ErrLockFuncNil
+	}
 	if extendInterval <= 0 {
 		return ErrInvalidLockRetryInterval
 	}
@@ -302,8 +310,8 @@ func WithLockAutoExtend(ctx context.Context, key string, initialTTL time.Duratio
 		_ = Unlock(unlockCtx, token)
 	}()
 
-	// 执行业务函数。
-	err = fn()
+	// 执行业务函数。fn 必须接收 ctx，避免请求取消后业务 loader/DB/HTTP 调用继续运行。
+	err = fn(ctx)
 
 	return err
 }

@@ -394,7 +394,7 @@ if token != nil {
 cache.ExtendLock(ctx, token, 30*time.Second)
 
 // 自动续期执行
-err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func() error {
+err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func(ctx context.Context) error {
     // 长任务自动续期
     return nil
 })

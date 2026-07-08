@@ -582,12 +582,12 @@ if token != nil {
 }
 
 // 自动管理锁（简单场景）
-err := cache.WithLock(ctx, key, ttl, func() error {
+err := cache.WithLock(ctx, key, ttl, func(ctx context.Context) error {
     return nil
 })
 
 // 自动续期锁（长任务场景）
-err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func() error {
+err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func(ctx context.Context) error {
     // 执行时间超过 TTL 时自动续期
     return nil
 })

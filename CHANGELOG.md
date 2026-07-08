@@ -22,6 +22,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 - **cache 写操作与计数器/原始 Redis helper 在 Redis 未初始化时返回 `ErrRedisNotReady`**：`Set` / `Delete` / `DeleteByPattern` / `Incr` / `IncrBy` / `Decr` / `GetTTL` / `SetExpire` / `GetRaw` / `SetRaw` 旧行为会静默返回成功或零值，调用方容易误判缓存写入、计数器更新或过期时间设置已经生效；现在统一显式返回错误。公共接口签名不变，但依赖“未启用 Redis 时当作成功”的下游需要改为忽略 `errors.Is(err, cache.ErrRedisNotReady)` 或显式启用 Redis。
 - **`cache.WithLock` / `cache.WithLockAutoExtend` 未获取到锁时返回 `ErrLockNotAcquired`**：旧行为返回 `nil` 并跳过业务函数，调用方无法区分“业务执行成功”和“根本没有执行”。同时锁 TTL 小于 1ms、续期/重试间隔非正会返回显式错误，避免 Redis PX=0 或 `time.NewTicker(0)` 崩溃。
+- **`cache.WithLock` / `cache.WithLockAutoExtend` 的业务函数签名改为 `func(context.Context) error`**：旧签名 `func() error` 无法强制业务函数接收取消信号，容易在请求取消/超时后继续访问 DB/HTTP 等下游资源；现在框架会把调用方 ctx 传入业务函数。nil 业务函数返回新增 `ErrLockFuncNil`。
 - **`test.Request.Execute()` 改为返回 `*test.Response`**：旧返回值是 `*httptest.ResponseRecorder`，与文档示例中的 `resp.AssertOK(t)` / `resp.ParseJSON(...)` 不一致；现在 `Execute()` 返回带断言和 JSON 解析方法的包装类型。需要原始 recorder 的调用方改用新增 `ExecuteRecorder()`。
 - **`config.Get()` / `(*config.Manager).Get()` 改为返回配置副本**：旧行为暴露内部 `*Config`，调用方修改返回值会污染全局配置并可能与热重载并发读写竞态；现在返回深拷贝。需要动态替换配置的测试或工具代码请改用 `config.Set(cfg)`。
 - **`config.Set()` / `(*config.Manager).Set()` 现在返回 `error`**：非 nil 配置会先执行 `Validate()`，非法配置不会覆盖旧配置，并返回 `ErrInvalidConfig` 包装错误。旧代码可以继续忽略返回值，但建议测试和启动路径显式检查。
@@ -40,7 +41,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 ### Fixed 🐛
 
 - **M9 JWT issuer / refresh expiry 契约修复**：`ParseToken`、`InvalidateToken`、`GetClaimsFromToken` 统一按当前配置校验 issuer；`RefreshToken` 不再忽略 `refresh_expire`；空 JTI 不再写入永不命中的 `jwt_bl:` 黑名单键。
-- **M10 分布式锁参数与未获锁语义修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`。
+- **M10 分布式锁参数与取消传播修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`；`WithLock` / `WithLockAutoExtend` 现在把调用方 ctx 传入业务函数，避免取消后业务函数继续运行。
 - **M10 cache 剩余错误语义收口**：新增 `cache.ExistsE` 与可选 `CacheExistChecker`，让调用方能区分 key 不存在和 Redis/backend 故障；保留旧 `Exists` bool-only 兼容方法但记录后端错误；`KeyBuilder` 现在忽略 nil option，`WithPrefix` / `WithSeparator` / `WithCacheType` 直接作用于 nil builder 时 no-op，避免扩展配置路径 panic。
 - **M2 config 热重载生命周期修复**：`StopWatcher` 会等待已触发的 reload/回调结束；包级 `Load` / `LoadWithWatch` 只有在新配置成功加载并启动 watcher 后才替换默认 manager，失败时保留旧 watcher；`SetDefaultManager` 会停止旧 manager 的 watcher，避免全局置换后遗留 goroutine；数据库配置出现字段时会校验 driver/host/name/port，未知 driver 不再静默回退 MySQL；MySQL DSN 转义用户名/库名，Postgres DSN 统一转义字符串字段。
 - **M4 database nil 边界修复**：`InitDB(nil)` / `InitDBWithReplicas(nil, ...)` / `InitRedis(nil)` 现在返回中文错误，不再空指针 panic；`UseMaster(nil)` / `UseReplica(nil)` / `GetDBFromContext(nil)` / `WithTx(nil, ...)` / `TxFromContext(nil)` / `TransactionWithContext(nil, ...)` / `ReadQuery(nil, ...)` / `WriteQuery(nil, ...)` / Redis health check 会把 nil context 归一化为 `context.Background()`，避免异常调用路径触发 panic；`Dialector(nil)` 安全回退到 MySQL 空 DSN。

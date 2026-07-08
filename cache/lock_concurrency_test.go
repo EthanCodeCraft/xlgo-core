@@ -45,11 +45,11 @@ func TestWithLockAutoExtendCtxCancelNoPanic(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		defer func() { panicked = recover() }()
-		err := cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func() error {
+		err := cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func(runCtx context.Context) error {
 			close(ran)
 			// 阻塞直到 ctx 被取消，模拟长任务。
-			<-ctx.Done()
-			return ctx.Err()
+			<-runCtx.Done()
+			return runCtx.Err()
 		})
 		// WithLockAutoExtend 返回 fn 的错误（ctx.Err），不应 panic。
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -83,7 +83,7 @@ func TestWithLockAutoExtendNormalRelease(t *testing.T) {
 	key := "c1a:normal"
 
 	called := false
-	err := cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func() error {
+	err := cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func(context.Context) error {
 		called = true
 		return nil
 	})
@@ -107,7 +107,7 @@ func TestWithLockAutoExtendExtendsLock(t *testing.T) {
 
 	// initialTTL=500ms，extendInterval=100ms。fn 执行 800ms，期间应多次续期。
 	// 若续期失效，锁会在 500ms 过期，另一 worker 可获取。
-	err := cache.WithLockAutoExtend(ctx, key, 500*time.Millisecond, 100*time.Millisecond, func() error {
+	err := cache.WithLockAutoExtend(ctx, key, 500*time.Millisecond, 100*time.Millisecond, func(context.Context) error {
 		time.Sleep(800 * time.Millisecond)
 		return nil
 	})
@@ -137,7 +137,7 @@ func TestWithLockAutoExtendBlocksContender(t *testing.T) {
 
 	go func() {
 		defer close(lockDone)
-		cache.WithLockAutoExtend(ctx, key, 2*time.Second, 100*time.Millisecond, func() error {
+		cache.WithLockAutoExtend(ctx, key, 2*time.Second, 100*time.Millisecond, func(context.Context) error {
 			close(fnStarted)
 			time.Sleep(600 * time.Millisecond)
 			close(fnDone)
@@ -173,7 +173,7 @@ func TestWithLockAutoExtendFnPanicReleasesLock(t *testing.T) {
 	var panicked any
 	func() {
 		defer func() { panicked = recover() }()
-		_ = cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func() error {
+		_ = cache.WithLockAutoExtend(ctx, key, 10*time.Second, 100*time.Millisecond, func(context.Context) error {
 			time.Sleep(150 * time.Millisecond) // 让续期 ticker 至少触发一次
 			panic("boom")
 		})
@@ -201,10 +201,10 @@ func TestWithLockCtxCancelReleasesLock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = cache.WithLock(ctx, key, 10*time.Second, func() error {
+		_ = cache.WithLock(ctx, key, 10*time.Second, func(runCtx context.Context) error {
 			close(fnStarted)
-			<-ctx.Done()
-			return ctx.Err()
+			<-runCtx.Done()
+			return runCtx.Err()
 		})
 	}()
 
@@ -215,6 +215,39 @@ func TestWithLockCtxCancelReleasesLock(t *testing.T) {
 	locked, _ := cache.IsLocked(context.Background(), key)
 	if locked {
 		t.Error("lock leaked after ctx cancel (WithLock Unlock should use Background ctx)")
+	}
+}
+
+func TestWithLockPassesContextToFunction(t *testing.T) {
+	setupMiniRedis(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	key := "m10:ctx-aware"
+
+	var seen context.Context
+	err := cache.WithLock(ctx, key, time.Second, func(runCtx context.Context) error {
+		seen = runCtx
+		cancel()
+		<-runCtx.Done()
+		return runCtx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("WithLock ctx-aware err = %v, want context.Canceled", err)
+	}
+	if seen != ctx {
+		t.Fatal("WithLock 应把调用方 ctx 传入业务函数")
+	}
+}
+
+func TestWithLockRejectsNilFunction(t *testing.T) {
+	setupMiniRedis(t)
+	ctx := context.Background()
+
+	if err := cache.WithLock(ctx, "m10:nil-fn", time.Second, nil); !errors.Is(err, cache.ErrLockFuncNil) {
+		t.Fatalf("WithLock nil fn err = %v, want ErrLockFuncNil", err)
+	}
+	if err := cache.WithLockAutoExtend(ctx, "m10:nil-fn-auto", time.Second, 100*time.Millisecond, nil); !errors.Is(err, cache.ErrLockFuncNil) {
+		t.Fatalf("WithLockAutoExtend nil fn err = %v, want ErrLockFuncNil", err)
 	}
 }
 
@@ -323,7 +356,7 @@ func TestWithLockAutoExtendRejectsNonPositiveInterval(t *testing.T) {
 	setupMiniRedis(t)
 	called := false
 
-	err := cache.WithLockAutoExtend(context.Background(), "m10:interval", time.Second, 0, func() error {
+	err := cache.WithLockAutoExtend(context.Background(), "m10:interval", time.Second, 0, func(context.Context) error {
 		called = true
 		return nil
 	})
@@ -347,7 +380,7 @@ func TestWithLockHeldReturnsErrLockNotAcquired(t *testing.T) {
 	defer cache.Unlock(ctx, holder)
 
 	called := false
-	err = cache.WithLock(ctx, key, time.Second, func() error {
+	err = cache.WithLock(ctx, key, time.Second, func(context.Context) error {
 		called = true
 		return nil
 	})
