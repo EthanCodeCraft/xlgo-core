@@ -2,6 +2,7 @@ package database_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
@@ -246,13 +247,17 @@ func TestRegisterDialectAndCustomDriver(t *testing.T) {
 		t.Fatalf("expected DSN built by registered builder, got %q", dsn)
 	}
 
-	// 未知驱动回退到 mysql
+	// 未知驱动应 fail-closed，避免拼写错误静默连向 MySQL。
 	unknownCfg := &config.Config{Database: config.DatabaseConfig{
 		Driver: "no-such-driver", Host: "localhost", Port: 3306,
 		User: "root", Password: "pass", Name: "db",
 	}}
-	if name := database.Dialector(unknownCfg).Name(); name != "mysql" {
-		t.Fatalf("expected fallback to mysql for unknown driver, got %q", name)
+	d := database.Dialector(unknownCfg)
+	if name := d.Name(); name != "invalid" {
+		t.Fatalf("expected invalid dialector for unknown driver, got %q", name)
+	}
+	if _, err := gorm.Open(d, &gorm.Config{}); err == nil || !strings.Contains(err.Error(), "数据库驱动未注册") {
+		t.Fatalf("未知 driver 应在 GORM 初始化时报错，实际: %v", err)
 	}
 }
 

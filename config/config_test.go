@@ -113,6 +113,26 @@ func TestDatabaseConfigPostgresDSN(t *testing.T) {
 	}
 }
 
+func TestDatabaseConfigUnknownDriverDoesNotFallback(t *testing.T) {
+	db := config.DatabaseConfig{
+		Driver:   "no-such-driver",
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "password",
+		Name:     "testdb",
+	}
+
+	if dsn := db.DSN(); dsn != "" {
+		t.Fatalf("未知 driver 不应静默回退 MySQL，实际 DSN=%q", dsn)
+	}
+
+	cfg := &config.Config{Database: db}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "database.driver") {
+		t.Fatalf("未知 driver 应在 Validate 阶段报错，实际: %v", err)
+	}
+}
+
 // TestDatabaseConfigDSNPasswordEscape_M9：含特殊字符的密码须被转义，不破坏 DSN。
 func TestDatabaseConfigDSNPasswordEscape_M9(t *testing.T) {
 	// MySQL：密码含 @/:/空格 → url.QueryEscape

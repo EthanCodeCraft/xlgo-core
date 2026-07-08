@@ -1,6 +1,7 @@
 package database
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,8 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 )
 
 // 内置驱动常量（更多驱动可通过 RegisterDialect 扩展）
@@ -29,8 +32,8 @@ type DialectSpec struct {
 	Aliases []string
 	// Dialector 由 DSN 构造 GORM Dialector
 	Dialector DialectorFactory
-	// DSN 由 DatabaseConfig 拼接连接字符串。可选——
-	// 不提供时使用 cfg.MySQLDSN() 兜底（适合自定义驱动通过 CustomDSN 指定连接串的场景）
+	// DSN 由 DatabaseConfig 拼接连接字符串。可选。
+	// 不提供时仅 CustomDSN 能直接生效；需要由配置字段拼接连接串的自定义驱动应显式提供该函数。
 	DSN config.DSNBuilder
 }
 
@@ -92,7 +95,8 @@ func RegisteredDialects() []string {
 }
 
 // Dialector 根据配置返回 GORM Dialector。
-// 驱动由 cfg.Database.Driver 决定，未指定或未注册时按 MySQL 兜底（向后兼容）。
+// 驱动由 cfg.Database.Driver 决定；未指定时默认 MySQL，非空但未注册时返回会初始化失败的
+// Dialector，避免拼写错误静默回退到 MySQL。
 func Dialector(cfg *config.Config) gorm.Dialector {
 	if cfg == nil {
 		logger.Warn("database: 配置为空，回退到 MySQL 空 DSN")
@@ -103,16 +107,48 @@ func Dialector(cfg *config.Config) gorm.Dialector {
 
 // dialectorForDSN 根据驱动名和 DSN 返回 Dialector
 func dialectorForDSN(driver, dsn string) gorm.Dialector {
-	if f, ok := LookupDialect(driver); ok {
+	normalized := normalizeDriver(driver)
+	if normalized == "" {
+		normalized = DriverMySQL
+	}
+	if f, ok := LookupDialect(normalized); ok {
 		return f(dsn)
 	}
-	// 未注册时回退到 MySQL，与 config.DSN() 的回退保持一致。
-	// 拼写错误的驱动名（如 "mysq"/"postgrs"）会静默回退 MySQL，导致连接错误难排查（M10），
-	// 故在此告警一次，提示用户驱动名未注册。
-	logger.Warnf("database: 驱动 %q 未注册，回退到 MySQL（已注册: %s）；若是拼写错误请在配置中修正 driver",
-		normalizeDriver(driver), strings.Join(RegisteredDialects(), ", "))
-	return mysql.Open(dsn)
+	logger.Warnf("database: 驱动 %q 未注册（已注册: %s），拒绝静默回退到 MySQL；请修正配置或先注册方言",
+		normalized, strings.Join(RegisteredDialects(), ", "))
+	return errorDialector{
+		name: "invalid",
+		err:  fmt.Errorf("数据库驱动未注册: %s", normalized),
+	}
 }
+
+type errorDialector struct {
+	name string
+	err  error
+}
+
+func (d errorDialector) Name() string { return d.name }
+
+func (d errorDialector) Initialize(*gorm.DB) error {
+	if d.err == nil {
+		return errors.New("数据库驱动未注册")
+	}
+	return d.err
+}
+
+func (d errorDialector) Migrator(*gorm.DB) gorm.Migrator { return nil }
+
+func (d errorDialector) DataTypeOf(*schema.Field) string { return "" }
+
+func (d errorDialector) DefaultValueOf(*schema.Field) clause.Expression { return nil }
+
+func (d errorDialector) BindVarTo(clause.Writer, *gorm.Statement, any) {}
+
+func (d errorDialector) QuoteTo(writer clause.Writer, str string) {
+	_, _ = writer.WriteString(str)
+}
+
+func (d errorDialector) Explain(sql string, _ ...any) string { return sql }
 
 // normalizeDriver 规范化驱动名（小写、去空白）
 func normalizeDriver(name string) string {
@@ -128,7 +164,7 @@ func driverDescription(driver string) string {
 	if _, ok := LookupDialect(key); ok {
 		return key
 	}
-	return fmt.Sprintf("%s (unregistered, fallback=%s)", key, DriverMySQL)
+	return fmt.Sprintf("%s (unregistered)", key)
 }
 
 func init() {

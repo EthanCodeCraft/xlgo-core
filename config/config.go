@@ -313,22 +313,21 @@ type DatabaseConfig struct {
 	HealthCheckFailureThreshold int `mapstructure:"health_check_failure_threshold"`
 }
 
-// DSN 根据驱动返回连接字符串。设置了 CustomDSN 时优先返回 CustomDSN；
-// 未指定 Driver 时按 MySQL 处理（向后兼容）。
-// 若驱动通过 RegisterDSNBuilder 注册过自定义构建器，则使用注册的构建器。
+// DSN 根据驱动返回连接字符串。设置了 CustomDSN 时优先返回 CustomDSN。
+// 未指定 Driver 时按 MySQL 处理；非空但未注册的 Driver 返回空字符串，
+// 避免把拼写错误静默当作 MySQL 连接，正常加载路径会由 Validate 提前报错。
 func (c *DatabaseConfig) DSN() string {
 	if c.CustomDSN != "" {
 		return c.CustomDSN
 	}
-	driver := c.Driver
+	driver := strings.TrimSpace(c.Driver)
 	if strings.TrimSpace(driver) == "" {
 		driver = DriverMySQL
 	}
 	if builder, ok := LookupDSNBuilder(driver); ok {
 		return builder(c)
 	}
-	// 未注册时回退到 MySQL（保持向后兼容）
-	return c.MySQLDSN()
+	return ""
 }
 
 func (c DatabaseConfig) isConfigured() bool {
