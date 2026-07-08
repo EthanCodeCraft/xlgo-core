@@ -3,9 +3,11 @@ package trace
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/contrib/propagators/b3"
@@ -66,6 +68,10 @@ var tracerProviderPtr atomic.Pointer[sdktrace.TracerProvider]
 // tracerPtr 全局 Tracer（atomic，C13a）。Init 之前为 Noop，调用安全。
 var tracerPtr atomic.Pointer[trace.Tracer]
 
+const defaultOperationTimeout = 5 * time.Second
+
+var operationTimeoutNanos atomic.Int64
+
 func init() {
 	// 初始化为 Noop，保证包级函数在任何时刻（未 Init / 已 Close）Load 均非 nil（C13a）。
 	// P1 #19：用 noop.NewTracerProvider()（新 OTel API），替代已弃用的 trace.NewNoopTracerProvider()。
@@ -74,6 +80,7 @@ func init() {
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
 	tracerProviderPtr.Store(tp)
 	tracerPtr.Store(&noopTracer)
+	operationTimeoutNanos.Store(int64(defaultOperationTimeout))
 }
 
 // getTracer 返回全局 Tracer 的 atomic 快照（永不 nil）。
@@ -88,6 +95,10 @@ func TracerProvider() *sdktrace.TracerProvider {
 
 // Init 初始化链路追踪
 func Init(cfg Config) error {
+	if math.IsNaN(cfg.SampleRatio) || cfg.SampleRatio < 0 || cfg.SampleRatio > 1 {
+		return fmt.Errorf("trace SampleRatio must be between 0.0 and 1.0: %v", cfg.SampleRatio)
+	}
+
 	if !cfg.Enabled {
 		// 设置 Noop Tracer（P1 #19：noop 包替代弃用 API）
 		noopProvider := noop.NewTracerProvider()
@@ -98,7 +109,7 @@ func Init(cfg Config) error {
 		// 避免禁用 trace 后旧 exporter 后台 goroutine/连接持续占用。
 		fallback := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.NeverSample()))
 		if old := tracerProviderPtr.Swap(fallback); old != nil {
-			_ = old.Shutdown(context.Background())
+			_ = shutdownProviderWithTimeout(context.Background(), old)
 		}
 		return nil
 	}
@@ -139,7 +150,7 @@ func Init(cfg Config) error {
 	if err != nil {
 		// M-65 修复：传播器非法时回滚已创建的 provider。此时尚未 otel.SetTracerProvider，
 		// otel 全局仍指向旧 provider，无需恢复——仅 Shutdown 新 provider 避免泄漏。
-		_ = newProvider.Shutdown(context.Background())
+		_ = shutdownProviderWithTimeout(context.Background(), newProvider)
 		return err
 	}
 
@@ -152,10 +163,34 @@ func Init(cfg Config) error {
 	tracer := newProvider.Tracer(cfg.ServiceName)
 	tracerPtr.Store(&tracer)
 	if oldProvider != nil {
-		_ = oldProvider.Shutdown(context.Background())
+		_ = shutdownProviderWithTimeout(context.Background(), oldProvider)
 	}
 
 	return nil
+}
+
+func operationTimeout() time.Duration {
+	timeout := time.Duration(operationTimeoutNanos.Load())
+	if timeout <= 0 {
+		return defaultOperationTimeout
+	}
+	return timeout
+}
+
+func contextWithOperationTimeout(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return context.WithTimeout(parent, operationTimeout())
+}
+
+func shutdownProviderWithTimeout(parent context.Context, provider *sdktrace.TracerProvider) error {
+	if provider == nil {
+		return nil
+	}
+	ctx, cancel := contextWithOperationTimeout(parent)
+	defer cancel()
+	return provider.Shutdown(ctx)
 }
 
 // createExporter 创建导出器
@@ -167,14 +202,18 @@ func createExporter(cfg Config) (sdktrace.SpanExporter, error) {
 			opts = append(opts, otlptracehttp.WithInsecure()) // C13c
 		}
 		client := otlptracehttp.NewClient(opts...)
-		return otlptrace.New(context.Background(), client)
+		ctx, cancel := contextWithOperationTimeout(context.Background())
+		defer cancel()
+		return otlptrace.New(ctx, client)
 	case "otlp-grpc":
 		opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(cfg.Endpoint)}
 		if cfg.Insecure {
 			opts = append(opts, otlptracegrpc.WithInsecure()) // C13c
 		}
 		client := otlptracegrpc.NewClient(opts...)
-		return otlptrace.New(context.Background(), client)
+		ctx, cancel := contextWithOperationTimeout(context.Background())
+		defer cancel()
+		return otlptrace.New(ctx, client)
 	case "stdout":
 		return stdouttrace.New(
 			stdouttrace.WithWriter(os.Stdout),
@@ -219,7 +258,7 @@ func Close(ctx context.Context) error {
 	noopTracer := noop.NewTracerProvider().Tracer("xlgo") // P1 #19：noop 包替代弃用 API
 	tracerPtr.Store(&noopTracer)
 	if old != nil {
-		return old.Shutdown(ctx)
+		return shutdownProviderWithTimeout(ctx, old)
 	}
 	return nil
 }
@@ -242,15 +281,20 @@ func Middleware(serviceName string) gin.HandlerFunc {
 			spanName = c.Request.Method + " " + route
 		}
 
+		attrs := []attribute.KeyValue{
+			semconv.HTTPRequestMethodKey.String(c.Request.Method),
+			semconv.URLPathKey.String(c.Request.URL.Path),
+			semconv.HTTPRouteKey.String(route),
+			attribute.String("http.user_agent", c.Request.UserAgent()),
+			attribute.String("http.host", c.Request.Host),
+		}
+		if serviceName != "" {
+			attrs = append(attrs, attribute.String("service.name", serviceName))
+		}
+
 		ctx, span := getTracer().Start(ctx, spanName,
 			trace.WithSpanKind(trace.SpanKindServer),
-			trace.WithAttributes(
-				semconv.HTTPRequestMethodKey.String(c.Request.Method),
-				semconv.URLPathKey.String(c.Request.URL.Path),
-				semconv.HTTPRouteKey.String(route),
-				attribute.String("http.user_agent", c.Request.UserAgent()),
-				attribute.String("http.host", c.Request.Host),
-			),
+			trace.WithAttributes(attrs...),
 		)
 		// P1 #19：defer 保证下游 handler panic（在上游 recovery 捕获前）时 span 也被结束，
 		// 不泄漏未结束的 span。
@@ -262,8 +306,9 @@ func Middleware(serviceName string) gin.HandlerFunc {
 		c.Set("otel_ctx", ctx)
 
 		// 将 TraceID 添加到响应头
-		traceID := span.SpanContext().TraceID().String()
-		c.Header("X-Trace-ID", traceID)
+		if span.SpanContext().HasTraceID() {
+			c.Header("X-Trace-ID", span.SpanContext().TraceID().String())
+		}
 
 		// 执行请求
 		c.Next()
@@ -321,6 +366,9 @@ func StartSpanFromContext(ctx context.Context, name string, attrs ...attribute.K
 
 // RecordError 记录错误
 func RecordError(c *gin.Context, err error) {
+	if c == nil || err == nil {
+		return
+	}
 	ctx := GetContext(c)
 	span := trace.SpanFromContext(ctx)
 	span.RecordError(err)
@@ -329,6 +377,9 @@ func RecordError(c *gin.Context, err error) {
 
 // RecordErrorToSpan 记录错误到指定 Span
 func RecordErrorToSpan(span trace.Span, err error) {
+	if span == nil || err == nil {
+		return
+	}
 	span.RecordError(err)
 	span.SetStatus(codes.Error, err.Error())
 }

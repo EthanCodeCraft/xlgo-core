@@ -1,7 +1,9 @@
 package ws_test
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/EthanCodeCraft/xlgo-core/ws"
 )
@@ -64,15 +66,27 @@ func TestHubBroadcast(t *testing.T) {
 	hub := ws.NewHub()
 
 	// 广播消息（无连接时也应正常）
-	hub.Broadcast([]byte("test message"))
+	if err := hub.TryBroadcast([]byte("test message")); err == nil {
+		t.Error("TryBroadcast on a hub that has not Run should fail fast")
+	}
 }
 
 func TestHubBroadcastJSON(t *testing.T) {
 	hub := ws.NewHub()
+	go hub.Run()
+	t.Cleanup(hub.Stop)
 
-	err := hub.BroadcastJSON(map[string]string{"key": "value"})
-	if err != nil {
-		t.Errorf("BroadcastJSON error: %v", err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		err := hub.BroadcastJSON(map[string]string{"key": "value"})
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ws.ErrHubNotRunning) || time.Now().After(deadline) {
+			t.Errorf("BroadcastJSON error: %v", err)
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

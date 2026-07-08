@@ -2,10 +2,14 @@ package trace
 
 import (
 	"context"
+	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
@@ -37,6 +41,60 @@ func resetGlobal(t *testing.T) {
 	otel.SetTracerProvider(noopProvider)
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, propagation.Baggage{}))
+}
+
+func setOperationTimeoutForTest(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	old := operationTimeoutNanos.Load()
+	operationTimeoutNanos.Store(int64(timeout))
+	t.Cleanup(func() {
+		operationTimeoutNanos.Store(old)
+	})
+}
+
+type blockingExporter struct{}
+
+func (blockingExporter) ExportSpans(context.Context, []sdktrace.ReadOnlySpan) error {
+	return nil
+}
+
+func (blockingExporter) Shutdown(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type recordingExporter struct {
+	mu    sync.Mutex
+	spans []sdktrace.ReadOnlySpan
+}
+
+func (e *recordingExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans = append(e.spans, spans...)
+	return nil
+}
+
+func (e *recordingExporter) Shutdown(context.Context) error {
+	return nil
+}
+
+func (e *recordingExporter) Spans() []sdktrace.ReadOnlySpan {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	spans := make([]sdktrace.ReadOnlySpan, len(e.spans))
+	copy(spans, e.spans)
+	return spans
+}
+
+func requireNoPanic(t *testing.T, fn func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("unexpected panic: %v", r)
+		}
+	}()
+	fn()
 }
 
 // TestC13aInitNoopInvariant 锁定 init() 的 Noop 兜底不变式：
@@ -204,11 +262,11 @@ func TestC13dRequestContextContainsSpan(t *testing.T) {
 
 	// 用 stdout 导出器 + 全采样，使 span 真实生成（非 Noop）。
 	if err := Init(Config{
-		Enabled:       true,
-		ServiceName:   "test-svc",
-		ExporterType:  "stdout",
-		SampleRatio:   1.0,
-		Propagator:    "w3c",
+		Enabled:      true,
+		ServiceName:  "test-svc",
+		ExporterType: "stdout",
+		SampleRatio:  1.0,
+		Propagator:   "w3c",
 	}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
@@ -430,6 +488,146 @@ func TestH14CloseIdempotent(t *testing.T) {
 	if err := Close(context.Background()); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+}
+
+// ============================================================
+// M14 trace residue: validation, timeout, nil guards, headers, service name
+// ============================================================
+func TestM14SampleRatioRange(t *testing.T) {
+	t.Cleanup(func() { resetGlobal(t) })
+
+	for _, ratio := range []float64{-0.01, 1.01, math.NaN()} {
+		err := Init(Config{
+			Enabled:      true,
+			ExporterType: "stdout",
+			Propagator:   "w3c",
+			SampleRatio:  ratio,
+		})
+		if err == nil {
+			t.Fatalf("Init with SampleRatio=%v should fail", ratio)
+		}
+	}
+
+	for _, ratio := range []float64{0, 1} {
+		if err := Init(Config{
+			Enabled:      true,
+			ServiceName:  "svc",
+			ExporterType: "stdout",
+			Propagator:   "w3c",
+			SampleRatio:  ratio,
+		}); err != nil {
+			t.Fatalf("Init with boundary SampleRatio=%v failed: %v", ratio, err)
+		}
+		if err := Close(context.Background()); err != nil {
+			t.Fatalf("Close after SampleRatio=%v: %v", ratio, err)
+		}
+	}
+}
+
+func TestM14CloseUsesOperationTimeout(t *testing.T) {
+	resetGlobal(t)
+	t.Cleanup(func() { resetGlobal(t) })
+	setOperationTimeoutForTest(t, 20*time.Millisecond)
+
+	blockingProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(blockingExporter{}))
+	tracerProviderPtr.Store(blockingProvider)
+
+	start := time.Now()
+	err := Close(context.Background())
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close error = %v, want context deadline exceeded", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("Close took %s, expected operation timeout to bound shutdown", elapsed)
+	}
+}
+
+func TestM14InitDisabledShutdownUsesOperationTimeout(t *testing.T) {
+	resetGlobal(t)
+	t.Cleanup(func() { resetGlobal(t) })
+	setOperationTimeoutForTest(t, 20*time.Millisecond)
+
+	blockingProvider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(blockingExporter{}))
+	tracerProviderPtr.Store(blockingProvider)
+
+	start := time.Now()
+	if err := Init(Config{Enabled: false, ServiceName: "svc"}); err != nil {
+		t.Fatalf("Init disabled: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("Init disabled took %s, expected operation timeout to bound old provider shutdown", elapsed)
+	}
+}
+
+func TestM14RecordErrorNilInputsNoPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+
+	requireNoPanic(t, func() { RecordError(nil, errors.New("boom")) })
+	requireNoPanic(t, func() { RecordError(c, nil) })
+
+	var nilSpan oteltrace.Span
+	requireNoPanic(t, func() { RecordErrorToSpan(nilSpan, errors.New("boom")) })
+	requireNoPanic(t, func() {
+		RecordErrorToSpan(oteltrace.SpanFromContext(context.Background()), nil)
+	})
+}
+
+func TestM14NoZeroTraceIDHeaderFromNoop(t *testing.T) {
+	resetGlobal(t)
+	t.Cleanup(func() { resetGlobal(t) })
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(Middleware("svc"))
+	r.GET("/p", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/p", nil)
+	r.ServeHTTP(w, req)
+
+	const zeroTraceID = "00000000000000000000000000000000"
+	if got := w.Header().Get("X-Trace-ID"); got == zeroTraceID {
+		t.Fatalf("X-Trace-ID should not expose all-zero TraceID, got %q", got)
+	}
+}
+
+func TestM14MiddlewareServiceNameAttribute(t *testing.T) {
+	resetGlobal(t)
+	t.Cleanup(func() { resetGlobal(t) })
+
+	exporter := &recordingExporter{}
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	tracer := provider.Tracer("test")
+	tracerProviderPtr.Store(provider)
+	tracerPtr.Store(&tracer)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(Middleware("middleware-svc"))
+	r.GET("/p", func(c *gin.Context) {
+		c.Status(http.StatusOK)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/p", nil)
+	r.ServeHTTP(w, req)
+
+	for _, span := range exporter.Spans() {
+		for _, attr := range span.Attributes() {
+			if string(attr.Key) == "service.name" && attr.Value.AsString() == "middleware-svc" {
+				return
+			}
+		}
+	}
+	t.Fatal("server span missing service.name attribute from Middleware(serviceName)")
 }
 
 // TestM65PropagatorFailureLeavesOtelUsable 验证传播器失败时 otel 全局未被切到

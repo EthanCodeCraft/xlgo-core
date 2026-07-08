@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,7 +22,16 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     sameOriginCheck,
+	CheckOrigin:     currentCheckOrigin,
+}
+
+var checkOriginValue atomic.Value // stores func(*http.Request) bool
+
+func currentCheckOrigin(r *http.Request) bool {
+	if fn, ok := checkOriginValue.Load().(func(*http.Request) bool); ok && fn != nil {
+		return fn(r)
+	}
+	return sameOriginCheck(r)
 }
 
 // sameOriginCheck 同源校验：Origin 为空（非浏览器/服务器内部）放行；否则要求 Origin 的
@@ -36,7 +46,20 @@ func sameOriginCheck(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return u.Host == r.Host
+	if u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, requestScheme(r)) && strings.EqualFold(u.Host, r.Host)
+}
+
+func requestScheme(r *http.Request) string {
+	if r.URL != nil && r.URL.Scheme != "" {
+		return r.URL.Scheme
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // AllowOrigins 返回一个 CheckOrigin 函数，仅放行给定 Origin 列表（含 scheme+host[:port]）。
@@ -151,7 +174,9 @@ func (c *Connection) Close() {
 	c.once.Do(func() {
 		close(c.closeChan)
 		// #nosec G104 -- 关闭底层连接的错误无意义（重复关闭返错属正常），忽略
-		_ = c.conn.Close()
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
 	})
 }
 
@@ -229,6 +254,9 @@ func Upgrade(c *gin.Context) (*Connection, error) {
 
 // Handle WebSocket 处理中间件
 func Handle(handler Handler) gin.HandlerFunc {
+	if handler == nil {
+		handler = &DefaultHandler{}
+	}
 	return func(c *gin.Context) {
 		conn, err := Upgrade(c)
 		if err != nil {
@@ -312,14 +340,21 @@ func HandleFunc(fn HandlerFunc) gin.HandlerFunc {
 	})
 }
 
-// SetCheckOrigin 设置 Origin 检查函数。
-//
-// L-H：直接写包级 upgrader.CheckOrigin 无锁，与并发 Upgrade（读 upgrader.CheckOrigin）
-// 存在数据竞争。约定仅在 HTTP 服务启动前（init/main 阶段、路由注册前）调用一次，
-// 不要在服务运行期与请求处理并发切换。运行期动态切换 Origin 策略请改用自有 upgrader 实例。
+// SetCheckOrigin 设置 Origin 检查函数。传 nil 会恢复默认同源校验。
+// 运行期并发调用安全：upgrader 持有固定 wrapper，实际检查函数经 atomic.Value 切换。
 func SetCheckOrigin(fn func(r *http.Request) bool) {
-	upgrader.CheckOrigin = fn
+	if fn == nil {
+		fn = sameOriginCheck
+	}
+	checkOriginValue.Store(fn)
 }
+
+var (
+	ErrHubNotRunning = errors.New("websocket hub not running")
+	ErrHubStopped    = errors.New("websocket hub stopped")
+	ErrHubQueueFull  = errors.New("websocket hub queue full")
+	ErrNilConnection = errors.New("websocket connection is nil")
+)
 
 // Hub 连接管理中心（用于广播）。
 // W1 修复：添加 stop channel + Stop() 方法，支持优雅退出。
@@ -329,19 +364,21 @@ type Hub struct {
 	unregister  chan *Connection
 	broadcast   chan []byte
 	mu          sync.RWMutex
+	lifecycleMu sync.RWMutex
 	stop        chan struct{}
-	stopOnce    sync.Once       // H-8: 保证 close(stop) 仅一次，并发 Stop 不 double-close panic
-	runOnce     sync.Once       // H-9: 保证 Run 仅执行一次
-	runStarted  atomic.Bool     // H-9: 标记 Run 是否已启动，Stop 据此决定是否等待
-	runDone     chan struct{}   // H-9: Run 退出时 close，替代 WaitGroup 避免 Add/Wait 竞态
+	stopOnce    sync.Once   // H-8: 保证 close(stop) 仅一次，并发 Stop 不 double-close panic
+	runOnce     sync.Once   // H-9: 保证 Run 仅执行一次
+	runStarted  atomic.Bool // H-9: 标记 Run 是否已启动，Stop 据此决定是否等待
+	stopped     atomic.Bool
+	runDone     chan struct{} // H-9: Run 退出时 close，替代 WaitGroup 避免 Add/Wait 竞态
 }
 
 // NewHub 创建 Hub
 func NewHub() *Hub {
 	return &Hub{
 		connections: make(map[*Connection]bool),
-		register:    make(chan *Connection),
-		unregister:  make(chan *Connection),
+		register:    make(chan *Connection, 256),
+		unregister:  make(chan *Connection, 256),
 		broadcast:   make(chan []byte, 256),
 		stop:        make(chan struct{}),
 		runDone:     make(chan struct{}),
@@ -365,21 +402,22 @@ func (h *Hub) Run() {
 		for {
 			select {
 			case <-h.stop:
-				// 关闭所有连接后退出
-				h.mu.Lock()
-				for conn := range h.connections {
-					delete(h.connections, conn)
-					conn.Close()
-				}
-				h.mu.Unlock()
+				h.drainPending()
+				h.closeAll()
 				return
 
 			case conn := <-h.register:
+				if conn == nil {
+					continue
+				}
 				h.mu.Lock()
 				h.connections[conn] = true
 				h.mu.Unlock()
 
 			case conn := <-h.unregister:
+				if conn == nil {
+					continue
+				}
 				h.mu.Lock()
 				if _, ok := h.connections[conn]; ok {
 					delete(h.connections, conn)
@@ -402,6 +440,33 @@ func (h *Hub) Run() {
 	})
 }
 
+func (h *Hub) drainPending() {
+	for {
+		select {
+		case conn := <-h.register:
+			if conn != nil {
+				conn.Close()
+			}
+		case conn := <-h.unregister:
+			if conn != nil {
+				conn.Close()
+			}
+		case <-h.broadcast:
+		default:
+			return
+		}
+	}
+}
+
+func (h *Hub) closeAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for conn := range h.connections {
+		delete(h.connections, conn)
+		conn.Close()
+	}
+}
+
 // Stop 停止 Hub（W1 修复：优雅退出机制）。
 // close(stop) 通知 Run() 退出；若 Run 已启动则等待其完全结束（<-runDone）。
 //
@@ -414,36 +479,108 @@ func (h *Hub) Run() {
 // 幂等：重复/并发调用安全。
 func (h *Hub) Stop() {
 	h.stopOnce.Do(func() {
+		h.lifecycleMu.Lock()
+		defer h.lifecycleMu.Unlock()
+		h.stopped.Store(true)
 		close(h.stop)
+		if !h.runStarted.Load() {
+			h.drainPending()
+			h.closeAll()
+		}
 	})
 	if h.runStarted.Load() {
 		<-h.runDone
 	}
 }
 
-// Register 注册连接（W1 修复：Hub 已 stop 时 non-blocking 返回，避免永久阻塞）。
-func (h *Hub) Register(conn *Connection) {
+func (h *Hub) enqueueRegister(conn *Connection, requireStarted bool) error {
+	if conn == nil {
+		return ErrNilConnection
+	}
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
+	if h.stopped.Load() {
+		conn.Close()
+		return ErrHubStopped
+	}
+	if requireStarted && !h.runStarted.Load() {
+		conn.Close()
+		return ErrHubNotRunning
+	}
 	select {
 	case h.register <- conn:
-	case <-h.stop:
+		return nil
+	default:
 		conn.Close()
+		return ErrHubQueueFull
 	}
 }
 
-// Unregister 注销连接（W1 修复：Hub 已 stop 时 non-blocking 返回）。
-func (h *Hub) Unregister(conn *Connection) {
+// Register 注册连接。调用兼容旧 API：失败时关闭连接并直接返回。
+func (h *Hub) Register(conn *Connection) {
+	_ = h.enqueueRegister(conn, false)
+}
+
+// TryRegister 注册连接并返回失败原因。Hub 未 Run、已 Stop 或队列满时立即返回错误。
+func (h *Hub) TryRegister(conn *Connection) error {
+	return h.enqueueRegister(conn, true)
+}
+
+func (h *Hub) enqueueUnregister(conn *Connection, requireStarted bool) error {
+	if conn == nil {
+		return ErrNilConnection
+	}
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
+	if h.stopped.Load() {
+		return ErrHubStopped
+	}
+	if requireStarted && !h.runStarted.Load() {
+		return ErrHubNotRunning
+	}
 	select {
 	case h.unregister <- conn:
-	case <-h.stop:
+		return nil
+	default:
+		return ErrHubQueueFull
 	}
 }
 
-// Broadcast 广播消息（W1 修复：Hub 已 stop 时 non-blocking 返回）。
-func (h *Hub) Broadcast(message []byte) {
+// Unregister 注销连接。调用兼容旧 API：失败时直接返回。
+func (h *Hub) Unregister(conn *Connection) {
+	_ = h.enqueueUnregister(conn, false)
+}
+
+// TryUnregister 注销连接并返回失败原因。
+func (h *Hub) TryUnregister(conn *Connection) error {
+	return h.enqueueUnregister(conn, true)
+}
+
+func (h *Hub) enqueueBroadcast(message []byte, requireStarted bool) error {
+	h.lifecycleMu.RLock()
+	defer h.lifecycleMu.RUnlock()
+	if h.stopped.Load() {
+		return ErrHubStopped
+	}
+	if requireStarted && !h.runStarted.Load() {
+		return ErrHubNotRunning
+	}
 	select {
 	case h.broadcast <- message:
-	case <-h.stop:
+		return nil
+	default:
+		return ErrHubQueueFull
 	}
+}
+
+// Broadcast 广播消息。调用兼容旧 API：失败时直接返回。
+func (h *Hub) Broadcast(message []byte) {
+	_ = h.enqueueBroadcast(message, false)
+}
+
+// TryBroadcast 广播消息并返回失败原因。
+func (h *Hub) TryBroadcast(message []byte) error {
+	return h.enqueueBroadcast(message, true)
 }
 
 // BroadcastJSON 广播 JSON 消息
@@ -452,8 +589,7 @@ func (h *Hub) BroadcastJSON(v any) error {
 	if err != nil {
 		return err
 	}
-	h.Broadcast(data)
-	return nil
+	return h.TryBroadcast(data)
 }
 
 // Count 获取连接数

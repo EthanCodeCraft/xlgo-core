@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,7 +17,8 @@ func TestSameOriginCheck_C7(t *testing.T) {
 		want   bool
 	}{
 		{"empty origin (non-browser)", "", "example.com", true},
-		{"same origin", "https://example.com", "example.com", true},
+		{"same origin", "http://example.com", "example.com", true},
+		{"scheme mismatch", "https://example.com", "example.com", false},
 		{"cross origin", "https://evil.com", "example.com", false},
 		{"origin with port same", "http://example.com:8080", "example.com:8080", true},
 		{"origin with port diff", "http://example.com:8080", "example.com:9090", false},
@@ -37,6 +39,19 @@ func TestSameOriginCheck_C7(t *testing.T) {
 	}
 }
 
+func TestSameOriginCheckHTTPS_C7(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "https://example.com/ws", nil)
+	req.TLS = &tls.ConnectionState{}
+	req.Header.Set("Origin", "https://example.com")
+	if !sameOriginCheck(req) {
+		t.Fatal("sameOriginCheck should allow matching https origin for TLS request")
+	}
+	req.Header.Set("Origin", "http://example.com")
+	if sameOriginCheck(req) {
+		t.Fatal("sameOriginCheck should reject origin with mismatched scheme")
+	}
+}
+
 // TestAllowOrigins_C7：AllowOrigins 仅放行白名单 Origin。
 func TestAllowOrigins_C7(t *testing.T) {
 	check := AllowOrigins("https://a.com", "https://b.com")
@@ -44,11 +59,11 @@ func TestAllowOrigins_C7(t *testing.T) {
 		origin string
 		want   bool
 	}{
-		{"", true},                 // 非浏览器放行
-		{"https://a.com", true},    // 白名单
-		{"https://b.com", true},    // 白名单
+		{"", true},              // 非浏览器放行
+		{"https://a.com", true}, // 白名单
+		{"https://b.com", true}, // 白名单
 		{"https://evil.com", false},
-		{"http://a.com", false},    // scheme 不符
+		{"http://a.com", false}, // scheme 不符
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
