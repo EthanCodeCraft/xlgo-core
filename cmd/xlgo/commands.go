@@ -173,19 +173,19 @@ func validateProjectName(name string) error {
 	return nil
 }
 
-// isValidGoIdentifier 判断 s 是否为合法 Go 标识符（ASCII 范围）。
+// isValidGoIdentifier 判断 s 是否为脚手架接受的 ASCII 标识符：字母开头，后续允许字母、数字、下划线。
 func isValidGoIdentifier(s string) bool {
 	if s == "" {
 		return false
 	}
 	for i, r := range s {
-		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 		isNum := r >= '0' && r <= '9'
 		if i == 0 {
 			if !isLetter {
 				return false
 			}
-		} else if !isLetter && !isNum {
+		} else if !isLetter && !isNum && r != '_' {
 			return false
 		}
 	}
@@ -207,17 +207,11 @@ func validateModulePath(module string) error {
 }
 
 func makeFile(fileType, name string) error {
-	// 文件名小写，但保留原分隔用于多词；标识符须为合法 Go 标识符（仅字母数字下划线）。
-	// 将连字符/空格等转为下划线后再 Title，避免 "my-thing" → "My-Thing" 生成非法标识符（M20）。
-	name = strings.ToLower(name)
-	// P1 #21：拒绝含路径分隔符的名称，避免生成到目标目录之外。
-	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-		return fmt.Errorf("名称不能包含路径分隔符或 ..: %q", name)
+	if err := validateMakeName(name); err != nil {
+		return err
 	}
-	identBase := sanitizeIdent(name)
-	caser := cases.Title(language.English)
-	nameTitle := caser.String(strings.ReplaceAll(identBase, "_", " "))
-	nameTitle = strings.ReplaceAll(nameTitle, " ", "") // 拼回 CamelCase
+	name = strings.ToLower(name)
+	nameTitle := makeNameTitle(name)
 
 	switch fileType {
 	case "handler":
@@ -233,24 +227,28 @@ func makeFile(fileType, name string) error {
 	}
 }
 
-// sanitizeIdent 把 name 中的非字母数字字符替换为下划线，生成合法 Go 标识符基串（M20）。
-// 如 "my-thing" → "my_thing"，后续 Title 后得到 "MyThing"。
-func sanitizeIdent(name string) string {
-	var b strings.Builder
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-		} else if r >= 'A' && r <= 'Z' {
-			b.WriteRune(r)
-		} else {
-			b.WriteByte('_')
-		}
+// validateMakeName 校验 xlgo make 的资源名，避免路径穿越或生成不可编译的 Go 代码。
+func validateMakeName(name string) error {
+	if name == "" {
+		return fmt.Errorf("名称不能为空")
 	}
-	s := strings.Trim(b.String(), "_")
-	if s == "" {
-		return "xlgo"
+	if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
+		return fmt.Errorf("名称不能包含路径分隔符或 ..: %q", name)
 	}
-	return s
+	if strings.HasPrefix(name, ".") {
+		return fmt.Errorf("名称不能以 . 开头: %q", name)
+	}
+	if !isValidGoIdentifier(name) {
+		return fmt.Errorf("名称 %q 必须是合法标识符：须以字母开头，仅含字母、数字、下划线", name)
+	}
+	return nil
+}
+
+// makeNameTitle 把 snake_case 名称转为导出的 CamelCase 类型名。
+func makeNameTitle(name string) string {
+	caser := cases.Title(language.English)
+	nameTitle := caser.String(strings.ReplaceAll(name, "_", " "))
+	return strings.ReplaceAll(nameTitle, " ", "")
 }
 
 func createHandler(name, nameTitle string) error {

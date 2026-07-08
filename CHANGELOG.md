@@ -22,6 +22,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 - **cache 写操作与计数器/原始 Redis helper 在 Redis 未初始化时返回 `ErrRedisNotReady`**：`Set` / `Delete` / `DeleteByPattern` / `Incr` / `IncrBy` / `Decr` / `GetTTL` / `SetExpire` / `GetRaw` / `SetRaw` 旧行为会静默返回成功或零值，调用方容易误判缓存写入、计数器更新或过期时间设置已经生效；现在统一显式返回错误。公共接口签名不变，但依赖“未启用 Redis 时当作成功”的下游需要改为忽略 `errors.Is(err, cache.ErrRedisNotReady)` 或显式启用 Redis。
 - **`cache.WithLock` / `cache.WithLockAutoExtend` 未获取到锁时返回 `ErrLockNotAcquired`**：旧行为返回 `nil` 并跳过业务函数，调用方无法区分“业务执行成功”和“根本没有执行”。同时锁 TTL 小于 1ms、续期/重试间隔非正会返回显式错误，避免 Redis PX=0 或 `time.NewTicker(0)` 崩溃。
+- **`test.Request.Execute()` 改为返回 `*test.Response`**：旧返回值是 `*httptest.ResponseRecorder`，与文档示例中的 `resp.AssertOK(t)` / `resp.ParseJSON(...)` 不一致；现在 `Execute()` 返回带断言和 JSON 解析方法的包装类型。需要原始 recorder 的调用方改用新增 `ExecuteRecorder()`。
 - **`jwt.ParseToken` 开始校验 issuer，`RefreshToken` 使用 `jwt.refresh_expire`**：签发者与当前配置不一致的 token 会被拒绝；刷新后的 token 过期时间优先使用 `refresh_expire`，未配置时回退 `expire`。`GenerateTokenWithCustomExpiry` 现在拒绝非正过期时间，`InvalidateTokenByID("")` 返回 `ErrEmptyJTI`。
 - **`App.Init()` 由 `sync.Once` 改为生命周期状态机**（app.go，M1）：5 态 `stateCreated/Initializing/Initialized/Stopping/Stopped` + `lifecycleMu`(RWMutex) + `initMu`(Mutex)。`Shutdown` 后或 `Init` 失败后再调 `Init()` 返回新增导出错误 **`xlgo.ErrAppClosed`**（原 `sync.Once` "多次调用返回首次结果"语义不再适用——已关闭的 App 不可再 Init，需新建 App）。
 - **`App.Go()` 在 Shutdown 开始或 Init 失败后为 no-op**（app.go，M1）：`state >= stateStopping` 时拒绝 `wg.Add` 直接返回，避免与 `Shutdown` 的 `wg.Wait` 竞争 `sync.WaitGroup` 契约（Add 须 happen-before Wait）。依赖"Shutdown 后仍可 Go"的下游需改用独立 goroutine。
@@ -40,6 +41,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M10 cache 剩余错误语义收口**：新增 `cache.ExistsE` 与可选 `CacheExistChecker`，让调用方能区分 key 不存在和 Redis/backend 故障；保留旧 `Exists` bool-only 兼容方法但记录后端错误；`KeyBuilder` 现在忽略 nil option，`WithPrefix` / `WithSeparator` / `WithCacheType` 直接作用于 nil builder 时 no-op，避免扩展配置路径 panic。
 - **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
 - **M15 utils/validation 资源与错误边界修复**：`HTTPClient.Upload` 改为流式 multipart 上传，不再把文件请求体完整缓存在内存中；`AppendFile` / `CopyFile` 返回写侧 `Close` 错误；`CheckPasswordAndUpgrade` 归一化非法 `targetCost`，避免异常配置触发超高 bcrypt cost；`ValidateStruct(nil)` 直接返回 nil。
+- **M16 测试工具与脚手架边界修复**：`MockDB` / `MockCache` / `MockStorage` 改为并发安全；`MockCache` 与 `MockStorage.UploadFromBytes` 复制字节切片，避免调用方修改污染内部状态；`MockStorage` 拒绝 nil 文件与超过 32MiB 的输入，避免测试 helper 被误用成无上限内存缓冲；`xlgo make` 对资源名做显式标识符校验，非法名称（路径穿越、连字符、数字开头等）直接返回中文错误，不再静默转义后生成不可预期代码。
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
 
 - **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
