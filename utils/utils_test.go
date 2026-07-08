@@ -1,6 +1,8 @@
 package utils_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -92,9 +94,9 @@ func TestDefaultIfBlank(t *testing.T) {
 
 func TestSubstr(t *testing.T) {
 	tests := []struct {
-		input   string
-		start   int
-		length  int
+		input    string
+		start    int
+		length   int
 		expected string
 	}{
 		{"hello世界", 0, 7, "hello世界"},
@@ -334,8 +336,8 @@ func TestCalcOffset(t *testing.T) {
 		{1, 20, 0},
 		{2, 20, 20},
 		{3, 10, 20},
-		{0, 20, 0},  // page <= 0 自动修正为 1
-		{1, 0, 0},   // pageSize <= 0 自动修正为 20
+		{0, 20, 0}, // page <= 0 自动修正为 1
+		{1, 0, 0},  // pageSize <= 0 自动修正为 20
 	}
 
 	for _, tt := range tests {
@@ -343,6 +345,30 @@ func TestCalcOffset(t *testing.T) {
 		if result != tt.expected {
 			t.Errorf("CalcOffset(%d, %d) = %d, want %d", tt.page, tt.pageSize, result, tt.expected)
 		}
+	}
+}
+
+func TestAppendFileAndCopyFile(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "src.txt")
+	dst := filepath.Join(tmp, "nested", "dst.txt")
+
+	if err := utils.AppendFile(src, []byte("hello")); err != nil {
+		t.Fatalf("AppendFile first write: %v", err)
+	}
+	if err := utils.AppendFile(src, []byte(" world")); err != nil {
+		t.Fatalf("AppendFile second write: %v", err)
+	}
+	if err := utils.CopyFile(dst, src); err != nil {
+		t.Fatalf("CopyFile: %v", err)
+	}
+
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("ReadFile copied file: %v", err)
+	}
+	if string(data) != "hello world" {
+		t.Errorf("copied data = %q, want hello world", string(data))
 	}
 }
 

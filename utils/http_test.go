@@ -3,8 +3,11 @@ package utils_test
 import (
 	"crypto/tls"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -244,5 +247,49 @@ func TestHTTPClientSetBlockPrivateNetworks(t *testing.T) {
 	c.SetBlockPrivateNetworks(true)
 	if _, err := c.Get(srv.URL, nil); !errors.Is(err, utils.ErrSSRFBlocked) {
 		t.Errorf("after enabling guard, err = %v, want ErrSSRFBlocked", err)
+	}
+}
+
+func TestHTTPClientUploadStreamsMultipartBody(t *testing.T) {
+	tmp := t.TempDir()
+	filePath := filepath.Join(tmp, "payload.txt")
+	if err := os.WriteFile(filePath, []byte("streamed payload"), 0644); err != nil {
+		t.Fatalf("write temp payload: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.ContentLength != -1 {
+			t.Errorf("ContentLength = %d, want -1 for streaming upload", r.ContentLength)
+		}
+		if err := r.ParseMultipartForm(1024); err != nil {
+			t.Fatalf("ParseMultipartForm: %v", err)
+		}
+		if got := r.FormValue("kind"); got != "test" {
+			t.Errorf("form field kind = %q, want test", got)
+		}
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			t.Fatalf("FormFile: %v", err)
+		}
+		defer file.Close()
+		data, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatalf("read uploaded file: %v", err)
+		}
+		if string(data) != "streamed payload" {
+			t.Errorf("uploaded data = %q", string(data))
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := utils.NewHTTPClient()
+	defer c.Close()
+	body, err := c.Upload(srv.URL, []utils.UploadFile{{FieldName: "file", FilePath: filePath}}, map[string]string{"kind": "test"})
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want ok", string(body))
 	}
 }

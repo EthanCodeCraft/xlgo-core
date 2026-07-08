@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -68,8 +69,10 @@ func AppendFile(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	_, err = f.Write(data)
+	if cerr := f.Close(); cerr != nil {
+		return errors.Join(err, cerr)
+	}
 	return err
 }
 
@@ -80,7 +83,9 @@ func CopyFile(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	defer srcFile.Close()
+	defer func() {
+		_ = srcFile.Close()
+	}()
 
 	// 确保目标目录存在
 	dir := filepath.Dir(dst)
@@ -93,9 +98,11 @@ func CopyFile(dst, src string) error {
 	if err != nil {
 		return err
 	}
-	defer dstFile.Close()
 
 	_, err = io.Copy(dstFile, srcFile)
+	if cerr := dstFile.Close(); cerr != nil {
+		return errors.Join(err, cerr)
+	}
 	return err
 }
 

@@ -4,23 +4,36 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// 默认加密成本（bcrypt 推荐值）
+// defaultCost is the framework default bcrypt cost.
 const defaultCost = 12
 
-// HashPassword 对密码进行加密
+func normalizeHashCost(cost int) int {
+	if cost < bcrypt.MinCost {
+		return bcrypt.MinCost
+	}
+	if cost > bcrypt.MaxCost {
+		return bcrypt.MaxCost
+	}
+	return cost
+}
+
+func normalizeUpgradeTargetCost(cost int) int {
+	if cost <= 0 || cost > bcrypt.MaxCost {
+		return defaultCost
+	}
+	return normalizeHashCost(cost)
+}
+
+// HashPassword hashes a plaintext password with the framework default cost.
 func HashPassword(password string) (string, error) {
 	return HashPasswordWithCost(password, defaultCost)
 }
 
-// HashPasswordWithCost 使用指定成本对密码进行加密
-// cost 范围: 4-31，值越大越安全但越慢
+// HashPasswordWithCost hashes a plaintext password with a bounded bcrypt cost.
+// Costs below bcrypt.MinCost are raised to bcrypt.MinCost, and costs above
+// bcrypt.MaxCost are lowered to bcrypt.MaxCost.
 func HashPasswordWithCost(password string, cost int) (string, error) {
-	if cost < bcrypt.MinCost {
-		cost = bcrypt.MinCost
-	}
-	if cost > bcrypt.MaxCost {
-		cost = bcrypt.MaxCost
-	}
+	cost = normalizeHashCost(cost)
 
 	bytes, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
@@ -29,23 +42,22 @@ func HashPasswordWithCost(password string, cost int) (string, error) {
 	return string(bytes), nil
 }
 
-// CheckPassword 验证密码是否匹配
-// hashedPassword 是加密后的密码，password 是明文密码
+// CheckPassword verifies whether hashedPassword matches the plaintext password.
 func CheckPassword(hashedPassword, password string) bool {
 	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
 	return err == nil
 }
 
-// CheckPasswordAndUpgrade 验证密码并在需要时升级加密成本
-// 返回：是否匹配、是否需要升级、升级后的密码、错误
+// CheckPasswordAndUpgrade verifies a password and rehashes it when the stored
+// cost is lower than the normalized target cost.
 func CheckPasswordAndUpgrade(hashedPassword, password string, targetCost int) (match bool, needUpgrade bool, newHash string, err error) {
-	// 验证密码
+	targetCost = normalizeUpgradeTargetCost(targetCost)
+
 	err = bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password))
 	if err != nil {
 		return false, false, "", err
 	}
 
-	// 检查是否需要升级
 	cost, err := bcrypt.Cost([]byte(hashedPassword))
 	if err != nil {
 		return true, false, "", nil
@@ -62,7 +74,7 @@ func CheckPasswordAndUpgrade(hashedPassword, password string, targetCost int) (m
 	return true, false, "", nil
 }
 
-// GetPasswordCost 获取加密密码的成本
+// GetPasswordCost returns the bcrypt cost encoded in hashedPassword.
 func GetPasswordCost(hashedPassword string) (int, error) {
 	return bcrypt.Cost([]byte(hashedPassword))
 }

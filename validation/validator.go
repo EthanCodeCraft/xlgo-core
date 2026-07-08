@@ -250,6 +250,10 @@ func validateIDCardChecksum(id string) bool {
 
 // ValidateStruct 验证结构体
 func ValidateStruct(s any) ValidationErrors {
+	if s == nil {
+		return nil
+	}
+
 	v := Validator.Load()
 	if v == nil {
 		InitValidator()

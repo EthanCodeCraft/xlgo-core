@@ -15,10 +15,10 @@ func TestValidatePassword(t *testing.T) {
 		valid    bool
 		msg      string
 	}{
-		{"Abc12345", true, ""},                    // 有效
+		{"Abc12345", true, ""},            // 有效
 		{"abc12345", false, "密码必须包含大写字母"}, // 缺大写
 		{"ABC12345", false, "密码必须包含小写字母"}, // 缺小写
-		{"Abcdefgh", false, "密码必须包含数字"},    // 缺数字
+		{"Abcdefgh", false, "密码必须包含数字"},   // 缺数字
 		{"Abc123", false, "密码长度不能少于8位"},   // 太短
 		{"", false, "密码长度不能少于8位"},         // 空
 	}
@@ -193,6 +193,25 @@ func TestCheckPasswordAndUpgrade(t *testing.T) {
 	}
 }
 
+func TestCheckPasswordAndUpgradeNormalizesInvalidTargetCost(t *testing.T) {
+	password := "testPassword123"
+	hash, err := validation.HashPasswordWithCost(password, 12)
+	if err != nil {
+		t.Fatalf("HashPasswordWithCost: %v", err)
+	}
+
+	match, needUpgrade, newHash, err := validation.CheckPasswordAndUpgrade(hash, password, bcrypt.MaxCost+1)
+	if err != nil {
+		t.Fatalf("CheckPasswordAndUpgrade with high target cost: %v", err)
+	}
+	if !match {
+		t.Fatal("Password should match")
+	}
+	if needUpgrade || newHash != "" {
+		t.Fatalf("invalid high target cost should normalize to default and avoid upgrade, needUpgrade=%v newHash=%q", needUpgrade, newHash)
+	}
+}
+
 func TestGetPasswordCost(t *testing.T) {
 	password := "testPassword123"
 	hash, _ := validation.HashPasswordWithCost(password, 12)
@@ -311,6 +330,10 @@ func TestValidateStruct(t *testing.T) {
 }
 
 func TestValidateStructNil(t *testing.T) {
+	if errors := validation.ValidateStruct(nil); errors != nil {
+		t.Fatalf("ValidateStruct(nil) = %v, want nil", errors)
+	}
+
 	// 空结构体
 	emptyUser := TestUser{}
 	errors := validation.ValidateStruct(emptyUser)
@@ -365,12 +388,12 @@ func TestValidateUsername(t *testing.T) {
 		username string
 		valid    bool
 	}{
-		{"abc123", true},       // 有效
-		{"Abc123", true},       // 有效（大写开头）
-		{"user_name", true},    // 有效（包含下划线）
-		{"123abc", false},      // 无效（数字开头）
-		{"ab", false},          // 无效（太短）
-		{"a!bc", false},        // 无效（特殊字符）
+		{"abc123", true},    // 有效
+		{"Abc123", true},    // 有效（大写开头）
+		{"user_name", true}, // 有效（包含下划线）
+		{"123abc", false},   // 无效（数字开头）
+		{"ab", false},       // 无效（太短）
+		{"a!bc", false},     // 无效（特殊字符）
 	}
 
 	for _, tt := range tests {

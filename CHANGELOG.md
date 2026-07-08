@@ -39,6 +39,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M10 分布式锁参数与未获锁语义修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`。
 - **M10 cache 剩余错误语义收口**：新增 `cache.ExistsE` 与可选 `CacheExistChecker`，让调用方能区分 key 不存在和 Redis/backend 故障；保留旧 `Exists` bool-only 兼容方法但记录后端错误；`KeyBuilder` 现在忽略 nil option，`WithPrefix` / `WithSeparator` / `WithCacheType` 直接作用于 nil builder 时 no-op，避免扩展配置路径 panic。
 - **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
+- **M15 utils/validation 资源与错误边界修复**：`HTTPClient.Upload` 改为流式 multipart 上传，不再把文件请求体完整缓存在内存中；`AppendFile` / `CopyFile` 返回写侧 `Close` 错误；`CheckPasswordAndUpgrade` 归一化非法 `targetCost`，避免异常配置触发超高 bcrypt cost；`ValidateStruct(nil)` 直接返回 nil。
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
 
 - **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
