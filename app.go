@@ -649,7 +649,7 @@ func (a *App) doInit() error {
 
 	if a.enableMySQL {
 		dbm := database.NewManager(cfg)
-		if err := dbm.InitDB(cfg); err != nil {
+		if err := dbm.InitDB(a.rootCtx, cfg); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
 		}
 		a.previousDB = database.SwapDefaultManager(dbm)

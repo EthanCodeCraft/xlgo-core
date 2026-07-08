@@ -86,6 +86,9 @@ type Manager struct {
 	replicas []*gorm.DB
 	picker   ReplicaPicker
 	mu       sync.Mutex
+	// opMu 串行化 InitDB / InitDBWithReplicas / Close 这类资源生命周期操作。
+	// 避免关闭已开始后初始化又发布新连接，或初始化发布后被并发 Close 置空。
+	opMu sync.Mutex
 
 	// #21 健康自愈
 	healthy          atomic.Bool   // 主库是否健康
@@ -206,6 +209,15 @@ func (m *Manager) initReplicaHealth() {
 	m.replicaHealthSet = true
 }
 
+// ensureReplicaHealthLocked 按当前 replicas 重建健康标记。调用方须持有 m.mu。
+func (m *Manager) ensureReplicaHealthLocked() {
+	m.replicaHealthy = make([]atomic.Bool, len(m.replicas))
+	for i := range m.replicaHealthy {
+		m.replicaHealthy[i].Store(true)
+	}
+	m.replicaHealthSet = true
+}
+
 // resetReplicaHealth 清空从库健康标记，使下次 initReplicaHealth 按新 replicas 长度重建。
 // 重建从库（InitDBWithReplicas）/Close 前必须调用，避免健康切片与新 replicas 长度错位（C11a）。
 // 调用方须持有 m.mu。
@@ -272,6 +284,9 @@ func (m *Manager) probeOnce(ctx context.Context, threshold int) {
 	m.mu.Lock()
 	replicas := make([]*gorm.DB, len(m.replicas))
 	copy(replicas, m.replicas)
+	if len(replicas) > 0 && !m.replicaHealthSet {
+		m.ensureReplicaHealthLocked()
+	}
 	healthSet := m.replicaHealthSet
 	replicaHealthy := m.replicaHealthy // 快照切片头，避免与 resetReplicaHealth 写竞争
 	m.mu.Unlock()
@@ -327,7 +342,7 @@ func (m *Manager) Open(ctx context.Context) error {
 	if cfg == nil {
 		return errors.New("数据库配置未设置")
 	}
-	return m.InitDB(cfg)
+	return m.InitDB(ctx, cfg)
 }
 
 // OpenWithReplicas 打开主库与从库连接
@@ -336,7 +351,7 @@ func (m *Manager) OpenWithReplicas(ctx context.Context, replicaDSNs []string) er
 	if cfg == nil {
 		return errors.New("数据库配置未设置")
 	}
-	return m.InitDBWithReplicas(cfg, replicaDSNs)
+	return m.InitDBWithReplicas(ctx, cfg, replicaDSNs)
 }
 
 // closeDB 关闭 gorm.DB 底层连接池。nil 或未初始化（无 ConnPool）时返回 nil，不 panic。
@@ -361,6 +376,8 @@ func warnCloseDB(db *gorm.DB, context string) {
 // Close 关闭主库与全部从库连接，并重置从库健康状态。
 // 字段置空在锁内完成（保证新读取得到 nil），实际关闭在锁外执行避免持锁阻塞。
 func (m *Manager) Close() error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	m.mu.Lock()
 	master := m.master
 	replicas := m.replicas
@@ -446,10 +463,21 @@ func GetDefaultManager() *Manager {
 	return DefaultManager.Load()
 }
 
-// InitDB 初始化数据库连接（带重试机制），驱动由配置决定
-func (m *Manager) InitDB(cfg *config.Config) error {
+// InitDB 初始化数据库连接（带重试机制），驱动由配置决定。
+// ctx 控制 Ping 与重试等待；调用方取消 ctx 时初始化会尽快返回。
+func (m *Manager) InitDB(ctx context.Context, cfg *config.Config) error {
+	ctx = normalizeContext(ctx)
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.initDB(ctx, cfg)
+}
+
+func (m *Manager) initDB(ctx context.Context, cfg *config.Config) error {
 	if cfg == nil {
 		return errors.New("数据库配置未设置")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("数据库初始化已取消: %w", err)
 	}
 	m.setCfg(cfg) // P1 #11：锁内写入，避免与 StartProbing/Open 读竞态
 
@@ -471,6 +499,9 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 
 	var lastErr error
 	for i := range maxRetries {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("数据库初始化已取消: %w", err)
+		}
 		// 连接主库：先打开到局部变量，仅 Ping 成功后才安装为 m.master，
 		// 避免 Ping 失败时下轮覆盖 m.master 泄漏旧池（C11b）。
 		db, err := gorm.Open(Dialector(cfg), gormConfig)
@@ -493,7 +524,7 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 					sqlDB.SetConnMaxIdleTime(cfg.Database.ConnMaxIdleTime)
 				}
 
-				if err := sqlDB.Ping(); err == nil {
+				if err := sqlDB.PingContext(ctx); err == nil {
 					// 成功：安装为新主库，关闭旧主库池（重建路径覆盖前先释放旧资源，C11b）
 					m.mu.Lock()
 					old := m.master
@@ -515,7 +546,14 @@ func (m *Manager) InitDB(cfg *config.Config) error {
 		}
 
 		logger.Warnf("数据库连接失败，第 %d/%d 次重试: %v", i+1, maxRetries, lastErr)
-		time.Sleep(retryDelay)
+		if i == maxRetries-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("数据库初始化已取消: %w", ctx.Err())
+		case <-time.After(retryDelay):
+		}
 		retryDelay *= 2
 		if retryDelay > 30*time.Second {
 			retryDelay = 30 * time.Second
@@ -572,12 +610,15 @@ func replicaMaxOpenConns(masterMax int) int {
 
 // InitDBWithReplicas 初始化数据库主从连接，驱动由配置决定
 // replicaDSNs: 从库连接字符串列表（需与主库驱动匹配）
-func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) error {
+func (m *Manager) InitDBWithReplicas(ctx context.Context, cfg *config.Config, replicaDSNs []string) error {
+	ctx = normalizeContext(ctx)
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	if cfg == nil {
 		return errors.New("数据库配置未设置")
 	}
 	// 先初始化主库
-	if err := m.InitDB(cfg); err != nil {
+	if err := m.initDB(ctx, cfg); err != nil {
 		return err
 	}
 
@@ -607,6 +648,12 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 		// 先构建到局部切片，全部成功后再安装，避免部分构建期间外部读到中间态
 		var newReplicas []*gorm.DB
 		for i, dsn := range replicaDSNs {
+			if err := ctx.Err(); err != nil {
+				for _, r := range newReplicas {
+					warnCloseDB(r, "关闭已打开的数据库从库连接池失败")
+				}
+				return fmt.Errorf("数据库从库初始化已取消: %w", err)
+			}
 			replicaDB, err := gorm.Open(dialectorForDSN(cfg.Database.Driver, dsn), gormConfig)
 			if err != nil {
 				logger.Warnf("数据库从库 %d 连接失败: %v", i+1, err)
@@ -629,7 +676,7 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 			sqlDB.SetMaxOpenConns(replicaMaxOpenConns(cfg.Database.MaxOpenConns))
 			sqlDB.SetConnMaxLifetime(time.Hour)
 
-			if err := sqlDB.Ping(); err != nil {
+			if err := sqlDB.PingContext(ctx); err != nil {
 				logger.Warnf("数据库从库 %d Ping 失败: %v", i+1, err)
 				warnCloseDB(replicaDB, "关闭 Ping 失败的数据库从库连接池失败") // C11c: 关闭刚打开的池避免泄漏
 				continue
@@ -641,20 +688,21 @@ func (m *Manager) InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) e
 
 		m.mu.Lock()
 		m.replicas = newReplicas
+		m.ensureReplicaHealthLocked()
 		m.mu.Unlock()
 	}
 
 	return nil
 }
 
-// InitDB 初始化数据库连接（带重试机制），驱动由配置决定
-func InitDB(cfg *config.Config) error {
-	return DefaultManager.Load().InitDB(cfg)
+// InitDB 初始化数据库连接（带重试机制），驱动由配置决定。
+func InitDB(ctx context.Context, cfg *config.Config) error {
+	return DefaultManager.Load().InitDB(ctx, cfg)
 }
 
 // InitDBWithReplicas 初始化数据库主从连接，驱动由配置决定
-func InitDBWithReplicas(cfg *config.Config, replicaDSNs []string) error {
-	return DefaultManager.Load().InitDBWithReplicas(cfg, replicaDSNs)
+func InitDBWithReplicas(ctx context.Context, cfg *config.Config, replicaDSNs []string) error {
+	return DefaultManager.Load().InitDBWithReplicas(ctx, cfg, replicaDSNs)
 }
 
 // GetReadDB 获取读库实例（按策略选择从库）
@@ -764,7 +812,7 @@ func TransactionWithContext(ctx context.Context, fn func(tx *gorm.DB) error) err
 	return db.WithContext(ctx).Transaction(fn)
 }
 
-// ReadQuery 读查询（自动路由到从库）
+// ReadQuery 读查询。遵循 ctx 中的数据库路由标记；未指定时默认走从库。
 func ReadQuery(ctx context.Context, model any, query string, args ...any) error {
 	ctx = normalizeContext(ctx)
 	db := GetDBFromContext(ctx)
@@ -801,9 +849,10 @@ func pingWithTimeout(sqlDB *sql.DB, parent context.Context) error {
 func HealthCheck() map[string]bool {
 	result := make(map[string]bool)
 	ctx := context.Background()
+	m := DefaultManager.Load()
 
 	// 检查主库
-	if master := DefaultManager.Load().Master(); master != nil {
+	if master := m.Master(); master != nil {
 		sqlDB, err := master.DB()
 		if err == nil && pingWithTimeout(sqlDB, ctx) == nil {
 			result["master"] = true
@@ -815,7 +864,7 @@ func HealthCheck() map[string]bool {
 	}
 
 	// 检查从库
-	for i, replica := range DefaultManager.Load().Replicas() {
+	for i, replica := range m.Replicas() {
 		if replica != nil {
 			sqlDB, err := replica.DB()
 			if err == nil && pingWithTimeout(sqlDB, ctx) == nil {

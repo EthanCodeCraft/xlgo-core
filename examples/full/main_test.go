@@ -48,7 +48,7 @@ func setupExampleRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	}
 
 	mgr := database.NewManager(cfg)
-	if err := mgr.InitDB(cfg); err != nil {
+	if err := mgr.InitDB(context.Background(), cfg); err != nil {
 		t.Fatalf("初始化测试数据库失败: %v", err)
 	}
 	db := mgr.Master()

@@ -148,16 +148,16 @@ func TestNilContextHelpersDoNotPanic(t *testing.T) {
 
 func TestNilConfigInitializationReturnsError(t *testing.T) {
 	mgr := database.NewManager(nil)
-	if err := mgr.InitDB(nil); err == nil {
+	if err := mgr.InitDB(context.Background(), nil); err == nil {
 		t.Fatal("InitDB(nil) 应返回错误")
 	}
-	if err := mgr.InitDBWithReplicas(nil, nil); err == nil {
+	if err := mgr.InitDBWithReplicas(context.Background(), nil, nil); err == nil {
 		t.Fatal("InitDBWithReplicas(nil) 应返回错误")
 	}
-	if err := database.InitDB(nil); err == nil {
+	if err := database.InitDB(context.Background(), nil); err == nil {
 		t.Fatal("包级 InitDB(nil) 应返回错误")
 	}
-	if err := database.InitDBWithReplicas(nil, nil); err == nil {
+	if err := database.InitDBWithReplicas(context.Background(), nil, nil); err == nil {
 		t.Fatal("包级 InitDBWithReplicas(nil) 应返回错误")
 	}
 }

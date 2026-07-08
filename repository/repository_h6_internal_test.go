@@ -403,7 +403,7 @@ func setupH6Manager(t *testing.T) (masterFile, replicaFile string) {
 	cfg.Database.Driver = "sqlite"
 	cfg.Database.CustomDSN = masterFile
 
-	if err := database.InitDBWithReplicas(cfg, []string{replicaFile}); err != nil {
+	if err := database.InitDBWithReplicas(context.Background(), cfg, []string{replicaFile}); err != nil {
 		t.Fatalf("InitDBWithReplicas: %v", err)
 	}
 	if err := database.GetWriteDB().AutoMigrate(&h6User{}); err != nil {

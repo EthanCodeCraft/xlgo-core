@@ -2,13 +2,17 @@ package database
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/logger"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 )
 
 func init() {
@@ -128,6 +132,25 @@ func TestC11ReplicaHealthResetOnRebuild(t *testing.T) {
 		if !m.replicaHealthy[i].Load() {
 			t.Fatal("re-init should mark all replicas healthy")
 		}
+	}
+}
+
+func TestM4ProbeOnceReinitializesReplicaHealthAfterRebuild(t *testing.T) {
+	m := &Manager{picker: &RandomPicker{}}
+	m.mu.Lock()
+	m.replicas = []*gorm.DB{sentinelDB(), sentinelDB()}
+	m.resetReplicaHealth()
+	m.mu.Unlock()
+
+	m.probeOnce(context.Background(), 1)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.replicaHealthSet {
+		t.Fatal("probeOnce 应在从库重建后自动重建健康标记")
+	}
+	if len(m.replicaHealthy) != 2 {
+		t.Fatalf("健康标记长度应与从库数量一致，实际 %d", len(m.replicaHealthy))
 	}
 }
 
@@ -306,5 +329,76 @@ func TestSwapDefaultManagerPreservesReplacedManager(t *testing.T) {
 	defer old.mu.Unlock()
 	if old.master == nil || len(old.replicas) != 1 {
 		t.Fatal("SwapDefaultManager 不应关闭旧 manager，旧资源需可用于失败回滚")
+	}
+}
+
+type transientDialector struct{}
+
+func (d transientDialector) Name() string { return "m4_transient" }
+
+func (d transientDialector) Initialize(*gorm.DB) error {
+	return errors.New("temporary connection failure")
+}
+
+func (d transientDialector) Migrator(*gorm.DB) gorm.Migrator { return nil }
+
+func (d transientDialector) DataTypeOf(*schema.Field) string { return "" }
+
+func (d transientDialector) DefaultValueOf(*schema.Field) clause.Expression { return nil }
+
+func (d transientDialector) BindVarTo(clause.Writer, *gorm.Statement, any) {}
+
+func (d transientDialector) QuoteTo(writer clause.Writer, str string) {
+	_, _ = writer.WriteString(str)
+}
+
+func (d transientDialector) Explain(sql string, _ ...any) string { return sql }
+
+func TestM4InitDBHonorsContextDuringRetrySleep(t *testing.T) {
+	const driver = "m4_transient_retry"
+	RegisterDialect(DialectSpec{
+		Name:      driver,
+		Dialector: func(string) gorm.Dialector { return transientDialector{} },
+		DSN:       func(*config.DatabaseConfig) string { return "m4://retry" },
+	})
+
+	m := NewManager(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	err := m.InitDB(ctx, &config.Config{Database: config.DatabaseConfig{Driver: driver}})
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("InitDB 应返回 context.Canceled，实际: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("InitDB 不应等待完整 retry sleep，耗时 %s", elapsed)
+	}
+}
+
+func TestM4CloseWaitsForLifecycleOperation(t *testing.T) {
+	m := NewManager(nil)
+	m.opMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		_ = m.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("Close 不应越过正在执行的生命周期操作")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	m.opMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("释放生命周期锁后 Close 未返回")
 	}
 }

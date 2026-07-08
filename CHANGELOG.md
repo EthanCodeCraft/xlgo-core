@@ -28,6 +28,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`config.Set()` / `(*config.Manager).Set()` 现在返回 `error`**：非 nil 配置会先执行 `Validate()`，非法配置不会覆盖旧配置，并返回 `ErrInvalidConfig` 包装错误。旧代码可以继续忽略返回值，但建议测试和启动路径显式检查。
 - **`config.GetViper()` / `(*config.Manager).GetViper()` 改为返回 viper 快照**：旧行为暴露内部可变 `*viper.Viper`；现在修改返回对象不会影响全局配置。常规读取请使用 `GetString` / `GetInt` / `GetBool` / `GetStringMap`。
 - **未知数据库 driver 不再静默回退 MySQL**：`config.DatabaseConfig.DSN()` 对非空但未注册的 `driver` 返回空字符串，`database.Dialector` 返回初始化即失败的 Dialector；空 `driver` 仍保持默认 MySQL。下游若使用自定义数据库驱动，需先通过 `database.RegisterDialect` 或 `config.RegisterDSNBuilder` 注册。
+- **`database.InitDB` / `(*database.Manager).InitDB` / `InitDBWithReplicas` 必须显式传入 `context.Context`**：旧 API 无法取消初始化过程中的 Ping 与重试等待，shutdown 或启动失败回滚时可能长时间卡住。现在调用方必须传入生命周期 ctx；普通测试或一次性脚本可使用 `context.Background()`，App 初始化会使用 App root ctx。
 - **`database.SetDefaultManager` / `database.SetDefaultRedisManager` 会关闭被替换的旧 manager**：旧行为只做 atomic 替换，直接调用会遗留旧 DB/Redis 连接池。现在普通 Set 表示“接管全局默认资源并释放旧资源”；需要失败回滚或延迟释放旧资源的初始化流程请改用新增 `database.SwapDefaultManager` / `database.SwapDefaultRedisManager`。
 - **`jwt.ParseToken` 开始校验 issuer，`RefreshToken` 使用 `jwt.refresh_expire`**：签发者与当前配置不一致的 token 会被拒绝；刷新后的 token 过期时间优先使用 `refresh_expire`，未配置时回退 `expire`。`GenerateTokenWithCustomExpiry` 现在拒绝非正过期时间，`InvalidateTokenByID("")` 返回 `ErrEmptyJTI`。
 - **`App.Init()` 由 `sync.Once` 改为生命周期状态机**（app.go，M1）：5 态 `stateCreated/Initializing/Initialized/Stopping/Stopped` + `lifecycleMu`(RWMutex) + `initMu`(Mutex)。`Shutdown` 后或 `Init` 失败后再调 `Init()` 返回新增导出错误 **`xlgo.ErrAppClosed`**（原 `sync.Once` "多次调用返回首次结果"语义不再适用——已关闭的 App 不可再 Init，需新建 App）。
@@ -47,8 +48,9 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M10 分布式锁参数与取消传播修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`；`WithLock` / `WithLockAutoExtend` 现在把调用方 ctx 传入业务函数，避免取消后业务函数继续运行。
 - **M10 cache 剩余错误语义收口**：新增 `cache.ExistsE` 与可选 `CacheExistChecker`，让调用方能区分 key 不存在和 Redis/backend 故障；保留旧 `Exists` bool-only 兼容方法但记录后端错误；`KeyBuilder` 现在忽略 nil option，`WithPrefix` / `WithSeparator` / `WithCacheType` 直接作用于 nil builder 时 no-op，避免扩展配置路径 panic。
 - **M2 config 热重载生命周期修复**：`StopWatcher` 会等待已触发的 reload/回调结束；包级 `Load` / `LoadWithWatch` 只有在新配置成功加载并启动 watcher 后才替换默认 manager，失败时保留旧 watcher；`SetDefaultManager` 会停止旧 manager 的 watcher，避免全局置换后遗留 goroutine；数据库配置出现字段时会校验 driver/host/name/port，未知 driver 不再静默回退 MySQL，`database.Dialector` 对未知 driver fail-closed；MySQL DSN 转义用户名/库名，Postgres DSN 统一转义字符串字段。
-- **M4 database nil 边界修复**：`InitDB(nil)` / `InitDBWithReplicas(nil, ...)` / `InitRedis(nil)` 现在返回中文错误，不再空指针 panic；`UseMaster(nil)` / `UseReplica(nil)` / `GetDBFromContext(nil)` / `WithTx(nil, ...)` / `TxFromContext(nil)` / `TransactionWithContext(nil, ...)` / `ReadQuery(nil, ...)` / `WriteQuery(nil, ...)` / Redis health check 会把 nil context 归一化为 `context.Background()`，避免异常调用路径触发 panic；`Dialector(nil)` 安全回退到 MySQL 空 DSN。
+- **M4 database nil 边界修复**：`InitDB(ctx, nil)` / `InitDBWithReplicas(ctx, nil, ...)` / `InitRedis(nil)` 现在返回中文错误，不再空指针 panic；`UseMaster(nil)` / `UseReplica(nil)` / `GetDBFromContext(nil)` / `WithTx(nil, ...)` / `TxFromContext(nil)` / `TransactionWithContext(nil, ...)` / `ReadQuery(nil, ...)` / `WriteQuery(nil, ...)` / Redis health check 会把 nil context 归一化为 `context.Background()`，避免异常调用路径触发 panic；`Dialector(nil)` 安全回退到 MySQL 空 DSN。
 - **M4 database 全局置换资源释放修复**：`SetDefaultManager` / `SetDefaultRedisManager` 替换全局默认 manager 时会关闭旧 DB/Redis manager，避免包级默认资源反复置换后连接池泄漏；App 初始化改用 `SwapDefaultManager` / `SwapDefaultRedisManager` 暂存旧资源，保证失败回滚仍能恢复旧默认资源。
+- **M4 database 初始化生命周期修复**：DB 初始化与主从库初始化统一接收 ctx，主库/从库 Ping 使用 `PingContext`，重试等待改为 `select ctx.Done()/time.After`；`Manager` 用生命周期锁串行化 Init/Close，避免 shutdown 与运行期重建交错；运行期重建从库后会立即重建健康标记，探活循环也能在发现健康标记缺失时自愈；包级 `HealthCheck()` 固定读取一次默认 manager 快照。
 - **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
 - **M15 utils/validation 资源与错误边界修复**：`HTTPClient.Upload` 改为流式 multipart 上传，不再把文件请求体完整缓存在内存中；`AppendFile` / `CopyFile` 返回写侧 `Close` 错误；`CheckPasswordAndUpgrade` 归一化非法 `targetCost`，避免异常配置触发超高 bcrypt cost；`ValidateStruct(nil)` 直接返回 nil。
 - **M16 测试工具、脚手架与示例闭环修复**：`MockDB` / `MockCache` / `MockStorage` 改为并发安全；`MockCache` 与 `MockStorage.UploadFromBytes` 复制字节切片，避免调用方修改污染内部状态；`MockStorage` 拒绝 nil 文件与超过 32MiB 的输入，避免测试 helper 被误用成无上限内存缓冲；`xlgo make` 对资源名做显式标识符校验，非法名称（路径穿越、连字符、数字开头等）直接返回中文错误，不再静默转义后生成不可预期代码；`examples/full` 启动时初始化 `alice/secret`，登录校验 bcrypt 哈希，创建用户也保存哈希，避免示例首次运行无法登录或传播不验密/明文密码模式；README/GUIDE 限流示例不再引用不存在的 `handler.Login` / `handler.Upload`。
@@ -743,8 +745,8 @@ database.InitMySQL(cfg)
 database.InitMySQLWithReplicas(cfg, replicas)
 
 // ✅ 新（驱动由 cfg.Database.Driver 决定，可以是 mysql / postgres / 自定义注册的方言）
-database.InitDB(cfg)
-database.InitDBWithReplicas(cfg, replicas)
+database.InitDB(ctx, cfg)
+database.InitDBWithReplicas(ctx, cfg, replicas)
 ```
 
 **为什么现在动手**：
