@@ -117,6 +117,54 @@ func TestAppShutdownIdempotent_M1(t *testing.T) {
 // TestAppInitFailureRollsBackCron_M1（Edge 3 + 资源回滚）：Init 失败（OnInit hook 报错）时，
 // 已 cron.Start() 的全局调度器必须被 failAfterInit 停止，canary 任务不再触发。
 // 修复前：Init 失败不停 cron → canary 在下个 1s tick 跑 → ran > 0。
+// TestAppShutdownTimeoutCoversOnStop_M1 回归：OnStop 必须受 server.shutdown_timeout 约束。
+// 修复前：OnStop 同步执行且不看超时，阻塞 hook 会拖死 Shutdown。
+func TestAppShutdownTimeoutCoversOnStop_M1(t *testing.T) {
+	cfg := testConfig(18105)
+	cfg.Server.ShutdownTimeout = 30 * time.Millisecond
+	release := make(chan struct{})
+	defer close(release)
+
+	app := xlgo.New(
+		xlgo.WithConfig(cfg),
+		xlgo.WithHook(xlgo.Hook{Name: "slow-stop", OnStop: func(*xlgo.App) error {
+			<-release
+			return nil
+		}}),
+	)
+	if err := app.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	start := time.Now()
+	err := app.Shutdown()
+	if err == nil || !strings.Contains(err.Error(), "OnStop hook") {
+		t.Fatalf("Shutdown err = %v, want OnStop timeout error", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Shutdown took %s, OnStop timeout did not bound shutdown", elapsed)
+	}
+}
+
+// TestWithConfigClonesAndValidates_M1 回归：WithConfig 捕获私有快照，并在 Init 时校验。
+func TestWithConfigClonesAndValidates_M1(t *testing.T) {
+	cfg := testConfig(18106)
+	app := xlgo.New(xlgo.WithConfig(cfg))
+	cfg.Server.Port = -1 // 不应污染 App 内部快照
+	if err := app.Init(); err != nil {
+		t.Fatalf("Init with cloned config failed after caller mutation: %v", err)
+	}
+	if err := app.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	bad := testConfig(-1)
+	err := xlgo.New(xlgo.WithConfig(bad)).Init()
+	if err == nil || !strings.Contains(err.Error(), "配置校验失败") {
+		t.Fatalf("Init with invalid WithConfig err = %v, want validation error", err)
+	}
+}
+
 func TestAppInitFailureRollsBackCron_M1(t *testing.T) {
 	cron.StopGlobalWithTimeout(time.Second) // 清前序残留
 	t.Cleanup(func() {

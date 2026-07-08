@@ -1666,12 +1666,12 @@ func TestUserAPI(t *testing.T) {
         WithJSON(map[string]any{"name": "test"}).
         Execute()
     resp.AssertOK(t)
-    resp.AssertCode(t, 1)
+    resp.AssertJSONContains(t, "code", float64(1))
 
     // GET请求
     resp = test.GET(router, "/api/users/1").Execute()
     resp.AssertOK(t)
-    resp.AssertJSONKeyExists(t, "data.id")
+    resp.AssertJSONContains(t, "data.id", float64(1))
 }
 ```
 

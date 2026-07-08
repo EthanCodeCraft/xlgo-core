@@ -42,7 +42,7 @@ type Migrator func(*gorm.DB) error
 //   - OnInit:  Init() 内组件初始化完成后、路由注册前
 //   - OnStart: StartServer() 监听端口前
 //   - OnReady: 端口就绪后（已开始接受连接）
-//   - OnStop:  Shutdown() 开头，关 HTTP 之前
+//   - OnStop:  Shutdown() 开头，关 HTTP 之前，受 server.shutdown_timeout 约束
 //
 // OnInit/OnStart/OnReady/OnStop 返回 error 会中断流程并向上返回。
 // A2 修复：OnReady 改为返回 error，失败时触发 shutdown。
@@ -152,11 +152,12 @@ func WithConfigPath(path string) Option {
 }
 
 // WithConfig 设置配置对象。
-// A3 修复：不再调用 config.Set(cfg)，配置仅保留在 App 实例内，不污染全局状态。
+// 配置会在传入时深拷贝成 App 私有快照，并在 Init 时 Validate；调用方后续修改 cfg
+// 不会污染 App 内部配置。不再调用 config.Set(cfg)，配置仅保留在 App 实例内，不污染全局状态。
 // 依赖 config.Get() 获取注入配置的下游代码请改用 WithConfigPath。
 func WithConfig(cfg *config.Config) Option {
 	return func(a *App) {
-		a.config = cfg
+		a.config = cfg.Clone()
 	}
 }
 
@@ -605,6 +606,25 @@ func (a *App) shutdownAfterStartFailure(startErr error) error {
 	return startErr
 }
 
+func (a *App) runOnStopHook(ctx context.Context, h Hook) error {
+	if h.OnStop == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- h.OnStop(a)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			return fmt.Errorf("OnStop hook %q 失败: %w", h.Name, err)
+		}
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("OnStop hook %q 超时: %w", h.Name, ctx.Err())
+	}
+}
+
 // doInit 执行实际初始化流程。仅在 Init 持有 initMu 并完成状态切换后调用，不可直接调用。
 func (a *App) doInit() error {
 	cfg, err := a.resolveConfig()
@@ -759,7 +779,12 @@ func (a *App) doInit() error {
 
 func (a *App) resolveConfig() (*config.Config, error) {
 	if a.config != nil {
-		return a.config, nil
+		cfg := a.config.Clone()
+		if err := cfg.Validate(); err != nil {
+			return nil, fmt.Errorf("配置校验失败: %w", err)
+		}
+		a.config = cfg
+		return cfg, nil
 	}
 	if a.configManager == nil && a.configPath != "" {
 		a.configManager = config.NewManager(a.configPath)
@@ -941,6 +966,7 @@ func (a *App) Shutdown() error {
 // 顺序（M1 调整）：OnStop（仅 Init 曾成功时）→ cancel rootCtx → server.Shutdown →
 // wg.Wait → cron / 限流器 / db / redis / logger。OnStop 在 shutdown 开头、关 HTTP 之前，
 // 保有 cancel 前协调资源的机会；state=Stopping 已阻新 Go，无需先 cancel/wait 再跑 hook。
+// OnStop 也受同一个 shutdownTimeout 预算约束，避免 hook 卡死拖住整个进程退出。
 func (a *App) doShutdown(wasInitialized bool) error {
 	shutdownTimeout := 30 * time.Second
 	if a.config != nil {
@@ -955,9 +981,10 @@ func (a *App) doShutdown(wasInitialized bool) error {
 	// Init 失败/未 Init 时 HTTP 从未启动，OnStop 语义不适用。
 	if wasInitialized {
 		for _, h := range a.hooks {
-			if h.OnStop != nil {
-				if err := h.OnStop(a); err != nil {
-					errs = append(errs, fmt.Errorf("OnStop hook %q 失败: %w", h.Name, err))
+			if err := a.runOnStopHook(ctx, h); err != nil {
+				errs = append(errs, err)
+				if ctx.Err() != nil {
+					break
 				}
 			}
 		}

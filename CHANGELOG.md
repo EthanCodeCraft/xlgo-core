@@ -32,6 +32,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`App.Init()` 由 `sync.Once` 改为生命周期状态机**（app.go，M1）：5 态 `stateCreated/Initializing/Initialized/Stopping/Stopped` + `lifecycleMu`(RWMutex) + `initMu`(Mutex)。`Shutdown` 后或 `Init` 失败后再调 `Init()` 返回新增导出错误 **`xlgo.ErrAppClosed`**（原 `sync.Once` "多次调用返回首次结果"语义不再适用——已关闭的 App 不可再 Init，需新建 App）。
 - **`App.Go()` 在 Shutdown 开始或 Init 失败后为 no-op**（app.go，M1）：`state >= stateStopping` 时拒绝 `wg.Add` 直接返回，避免与 `Shutdown` 的 `wg.Wait` 竞争 `sync.WaitGroup` 契约（Add 须 happen-before Wait）。依赖"Shutdown 后仍可 Go"的下游需改用独立 goroutine。
 - **生命周期 hook 不允许重入调用 `Init`/`Shutdown`/`Run`**（app.go，M1）：`initMu` 非重入，hook（OnInit/OnStart/OnReady/OnStop）内调用会自锁死锁。需在 hook 内触发关闭应改用信号通道由主流程处理。
+- **`xlgo.WithConfig(cfg)` 改为快照语义并在 `Init` 时校验**（app.go，M1）：传入配置会深拷贝到 App 私有快照，调用方后续修改原 `cfg` 不再影响 App；非法配置在 `Init` 返回中文校验错误。依赖“修改原 cfg 指针动态影响 App”的下游需改为重新创建 App 或使用配置管理器。
 - **`logger.DefaultLogger = m` 直接赋值不再驱动包级 facade**（logger/logger.go，M3）：为消除 `SetDefaultLogManager()` 与包级 facade 并发读取默认 manager 的裸全局指针竞态，facade 改为读取内部 atomic 快照。`logger.DefaultLogger` 仍保持 `*LogManager` 类型，旧的 `logger.DefaultLogger.Init/Close/SetLevel/GetLevel` 直接调用仍可用；替换默认 manager 请使用 `logger.SetDefaultLogManager(m)`。
 - **`logger.Init` 拒绝明显非法日志配置**（logger/logger.go，M3）：空日志目录、负数 `MaxSize/MaxBackups/MaxAge` 现在直接返回错误。依赖零值日志配置启动 `WithLogger()` 的下游需显式设置 `Log.Dir` 与非负轮转参数。
 - **限流器非法配置改为 fail-fast**（middleware/ratelimit.go，M8）：`NewRateLimiter` / `NewRedisRateLimiter` / `NewRedisRateLimiterFailClosed` 现在对 `rate <= 0` 或 `window <= 0` 直接 panic，避免零值窗口/零值配额静默产生不确定限流语义。下游应在配置加载阶段校验限流参数。
@@ -50,6 +51,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **M11 SSE 换行注入修复**：`WriteEvent` 拒绝带 CR/LF 的 event 名，`WriteMessage` / `WriteEvent` 的 data 按 SSE 多行格式逐行输出，避免用户数据伪造额外 `event:`/`id:` 字段。
 - **M15 utils/validation 资源与错误边界修复**：`HTTPClient.Upload` 改为流式 multipart 上传，不再把文件请求体完整缓存在内存中；`AppendFile` / `CopyFile` 返回写侧 `Close` 错误；`CheckPasswordAndUpgrade` 归一化非法 `targetCost`，避免异常配置触发超高 bcrypt cost；`ValidateStruct(nil)` 直接返回 nil。
 - **M16 测试工具、脚手架与示例闭环修复**：`MockDB` / `MockCache` / `MockStorage` 改为并发安全；`MockCache` 与 `MockStorage.UploadFromBytes` 复制字节切片，避免调用方修改污染内部状态；`MockStorage` 拒绝 nil 文件与超过 32MiB 的输入，避免测试 helper 被误用成无上限内存缓冲；`xlgo make` 对资源名做显式标识符校验，非法名称（路径穿越、连字符、数字开头等）直接返回中文错误，不再静默转义后生成不可预期代码；`examples/full` 启动时初始化 `alice/secret`，登录校验 bcrypt 哈希，创建用户也保存哈希，避免示例首次运行无法登录或传播不验密/明文密码模式；README/GUIDE 限流示例不再引用不存在的 `handler.Login` / `handler.Upload`。
+- **M16 GUIDE/test API 不一致修复**：GUIDE 测试示例不再调用不存在的 `AssertCode` / `AssertJSONKeyExists`，统一改用现有 `AssertJSONContains`，避免照文档编写测试直接编译失败。
 - **M12 storage/compress 安全边界修复**：本地上传写侧 `Close` 错误会通过返回值暴露并清理残片；OSS `GetSignedURL` 统一经过 object key 净化；`UnzipWithOptions` 解析目标绝对路径失败时 fail-closed。
 
 - **M13 cron handler panic 未 recover 崩进程**（cron/cron.go）：`RunTask` 与 `checkAndRun` 调度 goroutine 统一经新增 `executeTask(t)` 边界 `recover`，panic 转为 error（含 `debug.Stack` 调用栈）记入 `task.LastError` 并向上返回，不再终止进程。外侧 `defer wg.Done()`/`running` 守卫释放不受影响（recover 在边界内完成）。顺带修复 `RunTask` 手动路径此前只更 `LastRun/RunCount`、不记 `LastError` 的子问题（现与调度路径一致）。
@@ -61,7 +63,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
   - **Init 失败无资源回滚** → 新增 `failAfterInit`：markStopping → cancel rootCtx → wg.Wait(10s) → cron 5s 显式超时停止 → `closeResources` 幂等关闭 db/redis/logger，回滚错误 `errors.Join` 进 `initErr` 不吞；先停 goroutine 再关资源，避免"关 DB 时探活 goroutine 仍在用"的竞态。
   - **App.Go 与 wg.Wait race** → `lifecycleMu.RLock` 包住 `wg.Add`，`Shutdown` 持写锁翻 `stateStopping`，保证 Add happens-before Wait。
   - **Shutdown 非幂等/非并发安全** → `shutdownOnce` 保证 `doShutdown` 单次执行，并发调用者返回同一 `shutdownErr`。
-  - **OnStop 语义** → 仅 `Init` 曾成功（`wasInitialized`）时在 `doShutdown` 开头执行；Init 失败/未 Init 时 HTTP 从未启动，OnStop 跳过。
+  - **OnStop 语义与超时** → 仅 `Init` 曾成功（`wasInitialized`）时在 `doShutdown` 开头执行；Init 失败/未 Init 时 HTTP 从未启动，OnStop 跳过。OnStop 现在受 `server.shutdown_timeout` 同一预算约束，阻塞 hook 不再无限拖住 Shutdown。
   - **资源所有权** → App 只关闭自己成功初始化过的 logger/db/redis/cron，避免一个 Init 失败的新 App 关闭同进程既有全局资源。
   - **复审补强：资源替换事务边界** → App 初始化 logger/db/redis 时先创建 App-owned manager 并保存旧默认 manager 快照；OnInit 或后续步骤失败时恢复旧默认 manager 并关闭新资源，完整成功后才释放旧资源，避免“新 App Init 失败”破坏同进程既有全局 logger/db/redis。
   - **复审补强：health/probing 绑定 App-owned manager** → App 注册的 MySQL/Redis health check 与 DB probing 使用本 App 持有的 manager，不随后续全局默认 manager 替换漂移。
