@@ -496,6 +496,11 @@ func (m *Manager) initDB(ctx context.Context, cfg *config.Config) error {
 
 	gormConfig := &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormLogLevel),
+		// H-db-1：禁用 gorm.Open 的自动 Ping（gorm.go:204，ConnPool 为 *sql.DB 时会调
+		// pinger.Ping() 无超时）。挂起 DB（连接活但不响应）下该 Ping 无 ctx deadline 无限阻塞，
+		// 发生在 initDB 的 pingWithTimeout 之前，使启动卡死。框架改用 pingWithTimeout（3s）自管
+		// 启动 ping，故禁用 gorm 无超时自动 ping。InitDBWithReplicas 的 replica 路径同理。
+		DisableAutomaticPing: true,
 	}
 
 	// M-config-2：MySQL 启用 TLS 且配置自定义 CA 时，注册命名 TLS 配置，使 DSN 中 tls=<name> 生效。
@@ -655,6 +660,8 @@ func (m *Manager) InitDBWithReplicas(ctx context.Context, cfg *config.Config, re
 
 		gormConfig := &gorm.Config{
 			Logger: gormlogger.Default.LogMode(gormLogLevel),
+			// H-db-1：禁用 gorm.Open 自动 Ping（同 initDB），框架用 pingWithTimeout 自管 replica 启动 ping。
+			DisableAutomaticPing: true,
 		}
 
 		// 先构建到局部切片，全部成功后再安装，避免部分构建期间外部读到中间态

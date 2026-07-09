@@ -68,6 +68,19 @@ func GetDefaultRedisManager() *RedisManager {
 	return DefaultRedis.Load()
 }
 
+// newRedisClient 构造带 D7 超时（Dial 5s / Read 3s / Write 3s）的 redis.Client。
+// 由 Init 与测试共用，确保所有 client 实例一致具备超时约束（挂起 Redis 不无限阻塞）。
+func newRedisClient(addr, password string, db int) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		DialTimeout:  5 * time.Second, // D7 修复：连接超时
+		ReadTimeout:  3 * time.Second, // D7 修复：读超时（约束 HealthCheck Ping 不被挂起 Redis 阻塞）
+		WriteTimeout: 3 * time.Second, // D7 修复：写超时
+	})
+}
+
 // Init 初始化 Redis 连接并 ping 验证。
 func (m *RedisManager) Init(cfg *config.Config) error {
 	if cfg == nil {
@@ -76,14 +89,7 @@ func (m *RedisManager) Init(cfg *config.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	client := redis.NewClient(&redis.Options{
-		Addr:         cfg.Redis.Addr(),
-		Password:     cfg.Redis.Password,
-		DB:           cfg.Redis.DB,
-		DialTimeout:  5 * time.Second, // D7 修复：连接超时
-		ReadTimeout:  3 * time.Second, // D7 修复：读超时
-		WriteTimeout: 3 * time.Second, // D7 修复：写超时
-	})
+	client := newRedisClient(cfg.Redis.Addr(), cfg.Redis.Password, cfg.Redis.DB)
 
 	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

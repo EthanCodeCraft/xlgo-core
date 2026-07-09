@@ -10,7 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EthanCodeCraft/xlgo-core/config"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"gorm.io/gorm/schema"
 )
 
 // hungDriver 是测试用 database/sql 驱动，其 Conn.PingContext 阻塞直到 ctx 取消，
@@ -124,5 +127,73 @@ func TestProbeOnceReplicaBoundsHungDB_Hdb1(t *testing.T) {
 	// 挂起从库应被标记不健康（剔除读流量，#21 自愈生效）
 	if m.replicaHealthy[0].Load() {
 		t.Errorf("挂起从库应被标记不健康（replicaHealthy=false），got true")
+	}
+}
+
+// hungDialector 让 gorm.Open 成功并注入挂起 *sql.DB 作为 ConnPool，使 initDB 的
+// db.DB() 返回挂起 *sql.DB、pingWithTimeout 触发。用于回归启动 ping 路径。
+type hungDialector struct{ sqlDB *sql.DB }
+
+func (d hungDialector) Name() string                         { return "hdb1_hung" }
+func (d hungDialector) Initialize(db *gorm.DB) error         { db.Config.ConnPool = d.sqlDB; return nil }
+func (d hungDialector) Migrator(*gorm.DB) gorm.Migrator      { return nil }
+func (d hungDialector) DataTypeOf(*schema.Field) string      { return "" }
+func (d hungDialector) DefaultValueOf(*schema.Field) clause.Expression { return nil }
+func (d hungDialector) BindVarTo(clause.Writer, *gorm.Statement, any) {}
+func (d hungDialector) QuoteTo(w clause.Writer, s string)    { _, _ = w.WriteString(s) }
+func (d hungDialector) Explain(sql string, _ ...any) string  { return sql }
+
+// registerHungDialect 注册挂起 dialect（幂等）。
+func registerHungDialect(t *testing.T) {
+	t.Helper()
+	RegisterDialect(DialectSpec{
+		Name:      "hdb1_hung",
+		Dialector: func(string) gorm.Dialector { return hungDialector{sqlDB: newHungSqlDB(t)} },
+		DSN:       func(*config.DatabaseConfig) string { return "hdb1_hung://" },
+	})
+}
+
+// hungCfg 构造用挂起 dialect 的 config。
+func hungCfg() *config.Config {
+	return &config.Config{Database: config.DatabaseConfig{Driver: "hdb1_hung"}}
+}
+
+// TestInitDBBoundsHungDB_Hdb1 回归 H-db-1 启动 master ping 路径：InitDB(Background) 对
+// 挂起主库的 ping 经 pingWithTimeout 3s 失败，5 次重试后总耗时 ~15s 返回错误，不无限阻塞。
+// 修复前 initDB 用裸 sqlDB.PingContext(ctx)，Background 无 deadline -> 首次 ping 无限阻塞。
+// 用 ctx 在首次 ping 超时后取消加速（避免 15s 全跑），同时证明 ctx 仍可中断重试循环。
+func TestInitDBBoundsHungDB_Hdb1(t *testing.T) {
+	registerHungDialect(t)
+	m := NewManager(nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 4s 后 cancel：首次 ping 经 pingWithTimeout ~3s 超时返回错误，进入重试前 ctx 已取消，
+	// initDB 在重试循环的 ctx.Err() 检查处快速返回。若修复前裸 PingContext(Background)
+	// 首次即无限阻塞，cancel 无法中断 -> assertBoundedPing 超时 fail。
+	go func() { time.Sleep(4 * time.Second); cancel() }()
+
+	_ = assertBoundedPing(t, func() error {
+		return m.InitDB(ctx, hungCfg())
+	}, 6*time.Second)
+}
+
+// TestInitDBWithReplicasBoundsHungDB_Hdb1 回归 H-db-1 启动 replica ping 路径：
+// InitDBWithReplicas 对挂起 replica DSN 的 ping 经 pingWithTimeout 失败（replica 被 continue
+// 跳过），主库经挂起 dialect 同样 ping 失败。整流程有界返回，不无限阻塞。
+// 修复前 replica 启动 ping 用裸 PingContext -> 挂起 replica 无限阻塞 InitDBWithReplicas。
+func TestInitDBWithReplicasBoundsHungDB_Hdb1(t *testing.T) {
+	registerHungDialect(t)
+	m := NewManager(nil)
+
+	// 用可取消 ctx 限制总时长；主库挂起 ping ~3s 失败后 InitDBWithReplicas 直接返回错误
+	// （主库失败不进入 replica 初始化）。此处验证主库 ping 路径有界即可覆盖启动 ping 约束。
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(4 * time.Second); cancel() }()
+
+	err := assertBoundedPing(t, func() error {
+		return m.InitDBWithReplicas(ctx, hungCfg(), []string{"hdb1_hung://replica"})
+	}, 6*time.Second)
+	if err == nil {
+		t.Fatalf("挂起主库的 InitDBWithReplicas 应返回错误，got nil")
 	}
 }
