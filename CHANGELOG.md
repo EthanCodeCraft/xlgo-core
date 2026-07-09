@@ -19,6 +19,8 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 > 复审报告 `gpt_check_report_review.md` 第一优先级（致命/进程级可用性）修复。P1 共 4 项，本次发布已推进 M13 cron panic、M1 App 生命周期、M3 logger 生命周期临界区；M8 CSRF JSON body 上限随后推进。
 >
 > config 模块评审（`glm_check_report_module_01_config.md`）修复：H-config-1 Set/viper 同源、M-config-1 回调 panic 隔离、M-config-2 DB SSL/TLS、M-config-3 App 关闭停 watcher、M-config-4 Clone 守卫、L-config-2/3/4/5/6。
+>
+> database 模块评审（`glm_check_report_module_04_database.md`）修复：H-db-1 后台探活/启动 ping 经 pingWithTimeout 3s 约束（M11 修复不完整）。
 
 ### Breaking ⚠️
 
@@ -61,6 +63,7 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **config `watchLoop` 增加 ctx 逃生通道**（L-config-2）：原仅靠 `w.Events` 关闭退出，与"for 消费循环须 ctx.Done"红线有张力。`StopWatcher` 改为 cancel ctx + Close watcher 双重退出。
 - **config `Validate` 连接池交叉校验**（L-config-3）：`MaxOpenConns>0` 时 `MaxIdleConns>MaxOpenConns` 视为配置错误。
 - **config 哨兵错误改用 `errors.New`**（L-config-4）；**`DSN()` 去除冗余 TrimSpace**（L-config-5）；**`DSN/MySQLDSN/PostgresDSN/Addr` nil receiver 防御**（L-config-6）。
+- **database 后台探活/启动 ping 经 pingWithTimeout 3s 约束**（H-db-1，M11 修复不完整）：`pingWithTimeout` 原只加到包级 `HealthCheck()`，未覆盖方法 `(*Manager).HealthCheck`（被后台探活 `probeOnce` master 与 `/health` 端点共用）、`probeOnce` 从库 ping、`InitDB`/`InitDBWithReplicas` 启动 ping。挂起 DB（连接活但不响应）下这些路径的 `PingContext` 无 ctx deadline 无限阻塞，致探活 goroutine 阻塞、#21 自愈冻结、`IsHealthy()` 缓存失真、启动卡死。现 4 路径统一经 `pingWithTimeout`（`healthCheckTimeout`=3s，尊重 ctx 自带更短 deadline）。新增 `manager_hdb1_internal_test.go` 用挂起驱动回归 3 条路径。
 
 - **M9 JWT issuer / refresh expiry 契约修复**：`ParseToken`、`InvalidateToken`、`GetClaimsFromToken` 统一按当前配置校验 issuer；`RefreshToken` 不再忽略 `refresh_expire`；空 JTI 不再写入永不命中的 `jwt_bl:` 黑名单键；新增 `ParseTokenFailClosed` / `ParseTokenWithBlacklistPolicy` / `TokenBlacklist.IsBlacklistedE`，默认 `ParseToken` 仍保持黑名单检查 fail-open 兼容语义，安全敏感路由可显式选择 fail-closed；解析侧配置错误现在可通过 `errors.Is` 区分 `ErrEmptySecret` / `ErrUnsupportedAlgorithm`；`InvalidateToken` 使用不校验时序的解析路径，允许提前吊销 `nbf` 在未来的外部 token。
 - **M10 分布式锁参数与取消传播修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`；`WithLock` / `WithLockAutoExtend` 现在把调用方 ctx 传入业务函数，避免取消后业务函数继续运行。

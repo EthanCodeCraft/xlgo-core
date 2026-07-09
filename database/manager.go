@@ -304,7 +304,8 @@ func (m *Manager) probeOnce(ctx context.Context, threshold int) {
 			}
 			continue
 		}
-		if err := sqlDB.PingContext(ctx); err != nil {
+		// M11（H-db-1）：从库探活 ping 经 pingWithTimeout 受 3s 约束，挂起 DB 不无限阻塞探活 goroutine。
+		if err := pingWithTimeout(sqlDB, ctx); err != nil {
 			if i < len(replicaHealthy) && replicaHealthy[i].Load() {
 				logger.Warnf("数据库从库 #%d 探活失败，暂时剔除读流量: %v", i, err)
 			}
@@ -399,7 +400,11 @@ func (m *Manager) Close() error {
 	return errors.Join(errs...)
 }
 
-// HealthCheck 健康检查，主库不可达时返回错误
+// HealthCheck 健康检查，主库不可达时返回错误。
+//
+// M11 完整覆盖（H-db-1 修复）：ping 经 pingWithTimeout 受 healthCheckTimeout(3s) 约束，
+// 使后台探活（probeOnce）与 /health 端点（app.go 经本方法）都不会被挂起 DB（连接活但不
+// 响应）无限阻塞。ctx 自带更短 deadline 时优先尊重 ctx。
 func (m *Manager) HealthCheck(ctx context.Context) error {
 	ctx = normalizeContext(ctx)
 	m.mu.Lock()
@@ -412,7 +417,7 @@ func (m *Manager) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return sqlDB.PingContext(ctx)
+	return pingWithTimeout(sqlDB, ctx)
 }
 
 // DefaultManager 默认数据库管理器，包级 facade 代理到它。
@@ -530,7 +535,8 @@ func (m *Manager) initDB(ctx context.Context, cfg *config.Config) error {
 					sqlDB.SetConnMaxIdleTime(cfg.Database.ConnMaxIdleTime)
 				}
 
-				if err := sqlDB.PingContext(ctx); err == nil {
+				// M11（H-db-1）：启动 ping 经 pingWithTimeout 受 3s 约束，挂起 DB 致 InitDB 重试失败而非无限阻塞。
+				if err := pingWithTimeout(sqlDB, ctx); err == nil {
 					// 成功：安装为新主库，关闭旧主库池（重建路径覆盖前先释放旧资源，C11b）
 					m.mu.Lock()
 					old := m.master
@@ -682,7 +688,8 @@ func (m *Manager) InitDBWithReplicas(ctx context.Context, cfg *config.Config, re
 			sqlDB.SetMaxOpenConns(replicaMaxOpenConns(cfg.Database.MaxOpenConns))
 			sqlDB.SetConnMaxLifetime(time.Hour)
 
-			if err := sqlDB.PingContext(ctx); err != nil {
+			// M11（H-db-1）：从库启动 ping 经 pingWithTimeout 受 3s 约束，挂起 DB 不无限阻塞 InitDBWithReplicas。
+			if err := pingWithTimeout(sqlDB, ctx); err != nil {
 				logger.Warnf("数据库从库 %d Ping 失败: %v", i+1, err)
 				warnCloseDB(replicaDB, "关闭 Ping 失败的数据库从库连接池失败") // C11c: 关闭刚打开的池避免泄漏
 				continue
