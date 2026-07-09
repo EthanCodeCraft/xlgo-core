@@ -56,6 +56,23 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(c.Database.CustomDSN) == "" && (c.Database.Port <= 0 || c.Database.Port > 65535) {
 			problems = append(problems, fmt.Sprintf("database.port 超出范围(1-65535): %d", c.Database.Port))
 		}
+		// L-config-3：连接池配置交叉校验。MaxOpenConns>0 时 MaxIdleConns 不应超过它，
+		// 否则 database/sql 会按 MaxOpenConns 截断空闲连接，配置意图与实际不符。
+		if c.Database.MaxOpenConns > 0 && c.Database.MaxIdleConns > c.Database.MaxOpenConns {
+			problems = append(problems, fmt.Sprintf(
+				"database.max_idle_conns(%d) 不应大于 max_open_conns(%d)", c.Database.MaxIdleConns, c.Database.MaxOpenConns))
+		}
+		// M-config-2：Postgres SSLMode 合法性（非空时校验，空由 PostgresDSN 默认 prefer）。
+		if sslmode := strings.TrimSpace(c.Database.SSLMode); sslmode != "" {
+			if !validPostgresSSLMode(sslmode) {
+				problems = append(problems, fmt.Sprintf(
+					"database.ssl_mode 非法: %s（允许: disable/allow/prefer/require/verify-ca/verify-full）", sslmode))
+			}
+		}
+		// M-config-2：TLSRootCA 仅在 TLS=true 时生效，单独配置而无 tls:true 视为配置不一致。
+		if strings.TrimSpace(c.Database.TLSRootCA) != "" && !c.Database.TLS {
+			problems = append(problems, "database.tls_root_ca 需配合 tls: true 才生效")
+		}
 	}
 
 	// Redis：仅当配置了 host 时校验
@@ -73,3 +90,12 @@ func (c *Config) Validate() error {
 
 // validDuration 校验 Duration 非负（0 表示未配置/用默认，合法）。
 func validDuration(d time.Duration) bool { return d >= 0 }
+
+// validPostgresSSLMode 校验 PostgreSQL sslmode 取值（M-config-2）。
+func validPostgresSSLMode(s string) bool {
+	switch s {
+	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+		return true
+	}
+	return false
+}

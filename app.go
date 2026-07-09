@@ -143,7 +143,13 @@ type App struct {
 // Option 应用选项
 type Option func(*App)
 
-// WithConfigPath 设置配置文件路径
+// WithConfigPath 设置配置文件路径。
+//
+// M-config-5 全局可见性提示：WithConfigPath 在 Init 时会把 App 持有的 configManager 提升为
+// 全局默认（config.SetDefaultManager），故 config.Get / config.GetString 等包级便捷函数可读到
+// 该配置。这与 WithConfig 形成不对称：WithConfig 仅保留在 App 实例内，不污染全局，包级
+// config.Get() 取不到注入配置。下游若混用 a.config 与 config.GetString，两种注入方式行为不同--
+// 需要 config.Get/GetString 的下游请用 WithConfigPath（或自行 config.SetDefaultManager）。
 func WithConfigPath(path string) Option {
 	return func(a *App) {
 		a.configPath = path
@@ -154,7 +160,9 @@ func WithConfigPath(path string) Option {
 // WithConfig 设置配置对象。
 // 配置会在传入时深拷贝成 App 私有快照，并在 Init 时 Validate；调用方后续修改 cfg
 // 不会污染 App 内部配置。不再调用 config.Set(cfg)，配置仅保留在 App 实例内，不污染全局状态。
-// 依赖 config.Get() 获取注入配置的下游代码请改用 WithConfigPath。
+//
+// M-config-5：因此 config.Get / config.GetString 等包级函数取不到此注入配置（默认空 manager）。
+// 依赖 config.Get() 获取注入配置的下游代码请改用 WithConfigPath（会提升为全局默认）。
 func WithConfig(cfg *config.Config) Option {
 	return func(a *App) {
 		a.config = cfg.Clone()
@@ -521,6 +529,13 @@ func (a *App) closeResources() error {
 		}
 		a.initializedLogger = false
 		a.loggerManager = nil
+	}
+	// M-config-3：停止 App 持有的 configManager 热重载 watcher（若已启用），避免 App 关闭后
+	// 遗留监听 goroutine。默认流程（resolveConfig 用 Load 不启 watcher）为 no-op；用户对
+	// configManager 调用 LoadWithWatch/StartWatcher 后由这里统一收口。StopWatcher 幂等且会等待
+	// 进行中的 reload 回调结束，符合 C7 生命周期契约。configManager 可能为 nil（WithConfig 注入）。
+	if a.configManager != nil {
+		a.configManager.StopWatcher()
 	}
 	return errors.Join(errs...)
 }

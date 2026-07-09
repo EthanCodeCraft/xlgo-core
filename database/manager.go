@@ -493,6 +493,12 @@ func (m *Manager) initDB(ctx context.Context, cfg *config.Config) error {
 		Logger: gormlogger.Default.LogMode(gormLogLevel),
 	}
 
+	// M-config-2：MySQL 启用 TLS 且配置自定义 CA 时，注册命名 TLS 配置，使 DSN 中 tls=<name> 生效。
+	// 失败 fail-fast 返回错误，绝不静默回退明文连接。非 MySQL / 未配 CA 为 no-op。
+	if err := ensureMySQLTLSRegistered(cfg); err != nil {
+		return err
+	}
+
 	// 重试配置
 	maxRetries := 5
 	retryDelay := time.Second

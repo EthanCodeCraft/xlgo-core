@@ -17,8 +17,12 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 ## [Unreleased]
 
 > 复审报告 `gpt_check_report_review.md` 第一优先级（致命/进程级可用性）修复。P1 共 4 项，本次发布已推进 M13 cron panic、M1 App 生命周期、M3 logger 生命周期临界区；M8 CSRF JSON body 上限随后推进。
+>
+> config 模块评审（`glm_check_report_module_01_config.md`）修复：H-config-1 Set/viper 同源、M-config-1 回调 panic 隔离、M-config-2 DB SSL/TLS、M-config-3 App 关闭停 watcher、M-config-4 Clone 守卫、L-config-2/3/4/5/6。
 
 ### Breaking ⚠️
+
+- **PostgresDSN 默认 sslmode 由 `disable` 改为 `prefer`**（M-config-2）：原 `PostgresDSN` 硬编码 `sslmode=disable`，生产 DB 流量明文。新增 `DatabaseConfig.SSLMode` 字段，空值默认 `prefer`（优先加密、失败回退明文），可显式配置 `disable/allow/prefer/require/verify-ca/verify-full`（非法值在 `Validate` 阶段报错）。依赖明文 Postgres 连接的下游若因 `prefer` 回退行为受影响，请显式设置 `ssl_mode: disable`。MySQL 不受影响（用 `TLS`/`TLSRootCA`）。
 
 - **cache 写操作与计数器/原始 Redis helper 在 Redis 未初始化时返回 `ErrRedisNotReady`**：`Set` / `Delete` / `DeleteByPattern` / `Incr` / `IncrBy` / `Decr` / `GetTTL` / `SetExpire` / `GetRaw` / `SetRaw` 旧行为会静默返回成功或零值，调用方容易误判缓存写入、计数器更新或过期时间设置已经生效；现在统一显式返回错误。公共接口签名不变，但依赖“未启用 Redis 时当作成功”的下游需要改为忽略 `errors.Is(err, cache.ErrRedisNotReady)` 或显式启用 Redis。
 - **`cache.WithLock` / `cache.WithLockAutoExtend` 未获取到锁时返回 `ErrLockNotAcquired`**：旧行为返回 `nil` 并跳过业务函数，调用方无法区分“业务执行成功”和“根本没有执行”。同时锁 TTL 小于 1ms、续期/重试间隔非正会返回显式错误，避免 Redis PX=0 或 `time.NewTicker(0)` 崩溃。
@@ -43,7 +47,20 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`cron.ParseCron` 非法表达式改为 fail-fast panic**（cron/cron.go，M13）：旧行为会把非法表达式静默回退为每分钟执行，容易让拼写错误变成高频任务。动态输入请用 `ParseCronStrict` 处理 error；确实需要旧回退语义时改用新增 `ParseCronOrDefault`。
 - **repository 查询保护默认开启**（repository/repository.go，M5/N5）：`FindAll` 默认最多返回 `DefaultFindAllLimit=1000` 条；明确需要全表扫描时改用 `FindAllUnbounded`。`FindPage*` / `QueryBuilder.Page` 会归一化 `page/pageSize` 并限制 `MaxPageSize=100`、`MaxPage=10000`。`Find*Ordered` / `QueryBuilder.Order` 只接受简单字段排序（如 `created_at DESC, id ASC`），复杂表达式/raw SQL 会返回 `ErrUnsafeOrder`；`UpdateBatch` 字段名不合法返回 `ErrUnsafeField`。
 
+### Security 🔒
+
+- **MySQL 连接支持 TLS**（M-config-2）：`DatabaseConfig.TLS` 为 true 时 `MySQLDSN` 追加 `tls=true`（go-sql-driver/mysql v1.7.0 内置安全语义：系统根 CA + ServerName 自动取自 Host + 证书校验，无需注册）。配合 `DatabaseConfig.TLSRootCA`（PEM 路径）可指定私有 CA/自签证书，由 `database` 包在 `InitDB` 时 `RegisterTLSConfig` 注册命名配置（`config.MySQLTLSConfigName`）；CA 不可读或非 PEM 时 fail-fast，不静默回退明文。
+- **Postgres 连接支持 sslmode 配置**（M-config-2）：见 Breaking 项，默认 `prefer` 优先加密。
+
 ### Fixed 🐛
+
+- **config `Set(cfg)` 与 viper 视图同源修复**（H-config-1）：`Set` 原只更新类型化视图 `m.cfg`，`m.v`（viper）停留旧值，导致 `Get()` 与 `GetString/GetInt/GetBool/GetViper` 返回不同世界（违反 C1 单一配置源）。现在 `Set` 用 mapstructure 将 `*Config` 重建为不含 `AutomaticEnv` 的 viper 视图，保证 Get 与 GetString 同源。
+- **config 热重载回调 panic 隔离**（M-config-1）：单个 `onChange` 回调 panic 原会传播致 watcher 泄漏、后续热更新静默失效。现在每个回调独立 `recover`（标准库 `log` 记录 + 堆栈），不阻断后续回调、不杀 watcher。
+- **App.Shutdown 停止 configManager watcher**（M-config-3）：`closeResources` 末尾新增 `configManager.StopWatcher()`，用户对 App 的 configManager 调 `LoadWithWatch`/`StartWatcher` 后由 Shutdown 统一收口，避免关闭后遗留监听 goroutine（违反 C7）。
+- **config `Clone` 切片字段覆盖守卫**（M-config-4）：新增反射测试枚举 `Config` 所有切片/map 字段，断言 `Clone` 深拷贝；新增切片字段未同步 fixture 或 `Clone` 时测试失败，形成机械守卫。
+- **config `watchLoop` 增加 ctx 逃生通道**（L-config-2）：原仅靠 `w.Events` 关闭退出，与"for 消费循环须 ctx.Done"红线有张力。`StopWatcher` 改为 cancel ctx + Close watcher 双重退出。
+- **config `Validate` 连接池交叉校验**（L-config-3）：`MaxOpenConns>0` 时 `MaxIdleConns>MaxOpenConns` 视为配置错误。
+- **config 哨兵错误改用 `errors.New`**（L-config-4）；**`DSN()` 去除冗余 TrimSpace**（L-config-5）；**`DSN/MySQLDSN/PostgresDSN/Addr` nil receiver 防御**（L-config-6）。
 
 - **M9 JWT issuer / refresh expiry 契约修复**：`ParseToken`、`InvalidateToken`、`GetClaimsFromToken` 统一按当前配置校验 issuer；`RefreshToken` 不再忽略 `refresh_expire`；空 JTI 不再写入永不命中的 `jwt_bl:` 黑名单键；新增 `ParseTokenFailClosed` / `ParseTokenWithBlacklistPolicy` / `TokenBlacklist.IsBlacklistedE`，默认 `ParseToken` 仍保持黑名单检查 fail-open 兼容语义，安全敏感路由可显式选择 fail-closed；解析侧配置错误现在可通过 `errors.Is` 区分 `ErrEmptySecret` / `ErrUnsupportedAlgorithm`；`InvalidateToken` 使用不校验时序的解析路径，允许提前吊销 `nbf` 在未来的外部 token。
 - **M10 分布式锁参数与取消传播修复**：锁 TTL 统一校验到 Redis 毫秒粒度；`TryLock` 的非正 retry interval 不再 busy-loop；`WithLockAutoExtend` 的非正 extend interval 不再触发 goroutine panic；`UnlockByKey` 在 Redis 未初始化时与 `ForceUnlock` 一样返回 `ErrRedisNotReady`；`WithLock` / `WithLockAutoExtend` 现在把调用方 ctx 传入业务函数，避免取消后业务函数继续运行。

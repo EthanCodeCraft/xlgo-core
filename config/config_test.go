@@ -102,7 +102,7 @@ func TestDatabaseConfigPostgresDSN(t *testing.T) {
 	}
 
 	dsn := db.DSN()
-	expected := "host='localhost' port=5432 user='postgres' password='password' dbname='testdb' sslmode=disable TimeZone='Asia/Shanghai'"
+	expected := "host='localhost' port=5432 user='postgres' password='password' dbname='testdb' sslmode=prefer TimeZone='Asia/Shanghai'"
 	if dsn != expected {
 		t.Errorf("Postgres DSN = %s, want %s", dsn, expected)
 	}

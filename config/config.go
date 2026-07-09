@@ -1,10 +1,13 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,8 +20,9 @@ import (
 
 // 配置错误
 var (
-	ErrConfigNotLoaded = fmt.Errorf("配置未加载")
-	ErrInvalidConfig   = fmt.Errorf("配置非法")
+	// L-config-4：无格式化的哨兵错误用 errors.New（fmt.Errorf 无动词等价但语义上后者暗示格式化）。
+	ErrConfigNotLoaded = errors.New("配置未加载")
+	ErrInvalidConfig   = errors.New("配置非法")
 )
 
 // Config 全局配置结构体
@@ -230,6 +234,12 @@ const (
 	DriverPostgres = "postgres"
 )
 
+// MySQLTLSConfigName 是 database 包为 MySQL 私有 CA TLS 注册的命名配置名（M-config-2）。
+// 当 DatabaseConfig.TLS=true 且 TLSRootCA 非空时，MySQLDSN 追加 tls=<本常量>，
+// 由 database 包在 InitDB 时通过 go-sql-driver/mysql.RegisterTLSConfig 注册自定义 *tls.Config。
+// TLS=true 但 TLSRootCA 为空时则用内置 tls=true（系统根 CA），无需注册。
+const MySQLTLSConfigName = "xlgo-mysql"
+
 // DSNBuilder 根据 DatabaseConfig 生成连接字符串
 type DSNBuilder func(*DatabaseConfig) string
 
@@ -311,17 +321,34 @@ type DatabaseConfig struct {
 	HealthCheckInterval time.Duration `mapstructure:"health_check_interval"`
 	// HealthCheckFailureThreshold 连续探活失败多少次标记不健康（#21）。0 表示用默认 3
 	HealthCheckFailureThreshold int `mapstructure:"health_check_failure_threshold"`
+	// SSLMode PostgreSQL sslmode（disable/allow/prefer/require/verify-ca/verify-full）。
+	// 空时默认 "prefer"（M-config-2：原硬编码 disable 已改为默认 prefer，优先加密、失败回退明文）。
+	// 该字段仅对 PostgreSQL 生效；MySQL 用 TLS/TLSRootCA。
+	SSLMode string `mapstructure:"ssl_mode"`
+	// TLS 是否对 MySQL 启用 TLS。true 时 MySQLDSN 追加 tls=true（内置：系统根 CA + 证书校验，
+	// ServerName 自动取自 Host）。配合 TLSRootCA 可指定私有 CA（M-config-2）。
+	TLS bool `mapstructure:"tls"`
+	// TLSRootCA MySQL TLS 自定义 CA 证书 PEM 路径（用于私有 CA/自签证书）。
+	// 非空时 MySQLDSN 改用 tls=MySQLTLSConfigName，由 database 包在 InitDB 时注册命名 TLS 配置
+	// （ServerName 取自 Host）。该命名配置仅覆盖「replica DSN host 与主库 Host 相同」的单 host 集群；
+	// 多 host replicas + 私有 CA 时须为每个 replica host 注册不同名 TLS 配置并自建 replica DSN（框架
+	// MySQLDSN 硬编码 MySQLTLSConfigName，不适用），详见 database.ensureMySQLTLSRegistered 注释。
+	// 空时用内置 tls=true（系统根 CA）。仅 MySQL 生效。
+	TLSRootCA string `mapstructure:"tls_root_ca"`
 }
 
 // DSN 根据驱动返回连接字符串。设置了 CustomDSN 时优先返回 CustomDSN。
 // 未指定 Driver 时按 MySQL 处理；非空但未注册的 Driver 返回空字符串，
 // 避免把拼写错误静默当作 MySQL 连接，正常加载路径会由 Validate 提前报错。
 func (c *DatabaseConfig) DSN() string {
+	if c == nil { // L-config-6：防御 nil receiver
+		return ""
+	}
 	if c.CustomDSN != "" {
 		return c.CustomDSN
 	}
 	driver := strings.TrimSpace(c.Driver)
-	if strings.TrimSpace(driver) == "" {
+	if driver == "" { // L-config-5：去除原重复的 TrimSpace(driver)
 		driver = DriverMySQL
 	}
 	if builder, ok := LookupDSNBuilder(driver); ok {
@@ -343,25 +370,47 @@ func (c DatabaseConfig) isConfigured() bool {
 // MySQLDSN 返回 MySQL 连接字符串。
 // 密码经 url.QueryEscape 转义，避免含 @/:/空格 等特殊字符破坏 DSN（M9）。
 // loc 由 Timezone 配置，空则默认 "Local"（向后兼容）。
+// TLS=true 时追加 tls 参数（M-config-2）：TLSRootCA 为空用内置 tls=true（系统根 CA + 证书校验）；
+// TLSRootCA 非空用 tls=MySQLTLSConfigName（database 包注册的私有 CA 命名配置）。
 func (c *DatabaseConfig) MySQLDSN() string {
+	if c == nil { // L-config-6
+		return ""
+	}
 	loc := c.Timezone
 	if loc == "" {
 		loc = "Local"
 	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=%s",
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=%s",
 		url.QueryEscape(c.User), url.QueryEscape(c.Password), c.Host, c.Port, url.PathEscape(c.Name), url.QueryEscape(loc))
+	if c.TLS {
+		if strings.TrimSpace(c.TLSRootCA) == "" {
+			dsn += "&tls=true"
+		} else {
+			dsn += "&tls=" + MySQLTLSConfigName
+		}
+	}
+	return dsn
 }
 
 // PostgresDSN 返回 PostgreSQL 连接字符串。
 // 字符串字段统一用单引号包裹并转义，避免含空格/引号/反斜杠破坏 key=value DSN。
 // TimeZone 由 Timezone 配置，空则默认 "Asia/Shanghai"（向后兼容）。
+// sslmode 由 SSLMode 配置，空则默认 "prefer"（M-config-2：原硬编码 disable 改为 prefer，优先加密）。
 func (c *DatabaseConfig) PostgresDSN() string {
+	if c == nil { // L-config-6
+		return ""
+	}
 	tz := c.Timezone
 	if tz == "" {
 		tz = "Asia/Shanghai"
 	}
-	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable TimeZone=%s",
-		postgresQuote(c.Host), c.Port, postgresQuote(c.User), postgresQuote(c.Password), postgresQuote(c.Name), postgresQuote(tz))
+	sslmode := strings.TrimSpace(c.SSLMode)
+	if sslmode == "" {
+		sslmode = "prefer"
+	}
+	// sslmode 不加引号（与原 sslmode=disable 格式一致）；SSLMode 已被 Validate 限定为固定枚举，无注入风险。
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s TimeZone=%s",
+		postgresQuote(c.Host), c.Port, postgresQuote(c.User), postgresQuote(c.Password), postgresQuote(c.Name), sslmode, postgresQuote(tz))
 }
 
 func postgresQuote(s string) string {
@@ -380,6 +429,9 @@ type RedisConfig struct {
 
 // Addr 返回 Redis 地址
 func (c *RedisConfig) Addr() string {
+	if c == nil { // L-config-6
+		return ""
+	}
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
@@ -524,6 +576,10 @@ type Manager struct {
 	watcher *fsnotify.Watcher
 	// watchDone 在监听 goroutine 退出时被 close，供 StopWatcher 等待退出确认。
 	watchDone chan struct{}
+	// watchCancel 取消 watchLoop 的 ctx（L-config-2）。watchLoop 同时监听 ctx.Done 与 w.Events，
+	// 提供 fsnotify 致命错误且 Events 未关闭时的逃生通道，避免监听 goroutine 永驻。
+	// StopWatcher 时 cancel + Close(w) 双重退出保障。
+	watchCancel context.CancelFunc
 }
 
 // defaultManager 是包级默认管理器（C10a）。改用 atomic.Pointer 保护读写，
@@ -556,6 +612,38 @@ func cloneViper(src *viper.Viper, configPath string) *viper.Viper {
 		return nil
 	}
 	return cp
+}
+
+// configToMap 将 *Config 按 mapstructure tag 转为嵌套 map[string]any（H-config-1）。
+// mapstructure struct->map 会递归嵌套结构体为 map，切片/map 字段原样保留，
+// 用于在 Set(cfg) 后重建 m.v，使 GetString/GetInt/GetBool/GetViper 与 Get() 读到同一配置。
+func configToMap(cfg *Config) map[string]any {
+	if cfg == nil {
+		return nil
+	}
+	out := map[string]any{}
+	if err := mapstructure.Decode(cfg, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// viperFromConfig 由 *Config 重建一个不含 AutomaticEnv 的 viper（H-config-1）。
+// 用于 Set(cfg) 后同步 m.v：不启用 AutomaticEnv 是为了确保 GetString 等只读取 cfg 派生的值，
+// 与 Get()（返回 m.cfg 即调用方传入的 cfg）严格同源，避免 env 覆盖造成二者的二次分裂。
+// 保留 SetConfigFile(m.path) 以便后续 Reload 从文件重读。
+//
+// 已知差异（Duration 字段）：mapstructure struct->map 将 time.Duration 原样保留为 time.Duration，
+// 故 GetString("jwt.expire") 在 Set 后返回 Duration.String() 格式（如 "24h0m0s"），与文件加载路径
+// 返回的原始字符串（如 "24h"）字面不同。二者语义一致（均可 ParseDuration），typed view（Get().JWT.Expire）
+// 与 GetDuration 在两条路径下完全一致。Duration 字段应经 typed view 或 GetDuration 读取，勿用 GetString 字面比较。
+func viperFromConfig(configPath string, cfg *Config) *viper.Viper {
+	v := viper.New()
+	v.SetConfigFile(configPath)
+	if m := configToMap(cfg); m != nil {
+		_ = v.MergeConfigMap(m)
+	}
+	return v
 }
 
 // unmarshalConfig 将 viper 解析到 Config，启用 string→time.Duration decode hook，
@@ -653,19 +741,22 @@ func (m *Manager) StartWatcher() error {
 	}
 	m.watcher = w
 	m.watchDone = make(chan struct{})
+	// L-config-2：为 watchLoop 创建可取消 ctx，作为 w.Events 关闭之外的逃生通道。
+	ctx, cancel := context.WithCancel(context.Background())
+	m.watchCancel = cancel
 	target := filepath.Base(m.path)
 	done := m.watchDone
 	m.mu.Unlock()
 
-	go m.watchLoop(w, target, done)
+	go m.watchLoop(ctx, w, target, done)
 	return nil
 }
 
 // watchLoop 是文件监听 goroutine 主体。文件变更经去抖后调用 reload；
-// watcher 被 Close（Events 通道关闭）时退出并 close done。
-// done 由 StartWatcher 在锁内捕获传入，避免本 goroutine 读取 m.watchDone 字段
-// 与 StopWatcher 写入竞争。
-func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct{}) {
+// watcher 被 Close（Events 通道关闭）或 ctx 被 cancel（L-config-2）时退出并 close done。
+// done 与 ctx 均由 StartWatcher 在锁内捕获传入，避免本 goroutine 读取 m.watchDone /
+// m.watchCancel 字段与 StopWatcher 写入竞争。ctx 提供 fsnotify 致命错误下的逃生通道。
+func (m *Manager) watchLoop(ctx context.Context, w *fsnotify.Watcher, target string, done chan struct{}) {
 	defer close(done)
 	const debounce = 200 * time.Millisecond
 	timer := time.NewTimer(time.Hour)
@@ -676,6 +767,8 @@ func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct
 	var timerC <-chan time.Time
 	for {
 		select {
+		case <-ctx.Done(): // L-config-2：StopWatcher cancel 时退出，不单靠 w.Events 关闭
+			return
 		case ev, ok := <-w.Events:
 			if !ok {
 				return
@@ -711,7 +804,7 @@ func (m *Manager) watchLoop(w *fsnotify.Watcher, target string, done chan struct
 }
 
 // StopWatcher 停止配置文件监听并释放 watcher（C10d）。幂等。
-// 关闭 fsnotify watcher → Events 通道关闭 → watchLoop 退出 → 等待 watchDone。
+// cancel ctx 与关闭 fsnotify watcher 双重退出（L-config-2），等待 watchDone 确认 goroutine 退出。
 func (m *Manager) StopWatcher() {
 	if m == nil {
 		return
@@ -719,13 +812,18 @@ func (m *Manager) StopWatcher() {
 	m.mu.Lock()
 	w := m.watcher
 	done := m.watchDone
+	cancel := m.watchCancel
 	m.watcher = nil
 	m.watchDone = nil
+	m.watchCancel = nil
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel() // L-config-2：先 cancel 让 watchLoop 经 ctx.Done 退出
+	}
 	if w == nil {
 		return
 	}
-	_ = w.Close()
+	_ = w.Close() // 再 Close watcher 让 w.Events 关闭，双重保障
 	if done != nil {
 		<-done
 	}
@@ -807,6 +905,9 @@ func (m *Manager) GetStringMap(key string) map[string]any {
 }
 
 // Set 手动设置配置。非 nil 配置会先 Validate，并以深拷贝形式保存。
+// H-config-1：非 nil 配置同时用其重建 m.v（不含 AutomaticEnv），使 Get() 与
+// GetString/GetInt/GetBool/GetViper 读到同一配置世界，消除原"Set 只更新类型化视图、
+// viper 视图停留在旧值"的静默分裂（违反 C1 单一配置源）。
 func (m *Manager) Set(cfg *Config) error {
 	if m == nil {
 		return ErrConfigNotLoaded
@@ -821,6 +922,8 @@ func (m *Manager) Set(cfg *Config) error {
 	m.cfg = cfg.Clone()
 	if cfg == nil {
 		m.v = nil
+	} else {
+		m.v = viperFromConfig(m.path, cfg)
 	}
 	return nil
 }
@@ -864,8 +967,17 @@ func (m *Manager) reload() error {
 
 	// M-G：回调传入 newCfg 的深拷贝，避免回调修改切片字段与 Get() 读者（持有 &newCfg）竞态。
 	// 回调为 onChange 通知语义，应观察而非改写配置；改写副本不影响内部 m.cfg。
+	// M-config-1：每个回调独立 recover，单个回调 panic 不得杀掉 watcher 或阻断后续回调。
+	// config 是叶子包（logger 依赖 config），不能用框架 zap，故用标准库 log 记录 + 堆栈。
 	for _, cb := range cbs {
-		cb(newCfg.Clone())
+		func(cb func(*Config)) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("config: 配置变更回调 panic（已隔离，继续后续回调）: %v\n%s", r, debug.Stack())
+				}
+			}()
+			cb(newCfg.Clone())
+		}(cb)
 	}
 	return nil
 }
