@@ -124,9 +124,9 @@ const blacklistOpTimeout = 1 * time.Second
 type BlacklistPolicy int
 
 const (
-	// BlacklistFailOpen 黑名单查询出错时放行 Token（默认；兼容未启用 Redis 的存量部署）。
+	// BlacklistFailOpen 黑名单查询出错时放行 Token（仅用于无 Redis 或低安全场景，非默认）。
 	BlacklistFailOpen BlacklistPolicy = iota
-	// BlacklistFailClosed 黑名单查询出错时拒绝 Token（安全敏感路由使用）。
+	// BlacklistFailClosed 黑名单查询出错时拒绝 Token（默认；ParseToken 即用此策略）。
 	BlacklistFailClosed
 )
 
