@@ -529,9 +529,11 @@ c := cache.GetCache()
 // 设置缓存
 c.Set(ctx, "user:1", userData, 30*time.Minute)
 
-// 获取缓存
+// 获取缓存（命中返回 true，未命中返回 false,nil，后端错误返回 err）
 var user User
-if c.Get(ctx, "user:1", &user) {
+if hit, err := c.Get(ctx, "user:1", &user); err != nil {
+    return err
+} else if hit {
     // 缓存命中
 }
 
@@ -541,8 +543,11 @@ c.Delete(ctx, "user:1")
 // 批量删除（按模式）
 c.DeleteByPattern(ctx, "user:*")
 
-// 检查是否存在
-exists := c.Exists(ctx, "user:1")
+// 检查是否存在（未命中 false,nil；后端错误返回 err）
+exists, err := c.Exists(ctx, "user:1")
+if err != nil {
+    return err
+}
 ```
 
 ### 5.3 键名前缀管理（多站点共用 Redis）
@@ -562,7 +567,10 @@ cache.KSession("sid")    // → "session:my_app:sid"
 
 // 使用带前缀的缓存
 c.Set(ctx, cache.K("user:1"), userData, ttl)
-c.Get(ctx, cache.K("user:1"), &user)
+hit, err := c.Get(ctx, cache.K("user:1"), &user)
+if err != nil {
+    return err
+}
 ```
 
 ### 5.4 分布式锁（安全增强版）
@@ -920,13 +928,13 @@ r.Use(middleware.CustomRateLimit(50, time.Minute)) // 每分钟50次
 r.Use(middleware.RedisRateLimit("api_limit", 100))        // 每分钟100次（fail-open：Redis 故障时放行）
 r.Use(middleware.LoginRedisRateLimit())                    // 登录限流（fail-closed：Redis 故障时拒绝，防爆破）
 r.Use(middleware.APIRedisRateLimit())                      // API限流（fail-open）
-r.Use(middleware.UploadRedisRateLimit())                   // 上传限流（fail-open）
+r.Use(middleware.UploadRedisRateLimit())                   // 上传限流（fail-closed：资源敏感，Redis 故障时拒绝）
 
-// 自定义 Redis 限流
-r.Use(middleware.CustomRedisRateLimit("custom", 50, time.Minute))                 // fail-open
-r.Use(middleware.CustomRedisRateLimitFailClosed("sensitive", 50, time.Minute))    // fail-closed（安全场景）
+// 自定义 Redis 限流（默认 fail-open，传 WithFailClosed(true) 切换为 fail-closed）
+r.Use(middleware.CustomRedisRateLimit("custom", 50, time.Minute))                       // fail-open
+r.Use(middleware.CustomRedisRateLimit("sensitive", 50, time.Minute, middleware.WithFailClosed(true)))  // fail-closed（安全场景）
 
-// 自定义标识限流（如按用户ID）
+// 自定义标识限流（如按用户ID，同样支持 WithFailClosed）
 r.Use(middleware.RedisRateLimitWithIdentifier("user_limit", 100, func(c *gin.Context) string {
     return fmt.Sprintf("user:%d", middleware.GetUserID(c))
 }))
@@ -936,9 +944,9 @@ defer middleware.StopRateLimiters()
 ```
 
 > **fail-open vs fail-closed（H4c）**：Redis 限流器在 Redis 故障时有两种策略——
-> - **fail-open**（`RedisRateLimit`/`APIRedisRateLimit`/`UploadRedisRateLimit`/`CustomRedisRateLimit`，默认）：Redis 故障时放行，避免影响业务，但限流静默失效。
-> - **fail-closed**（`RedisRateLimitFailClosed`/`LoginRedisRateLimit`/`CustomRedisRateLimitFailClosed`）：Redis 故障时拒绝（HTTP 503），防限流静默失效。**安全敏感场景（登录防爆破、敏感操作）必须用 fail-closed**。
-> `RedisRateLimiter` 可经 `NewRedisRateLimiterFailClosed` 构造或 `SetFailClosed(true)` 切换策略。
+> - **fail-open**（默认）：Redis 故障时放行，避免影响业务，但限流静默失效。
+> - **fail-closed**（`WithFailClosed(true)`）：Redis 故障时拒绝（HTTP 503），防限流静默失效。**安全敏感场景（登录防爆破、上传、敏感操作）必须用 fail-closed**。
+> `RedisRateLimiter` 可经 `NewRedisRateLimiter(..., WithFailClosed(true))` 构造或 `SetFailClosed(true)` 切换策略。
 
 **内存限流 vs Redis 限流：**
 - 内存限流：单实例使用，简单高效
@@ -1115,7 +1123,7 @@ import "github.com/EthanCodeCraft/xlgo-core/jwt"
 // 生成Token（自动包含唯一 JTI）
 token, err := jwt.GenerateToken(userID, username, "admin", "admin")
 
-// 解析Token
+// 解析Token（默认 fail-closed：黑名单后端不可检查时拒绝 Token，需 Redis）
 claims, err := jwt.ParseToken(tokenString)
 
 // 使Token失效（使用 JTI，内存占用约 30 字节）
@@ -1229,8 +1237,12 @@ err := storage.Delete(path)
 // 获取文件内容
 data, err := storage.Get(path)
 
-// 检查文件是否存在
-if storage.Exists(path) {
+// 检查文件是否存在（不存在 false,nil；后端错误返回 err）
+ok, err := storage.Exists(path)
+if err != nil {
+    return err
+}
+if ok {
     // 文件存在
 }
 ```

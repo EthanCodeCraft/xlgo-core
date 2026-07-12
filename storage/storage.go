@@ -30,7 +30,9 @@ type Storage interface {
 	GetURL(path string) string
 	Delete(path string) error
 	Get(path string) ([]byte, error)
-	Exists(path string) bool
+	// Exists 检查文件是否存在。存在返回 (true, nil)；不存在返回 (false, nil)；
+	// 未初始化、路径非法/穿越、后端错误返回 (false, err)。
+	Exists(path string) (bool, error)
 }
 
 var (
@@ -46,6 +48,9 @@ var (
 	// ErrUploadTooLarge 上传声明大小或实际字节数超过 MaxSizeBytes（P0）。客户端声明的 file.Size
 	// 不可信，故除前置校验外，拷贝阶段也按实际字节封顶，防止声明小体积却流式发送大 body 撑爆磁盘/OSS。
 	ErrUploadTooLarge = errors.New("upload exceeds max size")
+	// ErrReadTooLarge Get 读取内容超过 maxReadBytes 上限（C4c）。与 ErrUploadTooLarge 区分：
+	// 前者是读操作的超限，后者是上传操作的超限。
+	ErrReadTooLarge = errors.New("read exceeds max size")
 )
 
 const (
@@ -458,19 +463,25 @@ func (s *LocalStorage) Get(p string) ([]byte, error) {
 		return nil, fmt.Errorf("读取文件内容失败: %w", err)
 	}
 	if s.maxReadBytes > 0 && int64(len(data)) > s.maxReadBytes {
-		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrInvalidPath)
+		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrReadTooLarge)
 	}
 	return data, nil
 }
 
-// Exists 检查文件是否存在
-func (s *LocalStorage) Exists(p string) bool {
+// Exists 检查文件是否存在。存在返回 (true, nil)；不存在返回 (false, nil)；
+// 路径非法/穿越返回 (false, err)；其他 Stat 错误返回 (false, err)。
+func (s *LocalStorage) Exists(p string) (bool, error) {
 	fullPath, err := s.safeJoin(p)
 	if err != nil {
-		return false
+		return false, err
 	}
-	_, err = os.Stat(fullPath)
-	return err == nil
+	if _, err := os.Stat(fullPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // OSSStorage OSS 存储
@@ -661,19 +672,27 @@ func (s *OSSStorage) Get(p string) ([]byte, error) {
 		return nil, fmt.Errorf("读取 OSS 文件内容失败: %w", err)
 	}
 	if s.maxReadBytes > 0 && int64(len(data)) > s.maxReadBytes {
-		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrInvalidPath)
+		return nil, fmt.Errorf("文件超过最大读取限制 %d 字节: %w", s.maxReadBytes, ErrReadTooLarge)
 	}
 	return data, nil
 }
 
-// Exists 检查 OSS 文件是否存在
-func (s *OSSStorage) Exists(p string) bool {
+// Exists 检查 OSS 文件是否存在。存在返回 (true, nil)；object 不存在返回 (false, nil)；
+// key 非法/穿越返回 (false, err)；鉴权/网络/服务端错误返回 (false, err)。
+func (s *OSSStorage) Exists(p string) (bool, error) {
 	key, err := sanitizeObjectKey(p)
 	if err != nil {
-		return false
+		return false, err
 	}
-	_, err = s.bucket.GetObjectMeta(key)
-	return err == nil
+	if _, err := s.bucket.GetObjectMeta(key); err != nil {
+		// OSS object 不存在（404 / NoSuchKey）不是错误，返回 (false, nil)。
+		var se *oss.ServiceError
+		if errors.As(err, &se) && (se.StatusCode == http.StatusNotFound || se.Code == "NoSuchKey") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // StorageManager 存储管理器（#10）。照 database.Manager 模式：
@@ -811,11 +830,12 @@ func Get(path string) ([]byte, error) {
 	return s.Get(path)
 }
 
-// Exists 检查文件是否存在
-func Exists(path string) bool {
+// Exists 检查文件是否存在。未初始化返回 (false, ErrStorageNotInitialized)；
+// 其余语义同 Storage.Exists。
+func Exists(path string) (bool, error) {
 	s := GetStorage()
 	if s == nil {
-		return false
+		return false, ErrStorageNotInitialized
 	}
 	return s.Exists(path)
 }

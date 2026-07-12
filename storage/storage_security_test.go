@@ -84,9 +84,9 @@ func TestLocalStoragePathTraversal(t *testing.T) {
 		t.Errorf("Get(%q) err = %v, want ErrPathTraversal", escapeRel, err)
 	}
 
-	// Exists 必须返回 false（而非穿越探测到 canary）
-	if s.Exists(escapeRel) {
-		t.Errorf("Exists(%q) = true, want false (traversal must not probe outside root)", escapeRel)
+	// Exists 必须返回 (false, ErrPathTraversal)（而非穿越探测到 canary）
+	if ok, err := s.Exists(escapeRel); ok || !errors.Is(err, storage.ErrPathTraversal) {
+		t.Errorf("Exists(%q) = (%v, %v), want (false, ErrPathTraversal)", escapeRel, ok, err)
 	}
 
 	// 绝对路径也必须拒绝
@@ -111,8 +111,8 @@ func TestLocalStorageNormalPathStillWorks(t *testing.T) {
 	}
 
 	rel := filepath.ToSlash(filepath.Join("sub", "ok.txt"))
-	if !s.Exists(rel) {
-		t.Error("Exists(normal) = false, want true")
+	if ok, err := s.Exists(rel); err != nil || !ok {
+		t.Errorf("Exists(normal) = (%v, %v), want (true, nil)", ok, err)
 	}
 	data, err := s.Get(rel)
 	if err != nil {
@@ -170,8 +170,8 @@ func TestLocalStorageGetReadLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Upload big file: %v", err)
 	}
-	if _, err := s.Get(rel); !errors.Is(err, storage.ErrInvalidPath) {
-		t.Errorf("Get over-limit err = %v, want ErrInvalidPath", err)
+	if _, err := s.Get(rel); !errors.Is(err, storage.ErrReadTooLarge) {
+		t.Errorf("Get over-limit err = %v, want ErrReadTooLarge", err)
 	}
 
 	// 小文件应正常读取。

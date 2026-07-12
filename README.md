@@ -21,8 +21,7 @@ db := database.GetDB()
 myDB := database.NewManager(cfg)
 myDB.Open(ctx)                       // 独立实例，不受全局影响
 database.SetDefaultManager(myDB)     // 提升为全局默认，并关闭旧默认 manager
-mockCache := &fakeCacheSvc{}
-cache.SetDefaultCacheManager(&cache.CacheManager{}) // 测试注入
+cache.SetDefaultCacheManager(&cache.CacheManager{}) // 测试注入自定义 CacheManager
 ```
 
 ### 区别于一般 Gin 脚手架的几点
@@ -351,19 +350,14 @@ cacheService := cache.GetCache()
 // 设置缓存
 cacheService.Set(ctx, "user:1", user, 10*time.Minute)
 
-// 获取缓存
+// 获取缓存（命中返回 true，未命中返回 false,nil，后端错误返回 err）
 var user User
-if cacheService.Get(ctx, "user:1", &user) {
-    // 缓存命中
-}
-
-// 严格区分缓存未命中与 Redis/反序列化错误
-if hit, err := cache.GetE(ctx, "user:1", &user); err != nil {
+if hit, err := cacheService.Get(ctx, "user:1", &user); err != nil {
     return err
 } else if hit {
     // 缓存命中
 }
-if exists, err := cache.ExistsE(ctx, "user:1"); err != nil {
+if exists, err := cacheService.Exists(ctx, "user:1"); err != nil {
     return err
 } else if exists {
     // key 存在
@@ -383,10 +377,11 @@ cacheService.DeleteByPattern(ctx, "user:*")
 token, err := jwt.GenerateToken(userID, username, "admin", "admin")
 
 // 解析 Token
+// ParseToken 默认 fail-closed：黑名单后端不可检查时拒绝 Token（需 Redis）
 claims, err := jwt.ParseToken(tokenString)
 
-// 安全敏感路由可要求黑名单检查 fail-closed
-claims, err = jwt.ParseTokenFailClosed(tokenString)
+// 需显式 fail-open（仅无 Redis 或低安全场景）用：
+claims, err = jwt.ParseTokenWithBlacklistPolicy(tokenString, jwt.BlacklistFailOpen)
 
 // 使 Token 失效（使用 JTI，高效）
 jwt.InvalidateToken(tokenString)
@@ -491,8 +486,11 @@ err := storage.Delete(path)
 // 获取文件内容
 data, err := storage.Get(path)
 
-// 检查文件是否存在
-exists := storage.Exists(path)
+// 检查文件是否存在（不存在 false,nil；后端错误返回 err）
+ok, err := storage.Exists(path)
+if err != nil {
+    return err
+}
 ```
 
 ### SSE 流式响应

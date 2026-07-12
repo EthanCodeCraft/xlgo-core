@@ -119,8 +119,8 @@ func (tb *TokenBlacklist) redisClient() *redis.Client {
 const blacklistOpTimeout = 1 * time.Second
 
 // BlacklistPolicy 控制解析 Token 时遇到黑名单查询错误的处理策略。
-// ParseToken 为兼容未启用 Redis 的存量部署默认 fail-open；安全敏感路由应使用
-// ParseTokenFailClosed 或 ParseTokenWithBlacklistPolicy(..., BlacklistFailClosed)。
+// ParseToken 默认 BlacklistFailClosed（黑名单不可检查即拒绝）；
+// 需显式 fail-open（仅无 Redis 或低安全场景）用 ParseTokenWithBlacklistPolicy(..., BlacklistFailOpen)。
 type BlacklistPolicy int
 
 const (
@@ -164,31 +164,10 @@ func (tb *TokenBlacklist) Add(jti string, expiry time.Time) error {
 	return client.Set(ctx, key, "1", ttl).Err()
 }
 
-// IsBlacklisted 检查 JTI 是否在黑名单中
-func (tb *TokenBlacklist) IsBlacklisted(jti string) bool {
-	client := tb.redisClient()
-	if client == nil {
-		// Redis 未启用，不检查黑名单
-		return false
-	}
-
-	ctx, cancel := blacklistCtx()
-	defer cancel()
-	key := fmt.Sprintf("jwt_bl:%s", jti)
-	// M-A 修复：显式处理 Redis 错误（原 .Val() 吞错致故障被静默当"未拉黑"）。
-	// 错误时保持 fail-open（返 false），与"无 Redis 部署可用"的固有局限一致，但记录告警
-	// 便于运维感知 Redis 故障。安全敏感场景必须启用 Redis（见 ErrBlacklistUnavailable 注释）。
-	n, err := client.Exists(ctx, key).Result()
-	if err != nil {
-		logger.Warn("jwt 黑名单检查失败，fail-open 放行", zap.String("jti", jti), zap.Error(err))
-		return false
-	}
-	return n > 0
-}
-
-// IsBlacklistedE 检查 JTI 是否在黑名单中，并返回 Redis/后端错误。
-// 当黑名单可用性属于路由安全契约时使用它；IsBlacklisted 保留旧版 fail-open bool API。
-func (tb *TokenBlacklist) IsBlacklistedE(jti string) (bool, error) {
+// IsBlacklisted 检查 JTI 是否在黑名单中。
+// 命中返回 (true, nil)；未命中返回 (false, nil)；
+// Redis 未启用或不可达返回 (false, ErrBlacklistUnavailable)，由调用方决定 fail-open/fail-closed。
+func (tb *TokenBlacklist) IsBlacklisted(jti string) (bool, error) {
 	client := tb.redisClient()
 	if client == nil {
 		return false, ErrBlacklistUnavailable
@@ -393,7 +372,7 @@ func checkTokenBlacklist(claims *Claims, policy BlacklistPolicy) error {
 	if claims == nil || claims.JTI == "" {
 		return nil
 	}
-	revoked, err := currentBlacklist().IsBlacklistedE(claims.JTI)
+	revoked, err := currentBlacklist().IsBlacklisted(claims.JTI)
 	if err != nil {
 		if policy == BlacklistFailClosed {
 			return err
@@ -407,13 +386,10 @@ func checkTokenBlacklist(claims *Claims, policy BlacklistPolicy) error {
 	return nil
 }
 
-// ParseToken 解析 JWT Token
+// ParseToken 解析 JWT Token。默认 fail-closed：黑名单后端不可检查时返回
+// ErrBlacklistUnavailable，拒绝该 Token。需要显式 fail-open（仅无 Redis 或低安全场景）
+// 请用 ParseTokenWithBlacklistPolicy(token, BlacklistFailOpen)。
 func ParseToken(tokenString string) (*Claims, error) {
-	return ParseTokenWithBlacklistPolicy(tokenString, BlacklistFailOpen)
-}
-
-// ParseTokenFailClosed 解析 JWT Token；若黑名单后端不可检查，则拒绝该 Token。
-func ParseTokenFailClosed(tokenString string) (*Claims, error) {
 	return ParseTokenWithBlacklistPolicy(tokenString, BlacklistFailClosed)
 }
 
@@ -521,8 +497,9 @@ func GetJTI(tokenString string) (string, error) {
 	return "", ErrTokenInvalid
 }
 
-// IsTokenRevoked 检查 Token 是否被撤销（通过 JTI）
-func IsTokenRevoked(jti string) bool {
+// IsTokenRevoked 检查 Token 是否被撤销（通过 JTI）。
+// 返回 (是否撤销, 错误)；黑名单后端不可用时返回 (false, ErrBlacklistUnavailable)。
+func IsTokenRevoked(jti string) (bool, error) {
 	return currentBlacklist().IsBlacklisted(jti)
 }
 

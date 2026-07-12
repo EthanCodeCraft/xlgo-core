@@ -270,8 +270,9 @@ func SetWithPrefix(ctx context.Context, key string, value any, ttl time.Duration
 	return GetCache().Set(ctx, kb.Build(key), value, ttl)
 }
 
-// GetWithPrefix 带前缀的缓存获取
-func GetWithPrefix(ctx context.Context, key string, dest any, prefix string) bool {
+// GetWithPrefix 带前缀的缓存获取。命中返回 (true, nil)；未命中返回 (false, nil)；
+// Redis 错误或反序列化失败返回 (false, err)。
+func GetWithPrefix(ctx context.Context, key string, dest any, prefix string) (bool, error) {
 	kb := NewKeyBuilder(WithPrefix(prefix))
 	return GetCache().Get(ctx, kb.Build(key), dest)
 }

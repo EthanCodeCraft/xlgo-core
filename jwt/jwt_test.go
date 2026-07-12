@@ -44,6 +44,7 @@ func TestGenerateToken(t *testing.T) {
 
 func TestParseToken(t *testing.T) {
 	setupTestConfig()
+	setupMiniRedis(t)
 
 	// 先生成 token
 	token, _ := jwt.GenerateToken(1, "testuser", "admin", "super_admin")
@@ -183,9 +184,10 @@ func TestTokenBlacklist(t *testing.T) {
 		t.Errorf("TokenBlacklist.Add without Redis should return ErrBlacklistUnavailable, got %v", err)
 	}
 
-	// 无 Redis 时，IsBlacklisted 仍返回 false（验证侧 fail-open 是无 Redis 部署的固有局限）
-	if tb.IsBlacklisted("test-token") {
-		t.Error("TokenBlacklist.IsBlacklisted without Redis should return false")
+	// 无 Redis 时，IsBlacklisted 返回 (false, ErrBlacklistUnavailable)（fail-closed：错误上抛）
+	revoked, err := tb.IsBlacklisted("test-token")
+	if revoked || !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Errorf("TokenBlacklist.IsBlacklisted without Redis = (%v, %v), want (false, ErrBlacklistUnavailable)", revoked, err)
 	}
 }
 
@@ -376,6 +378,7 @@ func TestSupportedAlgorithmHS384(t *testing.T) {
 		Expire:    time.Hour,
 	}})
 	t.Cleanup(setupTestConfig)
+	setupMiniRedis(t)
 
 	token, err := jwt.GenerateToken(1, "u", "admin", "admin")
 	if err != nil {
@@ -529,11 +532,11 @@ func TestParseTokenBlacklistPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateToken: %v", err)
 	}
-	if _, err := jwt.ParseToken(token); err != nil {
-		t.Fatalf("ParseToken default fail-open should pass without Redis: %v", err)
+	if _, err := jwt.ParseToken(token); !errors.Is(err, jwt.ErrBlacklistUnavailable) {
+		t.Fatalf("ParseToken default fail-closed should reject without Redis, err = %v, want ErrBlacklistUnavailable", err)
 	}
-	if _, err := jwt.ParseTokenFailClosed(token); !errors.Is(err, jwt.ErrBlacklistUnavailable) {
-		t.Fatalf("ParseTokenFailClosed err = %v, want ErrBlacklistUnavailable", err)
+	if _, err := jwt.ParseTokenWithBlacklistPolicy(token, jwt.BlacklistFailOpen); err != nil {
+		t.Fatalf("ParseTokenWithBlacklistPolicy fail-open should pass without Redis: %v", err)
 	}
 }
 
