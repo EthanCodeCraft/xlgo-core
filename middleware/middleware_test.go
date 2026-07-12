@@ -1115,7 +1115,7 @@ func TestRateLimiterRejectsInvalidConfig(t *testing.T) {
 		_ = middleware.NewRedisRateLimiter("bad", 0, time.Minute)
 	})
 	assertPanic(t, "redis fail-closed limiter zero window", func() {
-		_ = middleware.NewRedisRateLimiterFailClosed("bad", 1, 0)
+		_ = middleware.NewRedisRateLimiter("bad", 1, 0, middleware.WithFailClosed(true))
 	})
 }
 
@@ -1371,7 +1371,7 @@ func TestRedisRateLimiterFailClosedNoRedis(t *testing.T) {
 	prev := database.SetTestRedisClient(nil)
 	defer func() { database.SetTestRedisClient(prev) }()
 
-	limiter := middleware.NewRedisRateLimiterFailClosed("test", 10, time.Minute)
+	limiter := middleware.NewRedisRateLimiter("test", 10, time.Minute, middleware.WithFailClosed(true))
 	allowed, err := limiter.Allow(context.Background(), "1.2.3.4")
 	if allowed {
 		t.Error("fail-closed no-redis should deny")
@@ -1397,7 +1397,7 @@ func TestRedisRateLimiterFailClosedOnRedisError(t *testing.T) {
 	}
 
 	// fail-closed：正常时放行。
-	closedLimiter := middleware.NewRedisRateLimiterFailClosed("test_closed", 10, time.Minute)
+	closedLimiter := middleware.NewRedisRateLimiter("test_closed", 10, time.Minute, middleware.WithFailClosed(true))
 	allowed, err = closedLimiter.Allow(context.Background(), "1.2.3.4")
 	if err != nil {
 		t.Fatalf("fail-closed normal err = %v", err)
@@ -1431,7 +1431,7 @@ func TestRedisRateLimitFailClosedMiddlewareReturns503(t *testing.T) {
 	defer func() { database.SetTestRedisClient(prev) }()
 
 	r := setupTestRouter()
-	r.Use(middleware.RedisRateLimitFailClosed("login_limit", 10))
+	r.Use(middleware.RedisRateLimit("login_limit", 10, middleware.WithFailClosed(true)))
 	r.GET("/login", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
 
 	w := httptest.NewRecorder()

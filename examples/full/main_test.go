@@ -13,9 +13,12 @@ import (
 
 	"github.com/EthanCodeCraft/xlgo-core/config"
 	"github.com/EthanCodeCraft/xlgo-core/database"
+	"github.com/EthanCodeCraft/xlgo-core/jwt"
 	"github.com/EthanCodeCraft/xlgo-core/validation"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -62,6 +65,15 @@ func setupExampleRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 			_ = current.Close()
 		}
 	})
+
+	// JWT 黑名单走 Redis（ParseToken 默认 fail-closed，无 Redis 会拒绝所有 token）。
+	// 测试用 miniredis 注入，避免依赖外部 Redis。
+	mr := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = redisClient.Close() })
+	prevJWTMgr := jwt.GetDefaultJWT()
+	jwt.SetDefaultJWTManager(jwt.NewJWTManagerWithRedis(redisClient))
+	t.Cleanup(func() { jwt.SetDefaultJWTManager(prevJWTMgr) })
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

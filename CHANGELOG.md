@@ -49,6 +49,16 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 - **`cron.ParseCron` 非法表达式改为 fail-fast panic**（cron/cron.go，M13）：旧行为会把非法表达式静默回退为每分钟执行，容易让拼写错误变成高频任务。动态输入请用 `ParseCronStrict` 处理 error；确实需要旧回退语义时改用新增 `ParseCronOrDefault`。
 - **repository 查询保护默认开启**（repository/repository.go，M5/N5）：`FindAll` 默认最多返回 `DefaultFindAllLimit=1000` 条；明确需要全表扫描时改用 `FindAllUnbounded`。`FindPage*` / `QueryBuilder.Page` 会归一化 `page/pageSize` 并限制 `MaxPageSize=100`、`MaxPage=10000`。`Find*Ordered` / `QueryBuilder.Order` 只接受简单字段排序（如 `created_at DESC, id ASC`），复杂表达式/raw SQL 会返回 `ErrUnsafeOrder`；`UpdateBatch` 字段名不合法返回 `ErrUnsafeField`。
 
+- **同义可失败 API 收敛：错误不再吞并**（cache/jwt/storage/ratelimit）：按"同一能力只保留一个主入口、框架不替上层吞错、安全路径默认 fail-closed"原则，收敛历史双轨 API。详见下述分项；自定义 `CacheService`/`Storage` 实现需同步更新签名（编译失败即迁移信号）。
+
+  - **cache**：`CacheService.Get` / `Exists` 改为 `(bool, error)`--命中 `(true,nil)`、未命中 `(false,nil)`、Redis 未就绪/命令错误/反序列化失败返回 `(false,err)`。删除 `cache.GetE` / `cache.ExistsE` / `CacheGetter` / `CacheExistChecker` / `redisCache.GetE` / `redisCache.ExistsE`（不保留 deprecated wrapper）。新增包级 `cache.Get(ctx,key,dest) (bool,error)` / `cache.Exists(ctx,key) (bool,error)`。`GetWithPrefix` 改为 `(bool,error)`。迁移：`hit, err := cache.Get(ctx, key, &v); if err != nil { return err }; if !hit { /* miss */ }`。
+
+  - **jwt**：`TokenBlacklist.IsBlacklisted` 改为 `(bool, error)`，删除 `IsBlacklistedE`。`IsTokenRevoked` 改为 `(bool, error)`。`ParseToken` 默认从 **fail-open 改为 fail-closed**--黑名单后端不可检查时返回 `ErrBlacklistUnavailable` 拒绝该 Token（无 Redis 部署不再支持可靠撤销）。删除 `ParseTokenFailClosed`（主 API 已 fail-closed）。保留 `ParseTokenWithBlacklistPolicy(token, policy)` + `BlacklistPolicy`/`BlacklistFailOpen`/`BlacklistFailClosed` 供显式 fail-open（仅无 Redis 或低安全场景）。迁移：无 Redis 部署需启用 Redis，或显式 `jwt.ParseTokenWithBlacklistPolicy(token, jwt.BlacklistFailOpen)`。
+
+  - **storage**：`Storage.Exists` 改为 `(bool, error)`--存在 `(true,nil)`、不存在 `(false,nil)`、未初始化/路径非法/穿越/后端错误返回 `(false,err)`。`LocalStorage.Exists` 区分 `os.IsNotExist`（not found）与其他 `os.Stat` 错误；`OSSStorage.Exists` 区分 OSS 404/NoSuchKey（not found）与鉴权/网络错误。包级 `storage.Exists` 同步签名，未初始化返回 `ErrStorageNotInitialized`。新增 `ErrReadTooLarge`：`LocalStorage.Get` / `OSSStorage.Get` 读取超 `maxReadBytes` 上限原误用 `ErrInvalidPath`（路径无效语义不贴切），改为 `ErrReadTooLarge`。迁移：`ok, err := storage.Exists(p); if err != nil { return err }; if !ok { /* not found */ }`。
+
+  - **ratelimit**：Redis 限流器策略收敛为配置型 API。`NewRedisRateLimiter(keyPrefix, rate, window, opts ...RedisRateLimiterOption)` 新增可变参数，`WithFailClosed(true)` 替代原 `NewRedisRateLimiterFailClosed`。`RedisRateLimit` / `CustomRedisRateLimit` / `RedisRateLimitWithIdentifier` 同步加 `opts` 参数。删除 `NewRedisRateLimiterFailClosed` / `RedisRateLimitFailClosed` / `CustomRedisRateLimitFailClosed`。`UploadRedisRateLimit` 由 fail-open 改为 **fail-closed**（上传属资源敏感操作，Redis 故障时拒绝以防限流静默失效）。迁移：`middleware.RedisRateLimit("k", 100, middleware.WithFailClosed(true))` 替代原 `RedisRateLimitFailClosed("k", 100)`。
+
 ### Security 🔒
 
 - **MySQL 连接支持 TLS**（M-config-2）：`DatabaseConfig.TLS` 为 true 时 `MySQLDSN` 追加 `tls=true`（go-sql-driver/mysql v1.7.0 内置安全语义：系统根 CA + ServerName 自动取自 Host + 证书校验，无需注册）。配合 `DatabaseConfig.TLSRootCA`（PEM 路径）可指定私有 CA/自签证书，由 `database` 包在 `InitDB` 时 `RegisterTLSConfig` 注册命名配置（`config.MySQLTLSConfigName`）；CA 不可读或非 PEM 时 fail-fast，不静默回退明文。

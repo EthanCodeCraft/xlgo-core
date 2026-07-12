@@ -191,28 +191,32 @@ else
 end
 `
 
-// NewRedisRateLimiter 创建 Redis 分布式限流器（默认 fail-open：Redis 错误时放行，避免影响业务）。
-// 安全敏感场景（如登录防爆破）应使用 NewRedisRateLimiterFailClosed，Redis 故障时拒绝以防限流失效。
-func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
-	mustValidRateLimit(rate, window)
-	return &RedisRateLimiter{
-		keyPrefix: keyPrefix,
-		rate:      rate,
-		window:    window,
-		// failClosed 零值 false（fail-open，兼容默认）
+// RedisRateLimiterOption 配置 RedisRateLimiter 的可选策略。
+type RedisRateLimiterOption func(*RedisRateLimiter)
+
+// WithFailClosed 设置 Redis 故障时 fail-closed（拒绝请求）。
+// 不传或传 false 为 fail-open（放行，兼容默认）。安全敏感场景（登录防爆破等）应传 true。
+func WithFailClosed(failClosed bool) RedisRateLimiterOption {
+	return func(rl *RedisRateLimiter) {
+		rl.failClosed.Store(failClosed)
 	}
 }
 
-// NewRedisRateLimiterFailClosed 创建安全型 Redis 分布式限流器（fail-closed）：
-// Redis 不可用/错误/返回非预期类型时拒绝请求，避免限流静默失效（防爆破场景必备）。
-func NewRedisRateLimiterFailClosed(keyPrefix string, rate int, window time.Duration) *RedisRateLimiter {
+// NewRedisRateLimiter 创建 Redis 分布式限流器。
+// 默认 fail-open（Redis 故障时放行，避免影响业务）；安全敏感场景传 WithFailClosed(true)。
+func NewRedisRateLimiter(keyPrefix string, rate int, window time.Duration, opts ...RedisRateLimiterOption) *RedisRateLimiter {
 	mustValidRateLimit(rate, window)
 	rl := &RedisRateLimiter{
 		keyPrefix: keyPrefix,
 		rate:      rate,
 		window:    window,
+		// failClosed 零值 false（fail-open，兼容默认）
 	}
-	rl.failClosed.Store(true)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(rl)
+		}
+	}
 	return rl
 }
 
@@ -456,11 +460,11 @@ func redisLimitDecision(c *gin.Context, allowed bool, err error) {
 	c.Next()
 }
 
-// RedisRateLimit Redis 分布式限流中间件（fail-open：Redis 故障时放行，避免影响业务）。
-// 参数: keyPrefix 键名前缀（如 "login_limit"），rate 每分钟请求数
-// 安全敏感场景（登录防爆破等）应使用 RedisRateLimitFailClosed，Redis 故障时拒绝以防限流失效。
-func RedisRateLimit(keyPrefix string, rate int) gin.HandlerFunc {
-	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute)
+// RedisRateLimit Redis 分布式限流中间件。
+// 默认 fail-open（Redis 故障时放行，避免影响业务）；安全敏感场景（登录防爆破等）
+// 传 WithFailClosed(true)，Redis 故障时拒绝以防限流失效。
+func RedisRateLimit(keyPrefix string, rate int, opts ...RedisRateLimiterOption) gin.HandlerFunc {
+	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute, opts...)
 
 	return func(c *gin.Context) {
 		identifier := c.ClientIP()
@@ -476,22 +480,11 @@ func RedisRateLimit(keyPrefix string, rate int) gin.HandlerFunc {
 	}
 }
 
-// RedisRateLimitFailClosed 安全型 Redis 分布式限流中间件（fail-closed）：
-// Redis 故障时拒绝（503），避免限流静默失效。用于登录防爆破等安全场景。
-func RedisRateLimitFailClosed(keyPrefix string, rate int) gin.HandlerFunc {
-	limiter := NewRedisRateLimiterFailClosed(keyPrefix, rate, time.Minute)
-
-	return func(c *gin.Context) {
-		identifier := c.ClientIP()
-		allowed, err := limiter.Allow(c.Request.Context(), identifier)
-		redisLimitDecision(c, allowed, err)
-	}
-}
-
-// RedisRateLimitWithIdentifier 自定义标识的 Redis 分布式限流（fail-open）。
-// 参数: keyPrefix 键名前缀，rate 每分钟请求数，identifierFunc 标识获取函数
-func RedisRateLimitWithIdentifier(keyPrefix string, rate int, identifierFunc func(c *gin.Context) string) gin.HandlerFunc {
-	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute)
+// RedisRateLimitWithIdentifier 自定义标识的 Redis 分布式限流。
+// 参数: keyPrefix 键名前缀，rate 1 分钟窗口内允许的请求数，identifierFunc 标识获取函数。
+// identifierFunc 为 nil 或返回空串时回退到 c.ClientIP()。默认 fail-open，传 WithFailClosed(true) 切换。
+func RedisRateLimitWithIdentifier(keyPrefix string, rate int, identifierFunc func(c *gin.Context) string, opts ...RedisRateLimiterOption) gin.HandlerFunc {
+	limiter := NewRedisRateLimiter(keyPrefix, rate, time.Minute, opts...)
 
 	return func(c *gin.Context) {
 		identifier := ""
@@ -509,10 +502,10 @@ func RedisRateLimitWithIdentifier(keyPrefix string, rate int, identifierFunc fun
 
 // LoginRedisRateLimit 登录接口 Redis 分布式限流（fail-closed）。
 //
-// H4c: 登录防爆破场景必须 fail-closed——Redis 故障时若 fail-open 则限流失效、
+// H4c: 登录防爆破场景必须 fail-closed--Redis 故障时若 fail-open 则限流失效、
 // 攻击者可借 Redis 抖动窗口无限爆破。改为 fail-closed：Redis 故障时返 503 拒绝。
 func LoginRedisRateLimit() gin.HandlerFunc {
-	return RedisRateLimitFailClosed("login_limit", 10)
+	return RedisRateLimit("login_limit", 10, WithFailClosed(true))
 }
 
 // APIRedisRateLimit API Redis 分布式限流（fail-open，避免影响业务）。
@@ -520,25 +513,16 @@ func APIRedisRateLimit() gin.HandlerFunc {
 	return RedisRateLimit("api_limit", 100)
 }
 
-// UploadRedisRateLimit 上传接口 Redis 分布式限流（fail-open）。
+// UploadRedisRateLimit 上传接口 Redis 分布式限流（fail-closed）。
+// 上传属资源敏感操作，Redis 故障时拒绝以防限流静默失效。
 func UploadRedisRateLimit() gin.HandlerFunc {
-	return RedisRateLimit("upload_limit", 20)
+	return RedisRateLimit("upload_limit", 20, WithFailClosed(true))
 }
 
-// CustomRedisRateLimit 自定义 Redis 分布式限流（fail-open）。
-func CustomRedisRateLimit(keyPrefix string, rate int, window time.Duration) gin.HandlerFunc {
-	limiter := NewRedisRateLimiter(keyPrefix, rate, window)
-
-	return func(c *gin.Context) {
-		identifier := c.ClientIP()
-		allowed, err := limiter.Allow(c.Request.Context(), identifier)
-		redisLimitDecision(c, allowed, err)
-	}
-}
-
-// CustomRedisRateLimitFailClosed 自定义安全型 Redis 分布式限流（fail-closed）。
-func CustomRedisRateLimitFailClosed(keyPrefix string, rate int, window time.Duration) gin.HandlerFunc {
-	limiter := NewRedisRateLimiterFailClosed(keyPrefix, rate, window)
+// CustomRedisRateLimit 自定义 Redis 分布式限流。
+// 默认 fail-open，传 WithFailClosed(true) 切换为 fail-closed。
+func CustomRedisRateLimit(keyPrefix string, rate int, window time.Duration, opts ...RedisRateLimiterOption) gin.HandlerFunc {
+	limiter := NewRedisRateLimiter(keyPrefix, rate, window, opts...)
 
 	return func(c *gin.Context) {
 		identifier := c.ClientIP()

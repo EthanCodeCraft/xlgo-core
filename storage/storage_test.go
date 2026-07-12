@@ -40,8 +40,8 @@ func TestStorageNotInitialized(t *testing.T) {
 	if url := storage.GetURL("missing"); url != "" {
 		t.Fatalf("expected empty URL, got %q", url)
 	}
-	if storage.Exists("missing") {
-		t.Fatal("expected Exists false without storage")
+	if ok, err := storage.Exists("missing"); ok || !errors.Is(err, storage.ErrStorageNotInitialized) {
+		t.Fatalf("expected (false, ErrStorageNotInitialized) without storage, got (%v, %v)", ok, err)
 	}
 }
 
@@ -107,8 +107,9 @@ func TestLocalStorageDeleteGetExists(t *testing.T) {
 	}
 
 	// 测试 Exists
-	if !local.Exists("test.txt") {
-		t.Error("Exists should return true for existing file")
+	ok, err := local.Exists("test.txt")
+	if err != nil || !ok {
+		t.Errorf("Exists should return (true, nil) for existing file, got (%v, %v)", ok, err)
 	}
 
 	// 测试 Get
@@ -127,8 +128,9 @@ func TestLocalStorageDeleteGetExists(t *testing.T) {
 	}
 
 	// 验证删除后不存在
-	if local.Exists("test.txt") {
-		t.Error("Exists should return false after delete")
+	ok, err = local.Exists("test.txt")
+	if err != nil || ok {
+		t.Errorf("Exists should return (false, nil) after delete, got (%v, %v)", ok, err)
 	}
 
 	// 删除不存在的文件应该失败

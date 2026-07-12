@@ -67,70 +67,70 @@ func TestM10RawHelpersReturnRedisNotReady(t *testing.T) {
 	}
 }
 
-func TestM10ExistsEReturnsBackendErrors(t *testing.T) {
+func TestM10ExistsReturnsBackendErrors(t *testing.T) {
 	setupM10MiniRedis(t)
 	c := &redisCache{}
 	ctx := context.Background()
 
-	exists, err := c.ExistsE(ctx, "missing")
+	exists, err := c.Exists(ctx, "missing")
 	if err != nil {
-		t.Fatalf("ExistsE missing err = %v", err)
+		t.Fatalf("Exists missing err = %v", err)
 	}
 	if exists {
-		t.Fatal("ExistsE missing = true, want false")
+		t.Fatal("Exists missing = true, want false")
 	}
 
 	if err := c.Set(ctx, "present", "value", time.Minute); err != nil {
 		t.Fatalf("Set present: %v", err)
 	}
-	exists, err = c.ExistsE(ctx, "present")
+	exists, err = c.Exists(ctx, "present")
 	if err != nil || !exists {
-		t.Fatalf("ExistsE present = %v, err=%v; want true,nil", exists, err)
+		t.Fatalf("Exists present = %v, err=%v; want true,nil", exists, err)
 	}
 
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if exists, err = c.ExistsE(canceled, "present"); err == nil || exists {
-		t.Fatalf("ExistsE canceled = %v, err=%v; want false,error", exists, err)
+	if exists, err = c.Exists(canceled, "present"); err == nil || exists {
+		t.Fatalf("Exists canceled = %v, err=%v; want false,error", exists, err)
 	}
 }
 
-func TestM10GetEReturnsBackendAndDecodeErrors(t *testing.T) {
+func TestM10GetReturnsBackendAndDecodeErrors(t *testing.T) {
 	setupM10MiniRedis(t)
 	c := &redisCache{}
 	ctx := context.Background()
 
 	var got string
-	ok, err := c.GetE(ctx, "missing", &got)
+	ok, err := c.Get(ctx, "missing", &got)
 	if err != nil || ok {
-		t.Fatalf("GetE missing = %v, err=%v; want false,nil", ok, err)
+		t.Fatalf("Get missing = %v, err=%v; want false,nil", ok, err)
 	}
 
 	if err := c.Set(ctx, "present", "value", time.Minute); err != nil {
 		t.Fatalf("Set present: %v", err)
 	}
-	ok, err = c.GetE(ctx, "present", &got)
+	ok, err = c.Get(ctx, "present", &got)
 	if err != nil || !ok || got != "value" {
-		t.Fatalf("GetE present = %v, %q, err=%v; want true,value,nil", ok, got, err)
+		t.Fatalf("Get present = %v, %q, err=%v; want true,value,nil", ok, got, err)
 	}
 
 	if err := c.client().Set(ctx, "bad-json", "{", time.Minute).Err(); err != nil {
 		t.Fatalf("Set bad-json: %v", err)
 	}
-	ok, err = c.GetE(ctx, "bad-json", &got)
+	ok, err = c.Get(ctx, "bad-json", &got)
 	if err == nil || ok {
-		t.Fatalf("GetE bad-json = %v, err=%v; want false,error", ok, err)
+		t.Fatalf("Get bad-json = %v, err=%v; want false,error", ok, err)
 	}
 
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	ok, err = c.GetE(canceled, "present", &got)
+	ok, err = c.Get(canceled, "present", &got)
 	if err == nil || ok {
-		t.Fatalf("GetE canceled = %v, err=%v; want false,error", ok, err)
+		t.Fatalf("Get canceled = %v, err=%v; want false,error", ok, err)
 	}
 }
 
-func TestM10PackageExistsEUsesOptionalInterface(t *testing.T) {
+func TestM10PackageExistsReturnsBackendErrors(t *testing.T) {
 	setupM10MiniRedis(t)
 	orig := GetDefaultCache()
 	t.Cleanup(func() { SetDefaultCacheManager(orig) })
@@ -141,13 +141,13 @@ func TestM10PackageExistsEUsesOptionalInterface(t *testing.T) {
 	if err := GetCache().Set(ctx, "present", "value", time.Minute); err != nil {
 		t.Fatalf("Set through facade: %v", err)
 	}
-	exists, err := ExistsE(ctx, "present")
+	exists, err := Exists(ctx, "present")
 	if err != nil || !exists {
-		t.Fatalf("facade ExistsE = %v, err=%v; want true,nil", exists, err)
+		t.Fatalf("facade Exists = %v, err=%v; want true,nil", exists, err)
 	}
 }
 
-func TestM10PackageGetEUsesOptionalInterface(t *testing.T) {
+func TestM10PackageGetReturnsBackendErrors(t *testing.T) {
 	setupM10MiniRedis(t)
 	orig := GetDefaultCache()
 	t.Cleanup(func() { SetDefaultCacheManager(orig) })
@@ -159,8 +159,41 @@ func TestM10PackageGetEUsesOptionalInterface(t *testing.T) {
 		t.Fatalf("Set through facade: %v", err)
 	}
 	var got string
-	ok, err := GetE(ctx, "present", &got)
+	ok, err := Get(ctx, "present", &got)
 	if err != nil || !ok || got != "value" {
-		t.Fatalf("facade GetE = %v, %q, err=%v; want true,value,nil", ok, got, err)
+		t.Fatalf("facade Get = %v, %q, err=%v; want true,value,nil", ok, got, err)
+	}
+}
+
+// TestM10CustomCacheServiceCompile asserts a user-provided CacheService
+// implementation compiles against the (bool, error) contract. This is a
+// compile-time guard: if the interface changes again, this stops building.
+type customCacheSvc struct{}
+
+func (customCacheSvc) Get(ctx context.Context, key string, dest any) (bool, error) { return false, nil }
+func (customCacheSvc) Set(ctx context.Context, key string, value any, ttl time.Duration) error {
+	return nil
+}
+func (customCacheSvc) Delete(ctx context.Context, key string) error  { return nil }
+func (customCacheSvc) DeleteByPattern(ctx context.Context, p string) error { return nil }
+func (customCacheSvc) Exists(ctx context.Context, key string) (bool, error) { return false, nil }
+
+func TestM10CustomCacheServiceCompiles(t *testing.T) {
+	var _ CacheService = customCacheSvc{}
+}
+
+// TestM10RedisNotReadyOnGetExists asserts the Redis-not-ready error is
+// surfaced (not swallowed) when no backend is configured.
+func TestM10RedisNotReadyOnGetExists(t *testing.T) {
+	database.SetTestRedisClient(nil)
+	t.Cleanup(func() { database.SetTestRedisClient(nil) })
+	c := &redisCache{}
+	ctx := context.Background()
+
+	if _, err := c.Get(ctx, "k", new(string)); !errors.Is(err, ErrRedisNotReady) {
+		t.Fatalf("Get without Redis err = %v, want ErrRedisNotReady", err)
+	}
+	if _, err := c.Exists(ctx, "k"); !errors.Is(err, ErrRedisNotReady) {
+		t.Fatalf("Exists without Redis err = %v, want ErrRedisNotReady", err)
 	}
 }

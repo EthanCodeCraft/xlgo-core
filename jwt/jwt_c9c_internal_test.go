@@ -74,7 +74,7 @@ func TestC9cConcurrentSetDefaultAndRead(t *testing.T) {
 				default:
 				}
 				_, _ = ParseToken(token)
-				_ = IsTokenRevoked("some-jti")
+				_, _ = IsTokenRevoked("some-jti")
 				_ = InvalidateTokenByID("some-jti", time.Now().Add(time.Hour))
 				_ = currentManager()
 			}

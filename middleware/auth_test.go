@@ -42,6 +42,7 @@ func setAuthUser(userType, role string) func(*gin.Context) {
 }
 
 func TestAuthRequiredAcceptsCaseInsensitiveBearer_M8(t *testing.T) {
+	setupMiddlewareMiniRedis(t)
 	if err := config.Set(&config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret-key-1234567890123456789012",

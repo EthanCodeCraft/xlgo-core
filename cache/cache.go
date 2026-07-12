@@ -15,28 +15,17 @@ import (
 
 // CacheService 缓存服务接口
 type CacheService interface {
-	// Get 获取缓存值，如果存在则反序列化到 dest 并返回 true
-	Get(ctx context.Context, key string, dest any) bool
+	// Get 获取缓存值，命中则反序列化到 dest 并返回 (true, nil)；未命中返回 (false, nil)；
+	// Redis 未就绪、命令错误或反序列化失败返回 (false, err)。调用方须显式处理错误。
+	Get(ctx context.Context, key string, dest any) (bool, error)
 	// Set 设置缓存值
 	Set(ctx context.Context, key string, value any, ttl time.Duration) error
 	// Delete 删除缓存
 	Delete(ctx context.Context, key string) error
 	// DeleteByPattern 按模式删除缓存
 	DeleteByPattern(ctx context.Context, pattern string) error
-	// Exists 检查缓存是否存在
-	Exists(ctx context.Context, key string) bool
-}
-
-// CacheExistChecker is implemented by cache backends that can distinguish a
-// missing key from a backend failure.
-type CacheExistChecker interface {
-	ExistsE(ctx context.Context, key string) (bool, error)
-}
-
-// CacheGetter is implemented by cache backends that can distinguish a cache
-// miss from a backend failure while loading a value.
-type CacheGetter interface {
-	GetE(ctx context.Context, key string, dest any) (bool, error)
+	// Exists 检查缓存是否存在；未命中返回 (false, nil)，后端错误返回 (false, err)。
+	Exists(ctx context.Context, key string) (bool, error)
 }
 
 // redisCache Redis 缓存实现。
@@ -56,32 +45,9 @@ func NewRedisCache() CacheService {
 	return &redisCache{}
 }
 
-// Get 获取缓存值
-func (c *redisCache) Get(ctx context.Context, key string, dest any) bool {
-	cli := c.client()
-	if cli == nil {
-		return false
-	}
-
-	val, err := cli.Get(ctx, key).Result()
-	if err != nil {
-		if err != redis.Nil {
-			logger.Warn("缓存获取失败", zap.String("key", key), zap.Error(err))
-		}
-		return false
-	}
-
-	if err := json.Unmarshal([]byte(val), dest); err != nil {
-		logger.Warn("缓存反序列化失败", zap.String("key", key), zap.Error(err))
-		return false
-	}
-
-	return true
-}
-
-// GetE loads a cached JSON value and returns backend/deserialize errors to
-// callers that need to distinguish a cache miss from Redis or data failures.
-func (c *redisCache) GetE(ctx context.Context, key string, dest any) (bool, error) {
+// Get 获取缓存值。命中返回 (true, nil)；未命中返回 (false, nil)；
+// Redis 未就绪返回 (false, ErrRedisNotReady)；Redis 命令错误或反序列化失败返回 (false, err)。
+func (c *redisCache) Get(ctx context.Context, key string, dest any) (bool, error) {
 	cli := c.client()
 	if cli == nil {
 		return false, ErrRedisNotReady
@@ -181,19 +147,9 @@ func (c *redisCache) DeleteByPattern(ctx context.Context, pattern string) error 
 	return nil
 }
 
-// Exists 检查缓存是否存在
-func (c *redisCache) Exists(ctx context.Context, key string) bool {
-	ok, err := c.ExistsE(ctx, key)
-	if err != nil {
-		logger.Warn("缓存存在性检查失败", zap.String("key", key), zap.Error(err))
-		return false
-	}
-	return ok
-}
-
-// ExistsE checks whether key exists and returns Redis/backend errors to callers
-// that need to distinguish a missing key from a cache outage.
-func (c *redisCache) ExistsE(ctx context.Context, key string) (bool, error) {
+// Exists 检查缓存是否存在。命中返回 (true, nil)；未命中返回 (false, nil)；
+// Redis 未就绪返回 (false, ErrRedisNotReady)；命令错误返回 (false, err)。
+func (c *redisCache) Exists(ctx context.Context, key string) (bool, error) {
 	cli := c.client()
 	if cli == nil {
 		return false, ErrRedisNotReady
@@ -271,30 +227,22 @@ func GetCache() CacheService {
 	return GetDefaultCache().Get()
 }
 
-// ExistsE checks whether key exists and returns backend errors. It complements
-// the legacy bool-only CacheService.Exists method without changing that public
-// interface for downstream custom cache implementations.
-func ExistsE(ctx context.Context, key string) (bool, error) {
+// Get 获取全局缓存值。命中返回 (true, nil)；未命中返回 (false, nil)；
+// 缓存未初始化或 Redis 错误返回 (false, err)。
+func Get(ctx context.Context, key string, dest any) (bool, error) {
 	svc := GetCache()
 	if svc == nil {
 		return false, ErrRedisNotReady
 	}
-	if checker, ok := svc.(CacheExistChecker); ok {
-		return checker.ExistsE(ctx, key)
-	}
-	return svc.Exists(ctx, key), nil
+	return svc.Get(ctx, key, dest)
 }
 
-// GetE loads a cached JSON value and returns backend/deserialize errors. It
-// complements the legacy bool-only CacheService.Get method without changing
-// that public interface for downstream custom cache implementations.
-func GetE(ctx context.Context, key string, dest any) (bool, error) {
+// Exists 检查全局缓存是否存在。未命中返回 (false, nil)；缓存未初始化或
+// Redis 错误返回 (false, err)。
+func Exists(ctx context.Context, key string) (bool, error) {
 	svc := GetCache()
 	if svc == nil {
 		return false, ErrRedisNotReady
 	}
-	if getter, ok := svc.(CacheGetter); ok {
-		return getter.GetE(ctx, key, dest)
-	}
-	return svc.Get(ctx, key, dest), nil
+	return svc.Exists(ctx, key)
 }
