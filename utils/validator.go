@@ -46,7 +46,7 @@ func IsIDCard(id string) bool {
 	return idCardRE.MatchString(id)
 }
 
-// IsChinese 检查字符串是否全部为中文字符
+// IsChinese 检查字符串是否非空且全部为中文字符（CJK 基本区 U+4E00..U+9FFF）。空串返回 false。
 func IsChinese(s string) bool {
 	for _, r := range s {
 		if r < 0x4E00 || r > 0x9FFF {

@@ -677,6 +677,7 @@ func (r *Registry) GroupWithMiddlewareGroup(engine *gin.Engine, path string, gro
 	return engine.Group(path, r.GetMiddlewareGroup(groupName)...)
 }
 
+// GroupWithMiddlewareGroup 使用中间件分组创建路由组（全局方式，代理到默认 Registry）。
 func GroupWithMiddlewareGroup(engine *gin.Engine, path string, groupName string) *gin.RouterGroup {
 	return ensureRegistry().GroupWithMiddlewareGroup(engine, path, groupName)
 }

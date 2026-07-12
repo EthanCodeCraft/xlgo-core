@@ -7,7 +7,7 @@ import (
 )
 
 // BaseModel 基础模型。CreatedAt/UpdatedAt 不显式指定 type，由 GORM 按驱动选默认
-// 时间列类型（MySQL 通常为 datetime(0) 或 timestamp，保留亚秒精度）。
+// 时间列类型（MySQL 通常为 datetime(6)，保留亚秒精度）。
 type BaseModel struct {
 	ID        uint           `gorm:"primaryKey" json:"id"`
 	CreatedAt time.Time      `json:"created_at"`

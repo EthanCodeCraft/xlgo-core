@@ -257,7 +257,9 @@ func GetCSRFToken(c *gin.Context) string {
 	return s
 }
 
-// CSRFToken 返回 CSRF Token 的处理器（用于 API 模式）
+// CSRFToken 返回当前请求上下文中的 CSRF Token；若上下文无 Token 则现场生成一个返回。
+// 适用于 Cookie/双重提交模式（与 CSRF/DoubleSubmitCookie 中间件配合），
+// 不与 CSRFForAPI 配套--API 模式的可校验 Token 请用 GenerateAPIToken 颁发。
 func CSRFToken(c *gin.Context) {
 	token := GetCSRFToken(c)
 	if token == "" {

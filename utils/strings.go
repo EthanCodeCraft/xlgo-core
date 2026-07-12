@@ -102,7 +102,8 @@ func trimRightFunc(s string, f func(rune) bool) string {
 	return ""
 }
 
-// Substr 截取子字符串（按 Unicode 字符计数）
+// Substr 截取子字符串（按 Unicode 字符计数）。
+// start 支持负数（从末尾计算）；start 越界或 length<=0 返回空串；length 超出末尾自动截断。
 // 参数: start 起始位置（支持负数从末尾计算），length 截取长度
 func Substr(s string, start, length int) string {
 	runes := []rune(s)

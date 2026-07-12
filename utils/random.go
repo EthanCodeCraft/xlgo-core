@@ -36,7 +36,7 @@ const (
 // ErrRandInvalidLength 长度过大（超过 1<<20，保护熵池）。n<=0 时返回空串而非此错误。
 var ErrRandInvalidLength = errors.New("invalid random length")
 
-// RandInt 返回 [min, max) 范围内的随机整数。
+// RandInt 返回 [min, max) 范围内的随机整数。min==max 时返回 min；max<min 自动交换。
 //
 // 非密码学安全（math/rand + sync.Pool），仅用于非安全场景（负载均衡、游戏、A/B 分桶等）；
 // 不适用于 token/OTP 等安全场景。
@@ -52,7 +52,7 @@ func RandInt(min, max int) int {
 	return min + r.Intn(max-min)
 }
 
-// RandInt64 返回 [min, max) 范围内的随机 int64（非密码学安全）。
+// RandInt64 返回 [min, max) 范围内的随机 int64（非密码学安全）。min==max 返回 min；max<min 自动交换。
 func RandInt64(min, max int64) int64 {
 	if min == max {
 		return min

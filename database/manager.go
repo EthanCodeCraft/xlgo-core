@@ -63,8 +63,8 @@ func (p *RoundRobinPicker) Pick(replicas []*gorm.DB) *gorm.DB {
 
 // RandomPicker 随机选择从库。
 //
-// D2 注释：rand.Intn 自 Go 1.20 起（go.dev/issue/54899）内部使用 per-goroutine
-// 随机源，并发安全无需额外同步。本模块 go.mod 声明 go 1.25.0，满足此要求。
+// 使用 crypto/rand 生成随机索引，并发安全且不可预测。len(replicas)<=0 返回 nil；
+// crypto/rand 失败（极罕见，如熵池耗尽）时回退到 replicas[0]，保证可用性。
 type RandomPicker struct{}
 
 // Pick 随机选择一个从库

@@ -92,11 +92,11 @@ const (
 type MessageType string
 
 const (
-	TypeText   MessageType = "text"
-	TypeBinary MessageType = "binary"
-	TypePing   MessageType = "ping"
-	TypePong   MessageType = "pong"
-	TypeClose  MessageType = "close"
+	TypeText   MessageType = "text"   // 文本消息
+	TypeBinary MessageType = "binary" // 二进制消息
+	TypePing   MessageType = "ping"   // 心跳 ping
+	TypePong   MessageType = "pong"   // 心跳 pong
+	TypeClose  MessageType = "close"  // 关闭消息
 )
 
 // Message WebSocket 消息
@@ -350,9 +350,13 @@ func SetCheckOrigin(fn func(r *http.Request) bool) {
 }
 
 var (
+	// ErrHubNotRunning 在 Hub 未启动 Run 即调用 Try* 方法时返回。
 	ErrHubNotRunning = errors.New("websocket hub not running")
-	ErrHubStopped    = errors.New("websocket hub stopped")
-	ErrHubQueueFull  = errors.New("websocket hub queue full")
+	// ErrHubStopped 在 Hub 已 Stop 后调用 Try* 方法时返回。
+	ErrHubStopped = errors.New("websocket hub stopped")
+	// ErrHubQueueFull 在 register/unregister/broadcast channel 缓冲满时返回。
+	ErrHubQueueFull = errors.New("websocket hub queue full")
+	// ErrNilConnection 在向 Hub 注册/注销 nil 连接时返回。
 	ErrNilConnection = errors.New("websocket connection is nil")
 )
 

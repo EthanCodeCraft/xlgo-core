@@ -86,7 +86,7 @@ func ToString64(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
 
-// CalcPageCount 计算总页数
+// CalcPageCount 计算总页数（向上取整）。total<=0 或 pageSize<=0 时返回 0。
 func CalcPageCount(total, pageSize int64) int64 {
 	if total <= 0 || pageSize <= 0 {
 		return 0
@@ -94,7 +94,7 @@ func CalcPageCount(total, pageSize int64) int64 {
 	return (total + pageSize - 1) / pageSize
 }
 
-// CalcOffset 计算分页偏移量
+// CalcOffset 计算分页偏移量 (page-1)*pageSize。page<=0 时按 1 处理，pageSize<=0 时按 20 处理。
 func CalcOffset(page, pageSize int) int {
 	if page <= 0 {
 		page = 1

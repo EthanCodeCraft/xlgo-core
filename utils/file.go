@@ -76,7 +76,7 @@ func AppendFile(path string, data []byte) error {
 	return err
 }
 
-// CopyFile 复制文件
+// CopyFile 将 src 复制到 dst（覆盖），自动创建目标目录。src 不存在时返回其 Open 错误。
 func CopyFile(dst, src string) error {
 	// #nosec G304 -- generic filesystem helper intentionally opens caller-provided trusted source paths.
 	srcFile, err := os.Open(src)

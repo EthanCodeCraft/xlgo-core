@@ -459,8 +459,13 @@ func (a *App) Init() error {
 
 // failAfterInit 在 doInit 失败时执行资源回滚（M1）。
 // 顺序：标记 stateStopping（阻新 Go）→ cancel rootCtx → wg.Wait（让 a.Go 启动的探活等
-// goroutine 先退出）→ closeResources。先停 goroutine 再关资源，避免“关 DB 时探活 goroutine
-// 仍在用”的竞态。回滚错误与原 initErr 合并上抛，不吞。
+// goroutine 先退出，10s 超时）→ stopCron(5s) → rollbackReplacedResources。
+// 先停 goroutine 再回滚资源，避免“回滚 DB 时探活 goroutine 仍在用”的竞态。
+//
+// 回滚走 rollbackReplacedResources（恢复 Init 前默认 manager 再关新建 manager），
+// 而非 closeResources（直接关闭，仅供 doShutdown 复用）。Init 失败需恢复默认 manager
+// 而非直接关，故两者不复用同一路径。cron 停止预算固定 5s，由本路径单独停止。
+// 回滚错误与原 initErr 合并上抛，不吞。
 func (a *App) failAfterInit() {
 	a.lifecycleMu.Lock()
 	a.state = stateStopping
@@ -493,8 +498,10 @@ func (a *App) failAfterInit() {
 }
 
 // closeResources 关闭 db→redis→logger（M1）。各均为幂等 no-op（未 init 时安全），
-// 供 failAfterInit 与 doShutdown 复用。cron 因停止预算随调用方不同（Init 失败 5s /
-// Shutdown 剩余预算），由各调用方单独停止，不在此处。返回聚合错误。
+// 仅供 doShutdown 复用。cron 因停止预算随调用方不同（Init 失败 5s / Shutdown 剩余
+// 预算），由各调用方单独停止，不在此处。返回聚合错误。
+// 注意：Init 失败的回滚不经本函数，而走 failAfterInit 的 rollbackReplacedResources
+// （需恢复 Init 前默认 manager，而非直接关闭）。
 func (a *App) closeResources() error {
 	var errs []error
 	if a.initializedMySQL {
@@ -1050,7 +1057,9 @@ func (a *App) doShutdown(wasInitialized bool) error {
 	logger.Info("停止限流器...")
 	middleware.StopRateLimiters()
 
-	// db/redis/logger 经 closeResources 统一关闭（与 failAfterInit 复用，M1）。
+	// db/redis/logger 经 closeResources 统一关闭（M1）。注意：closeResources 仅供
+	// Shutdown 路径使用；Init 失败的回滚走 failAfterInit 的 rollbackReplacedResources，
+	// 两者不复用同一路径（Init 失败需恢复默认 manager，Shutdown 直接关闭）。
 	// 先记最后一条 "应用已优雅关闭"，再 Close（关闭后写日志会 fall back 到 nop）。
 	logger.Info("关闭数据库连接/Redis/日志...")
 	logger.Info("应用已优雅关闭")

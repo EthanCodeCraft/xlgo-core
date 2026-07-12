@@ -73,12 +73,12 @@ func StartOfWeek(t time.Time) time.Time {
 	return StartOfDay(monday)
 }
 
-// StartOfMonth 返回指定时间当月的开始时间
+// StartOfMonth 返回指定时间当月 1 日 00:00:00（保留原时区）。
 func StartOfMonth(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
 }
 
-// EndOfMonth 返回指定时间当月的结束时间
+// EndOfMonth 返回指定时间当月最后一天 23:59:59.999999999（保留原时区）。
 func EndOfMonth(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month()+1, 0, 23, 59, 59, 999999999, t.Location())
 }

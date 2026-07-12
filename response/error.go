@@ -91,6 +91,9 @@ func (e *Error) Error() string {
 //
 // H-10 修复：返回新 *Error 拷贝，不 mutate 接收者。预定义 Err*（如 ErrNotFound）是
 // 包级共享指针，原实现 e.Detail = detail 会污染全局且并发调用存在数据竞争。
+//
+// nil 接收者：返回 &Error{Detail: detail}（Code=0/Message=""），不 panic；调用方应避免
+// 在 nil 上调用本方法以拿到无 Code/Message 的半成品错误。
 func (e *Error) WithDetail(detail string) *Error {
 	if e == nil {
 		return &Error{Detail: detail}

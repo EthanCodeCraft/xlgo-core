@@ -34,7 +34,7 @@ type BaseRepository[T any] interface {
 	Create(ctx context.Context, model *T) error
 	// Update 更新记录
 	Update(ctx context.Context, model *T) error
-	// Delete 删除记录（软删除）
+	// Delete 删除记录（T 含软删除字段时为软删除，否则为硬删除；详见 BaseRepo.Delete）
 	Delete(ctx context.Context, id uint) error
 	// FindByIDs 批量查询
 	FindByIDs(ctx context.Context, ids []uint) ([]T, error)
@@ -143,8 +143,8 @@ func (r *BaseRepo[T]) Update(ctx context.Context, model *T) error {
 //
 // 示例：
 //
-//	repo.UpdateFields(ctx, &User{Name: "new"}, "name")        // 仅更新 name
-//	repo.UpdateFields(ctx, map[string]any{"status": 0}, "id = ?", id) // 显式置零
+//	repo.UpdateFields(ctx, &User{Name: "new"})                  // struct：仅更新非零字段 name
+//	repo.UpdateFields(ctx, map[string]any{"status": 0}, "id = ?", id) // map：显式置零，带条件
 func (r *BaseRepo[T]) UpdateFields(ctx context.Context, model any, conds ...any) error {
 	db := r.writeConn(ctx).Model(new(T))
 	if len(conds) > 0 {

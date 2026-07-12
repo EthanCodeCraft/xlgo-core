@@ -49,11 +49,12 @@ func SHA256Bytes(data []byte) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// HashFile 计算文件的哈希值。
+// HashFile 流式计算文件的哈希值，返回 hex 编码字符串。
 //
-// M-F 修复：改为流式 io.Copy(h, f)，不再经 ReadFile 把整文件读入内存——原实现大文件 OOM。
-// 流式哈希内存占用恒定、可处理任意大小文件，与 hash.Hash 的 io.Writer 接口契合。
-// 调用方负责选择哈希算法（如 sha256.New）。
+// newHash 须返回全新的 hash.Hash 实例（如 sha256.New），本函数不复用它。
+// Open 或读取失败时返回错误。M-F 修复：改为流式 io.Copy(h, f)，不再经 ReadFile 把整文件
+// 读入内存——原实现大文件 OOM。流式哈希内存占用恒定、可处理任意大小文件，与 hash.Hash
+// 的 io.Writer 接口契合。调用方负责选择哈希算法（如 sha256.New）。
 func HashFile(path string, newHash func() hash.Hash) (string, error) {
 	// #nosec G304 -- generic hashing helper intentionally opens caller-provided trusted local paths.
 	f, err := os.Open(path)

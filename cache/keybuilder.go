@@ -44,7 +44,7 @@ func WithSeparator(separator string) KeyBuilderOption {
 }
 
 // WithCacheType 设置缓存类型标识
-// 示例: WithCacheType("session") -> "session_site_a_user:1"
+// 示例: WithCacheType("session") -> "session:site_a:user:1"
 func WithCacheType(cacheType string) KeyBuilderOption {
 	return func(kb *KeyBuilder) {
 		if kb == nil {
@@ -72,7 +72,7 @@ func NewKeyBuilder(opts ...KeyBuilderOption) *KeyBuilder {
 
 // Build 构建完整键名（CK2 修复：mu 读保护）。
 // 格式: {cacheType}{separator}{prefix}{separator}{key}
-// 示例: kb.Build("user:1") -> "cache_site_a_user:1"
+// 示例: kb.Build("user:1") -> "cache:site_a:user:1"
 func (kb *KeyBuilder) Build(key string) string {
 	kb.mu.Lock()
 	defer kb.mu.Unlock()
@@ -153,7 +153,7 @@ func (kb *KeyBuilder) BuildSession(key string) string {
 }
 
 // BuildPattern 构建匹配模式（用于 SCAN/Keys）（CK2 修复：mu 读保护）。
-// 示例: kb.BuildPattern("user:*") -> "cache_site_a_user:*"
+// 示例: kb.BuildPattern("user:*") -> "cache:site_a:user:*"
 func (kb *KeyBuilder) BuildPattern(pattern string) string {
 	return kb.Build(pattern)
 }

@@ -8,7 +8,7 @@
 //
 //	POST /api/v1/login           {"username":"alice","password":"secret"}  → 返回 token
 //	GET  /api/v1/users/:id       （需 Authorization: Bearer <token>）
-//	POST /api/v1/users           （创建用户）
+//	POST /api/v1/users           （需 Authorization: Bearer <token>，创建用户）
 //
 // 示例会在启动时初始化 alice/secret，密码以 bcrypt 哈希保存。
 //
@@ -58,9 +58,6 @@ func main() {
 			},
 		}),
 	)
-
-	// 初始化 user repository（App.Init 之后 master DB 才可用，这里在 registerRoutes 里延迟拿）
-	_ = app
 
 	if err := app.Run(); err != nil {
 		fmt.Printf("启动失败: %v\n", err)

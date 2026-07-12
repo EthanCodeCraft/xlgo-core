@@ -21,10 +21,15 @@ var writeMu sync.Mutex
 type Level int32
 
 const (
+	// LevelDebug 调试级别（最低）。
 	LevelDebug Level = iota
+	// LevelInfo 普通信息。
 	LevelInfo
+	// LevelSuccess 成功信息。
 	LevelSuccess
+	// LevelWarn 警告。
 	LevelWarn
+	// LevelError 错误（最高常规级别）。
 	LevelError
 
 	// LevelSilent 完全静默：所有调用都不输出

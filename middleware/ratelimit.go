@@ -34,7 +34,9 @@ type visitor struct {
 	count       int
 }
 
-// NewRateLimiter 创建速率限制器（内存版）
+// NewRateLimiter 创建速率限制器（内存版）。
+// rate<=0 或 window<=0 时 panic。内部启动 cleanup goroutine，调用方负责在不再使用时
+// 调用 (*RateLimiter).Stop 释放，否则 goroutine 泄漏。
 func NewRateLimiter(rate int, window time.Duration) *RateLimiter {
 	mustValidRateLimit(rate, window)
 	ctx, cancel := context.WithCancel(context.Background())
