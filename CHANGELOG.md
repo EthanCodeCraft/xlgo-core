@@ -16,11 +16,17 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
-> 复审报告 `gpt_check_report_review.md` 第一优先级（致命/进程级可用性）修复。P1 共 4 项，本次发布已推进 M13 cron panic、M1 App 生命周期、M3 logger 生命周期临界区；M8 CSRF JSON body 上限随后推进。
+## [1.3.0] - 2026-07-12
+
+> 同义可失败 API 收敛 + 注释/文档一致性修复 + 前序评审收口。
 >
-> config 模块评审（`glm_check_report_module_01_config.md`）修复：H-config-1 Set/viper 同源、M-config-1 回调 panic 隔离、M-config-2 DB SSL/TLS、M-config-3 App 关闭停 watcher、M-config-4 Clone 守卫、L-config-2/3/4/5/6。
+> **API 收敛**（`gpt_clear_function.md` 计划）：按"同一能力只保留一个主入口、框架不替上层吞错、安全路径默认 fail-closed"原则，收敛 cache/jwt/storage/ratelimit 四个包的历史双轨 API。自定义 `CacheService`/`Storage` 实现需同步更新签名（编译失败即迁移信号）。
 >
-> database 模块评审（`glm_check_report_module_04_database.md`）修复：H-db-1 后台探活/启动 ping 经 pingWithTimeout 3s 约束（M11 修复不完整）。
+> **注释/文档一致性**（`glm_note_report.md` 报告）：A/B/C 三档共 23 项注释/文档修复，无运行逻辑变更。
+>
+> **前序评审收口**：M13 cron panic、M1 App 生命周期状态机、M3 logger 生命周期临界区；config 模块评审（H-config-1 Set/viper 同源、M-config-1 回调 panic 隔离、M-config-2 DB SSL/TLS、M-config-3 App 关闭停 watcher、M-config-4 Clone 守卫）；database 模块评审（H-db-1 后台探活/启动 ping 经 pingWithTimeout 3s 约束）。
+>
+> 项目处于初级阶段，无下游用户，放心引入破坏性变更。`go vet` + `go build` + `go test -race ./...` 全绿。
 
 ### Breaking ⚠️
 

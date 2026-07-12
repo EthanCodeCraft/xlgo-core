@@ -30,7 +30,7 @@ import (
 
 // Version 框架版本号。发版时只改这一处，避免版本字面量散落各处。
 // CLI（xlgo version）、脚手架生成的 go.mod 等均引用此常量。
-const Version = "1.2.0"
+const Version = "1.3.0"
 
 // HealthCheckFunc 健康检查函数
 type HealthCheckFunc func(context.Context) error
