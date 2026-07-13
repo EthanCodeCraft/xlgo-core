@@ -23,14 +23,16 @@ import (
 	"github.com/EthanCodeCraft/xlgo-core/response"
 	"github.com/EthanCodeCraft/xlgo-core/router"
 	"github.com/EthanCodeCraft/xlgo-core/storage"
+	"github.com/EthanCodeCraft/xlgo-core/trace"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
 // Version 框架版本号。发版时只改这一处，避免版本字面量散落各处。
 // CLI（xlgo version）、脚手架生成的 go.mod 等均引用此常量。
-const Version = "1.3.0"
+const Version = "1.4.0"
 
 // HealthCheckFunc 健康检查函数
 type HealthCheckFunc func(context.Context) error
@@ -57,6 +59,14 @@ type Hook struct {
 type staticRoute struct {
 	relativePath string
 	root         string
+}
+
+// cronTask 收集 WithCronTask 注册的任务，doInit 创建 App 调度器后批量注册（照
+// WithMigrator/WithHealthCheck 的"Option 收集、doInit 应用"模式）。
+type cronTask struct {
+	name     string
+	schedule cron.Schedule
+	handler  cron.TaskHandler
 }
 
 // appState 是 App 生命周期状态机（M1）。状态受 lifecycleMu 保护，单调推进：
@@ -99,6 +109,7 @@ type App struct {
 	enableReadiness   bool
 	enableMetrics     bool
 	enableCron        bool
+	enableTrace       bool
 	metricsPath       string
 
 	staticRoutes []staticRoute
@@ -123,6 +134,9 @@ type App struct {
 	initializedMySQL  bool
 	initializedRedis  bool
 	initializedCron   bool
+	initializedTrace  bool
+	initializedStorage bool
+	initializedCache  bool
 
 	loggerManager  *logger.LogManager
 	loggerSnapshot *logger.DefaultSnapshot
@@ -130,6 +144,15 @@ type App struct {
 	previousDB     *database.Manager
 	redisManager   *database.RedisManager
 	previousRedis  *database.RedisManager
+	storageManager  *storage.StorageManager
+	previousStorage *storage.StorageManager
+	scheduler        *cron.Scheduler
+	previousScheduler *cron.Scheduler
+	cronTasks        []cronTask
+	cacheManager     *cache.CacheManager
+	previousCache    *cache.CacheManager
+	rateLimitRegistry     *middleware.RateLimitRegistry
+	previousRateLimitRegistry *middleware.RateLimitRegistry
 
 	// 请求级超时（#19），<=0 表示不启用
 	requestTimeout time.Duration
@@ -254,12 +277,6 @@ func WithoutStorage() Option {
 	return func(a *App) { a.enableStorage = false }
 }
 
-// WithoutWire 已移除（wire 包在 v1.1.0 删除）。保留空函数仅为编译兼容，
-// 调用无副作用。后续版本将删除。
-func WithoutWire() Option {
-	return func(a *App) {}
-}
-
 // WithAutoMigrate 启用数据库迁移（需配合 WithMigrator/WithModels 注册迁移逻辑）
 func WithAutoMigrate() Option {
 	return func(a *App) { a.enableAutoMigrate = true }
@@ -331,12 +348,43 @@ func WithRequestTimeout(d time.Duration) Option {
 	return func(a *App) { a.requestTimeout = d }
 }
 
-// WithCron 将全局 cron 调度器纳入 App 生命周期（P1 #10）。
-// 启用后：Init 末尾 cron.Start() 启动调度循环；Shutdown 时在 ShutdownTimeout 约束内
-// 停止全局调度器并等待在跑任务退出（cron.StopGlobalWithTimeout），避免调度 goroutine
-// 与在跑任务在优雅关闭后残留。任务仍通过 cron.AddTask(...) 在 Run 前注册。
+// WithCron 将 cron 调度器纳入 App 生命周期（Phase 3 实例化）。
+// 启用后：Init 时创建 App 专属 Scheduler、注册 WithCronTask 收集的任务、提升为全局默认、
+// Start 启动调度循环；Shutdown 在剩余预算内 StopWithTimeout 等待在跑任务退出。
+//
+// 任务注册：优先用 WithCronTask(...)（或 Init 后 app.Scheduler().AddTask(...)）注册到 App 实例。
+// 包级 cron.AddTask(...) 仍可用--它代理到当前全局默认（App swap 后即 App 的调度器）--但
+// 在 App.Init 之前调用会注册到 init 默认调度器、被 App swap 丢弃，故 pre-Init 注册请用 WithCronTask。
 func WithCron() Option {
 	return func(a *App) { a.enableCron = true }
+}
+
+// WithCronTask 注册一个定时任务到 App 的调度器（Phase 3）。蕴含启用 cron（照 WithMigrator
+// 自动启用 AutoMigrate 的模式），故无需同时 WithCron。任务在 doInit 创建调度器后注册。
+//
+// name/schedule/handler 的校验由 cron.Scheduler.AddTask 负责（nil schedule/handler panic，
+// 非法 cron 字段 panic）。动态输入请先用 cron.ParseCronStrict 处理 error。
+func WithCronTask(name string, schedule cron.Schedule, handler cron.TaskHandler) Option {
+	return func(a *App) {
+		a.cronTasks = append(a.cronTasks, cronTask{name: name, schedule: schedule, handler: handler})
+		a.enableCron = true
+	}
+}
+
+// WithTrace 将链路追踪（OpenTelemetry）纳入 App 生命周期（Phase 1）。
+//
+// 启用后：Init 时按 config.Trace 调 trace.Init（安装 TracerProvider/Propagator）并把
+// trace.Middleware 装入全局中间件链；Shutdown 时调 trace.Close 刷出 exporter 并释放
+// 后台 goroutine/连接（H-14 后 Close 幂等，但 App 此前从未调它--本 Option 补上生命周期闭环）。
+//
+// 实际是否导出 span 由 config.Trace.Enabled 控制：Enabled=false（默认）时 trace.Init
+// 安装 Noop tracer，Middleware 不 panic、不导出。故"WithTrace + trace.enabled=true + endpoint"
+// 才真正出链路；仅 WithTrace 而未配 enabled 为 Noop（安全）。
+//
+// 不做 per-App 实例隔离：OTel 的 TracerProvider/Propagator 是进程级全局单例
+// （otel.SetTracerProvider 全局生效），多 App 进程共享同一 OTel 状态，与 OTel 设计一致。
+func WithTrace() Option {
+	return func(a *App) { a.enableTrace = true }
 }
 
 // WithModels 注册 GORM 自动迁移模型（自动启用 AutoMigrate）
@@ -396,6 +444,10 @@ func New(opts ...Option) *App {
 	app.registry = router.NewRegistry(app.router)
 	// rootCtx 生命周期与 App 一致，不依赖 Init，使 App.Go 在 Init 前也可用（#22）
 	app.rootCtx, app.cancel = context.WithCancel(context.Background())
+	// Phase 5：限流器 Registry 在 New 时预创建，使 app.RateLimitRegistry() 在 Init 前即可用于
+	// 路由装配（app-bound 中间件捕获此实例，请求时走 App 自己的 Registry 而非全局默认，
+	// 实现多 App per-App 计数隔离）。doInit 时 swap 为全局默认供包级 facade 代理。
+	app.rateLimitRegistry = middleware.NewRateLimitRegistry()
 
 	for _, opt := range opts {
 		opt(app)
@@ -488,6 +540,15 @@ func (a *App) failAfterInit() {
 	if err := a.stopCron(5 * time.Second); err != nil {
 		a.initErr = errors.Join(a.initErr, err)
 	}
+	// trace 不是 swap 资源（OTel 全局），不走 rollbackReplacedResources；Init 失败时单独 Close。
+	if a.initializedTrace {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := trace.Close(closeCtx); err != nil {
+			a.initErr = errors.Join(a.initErr, fmt.Errorf("trace 关闭失败: %w", err))
+		}
+		closeCancel()
+		a.initializedTrace = false
+	}
 	if rbErr := a.rollbackReplacedResources(); rbErr != nil {
 		a.initErr = errors.Join(a.initErr, fmt.Errorf("回滚已初始化资源失败: %w", rbErr))
 	}
@@ -525,6 +586,17 @@ func (a *App) closeResources() error {
 		}
 		a.initializedRedis = false
 		a.redisManager = nil
+	}
+	if a.initializedStorage {
+		// StorageManager.Close 当前为 no-op（oss.Client 无 Close），但闭合 Init/Close 生命周期，
+		// 为未来驱动预留收口点。与 db/redis/logger manager 对齐。
+		if a.storageManager != nil {
+			if err := a.storageManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.initializedStorage = false
+		a.storageManager = nil
 	}
 	if a.initializedLogger {
 		if a.loggerManager != nil {
@@ -575,6 +647,48 @@ func (a *App) rollbackReplacedResources() error {
 		a.previousRedis = nil
 		a.initializedRedis = false
 	}
+	if a.initializedStorage {
+		// 把全局默认 swap 回 Init 前的旧实例，并 Close 本 App 新建的 manager（与 closeResources
+		// 的 Shutdown 路径对称）。当前 Close 为 no-op，但未来驱动有真实副作用时不漏关。
+		if a.previousStorage != nil {
+			storage.SwapDefaultStorageManager(a.previousStorage)
+		}
+		if a.storageManager != nil {
+			if err := a.storageManager.Close(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		a.storageManager = nil
+		a.previousStorage = nil
+		a.initializedStorage = false
+	}
+	// cron：stopCron 已在 failAfterInit 停止调度 goroutine（并把 initializedCron 置 false），
+	// 此处仅把全局默认 swap 回 Init 前的旧调度器。用 a.scheduler 作守卫（stopCron 不 nil 它）。
+	if a.scheduler != nil {
+		if a.previousScheduler != nil {
+			cron.SwapDefaultScheduler(a.previousScheduler)
+		}
+		a.previousScheduler = nil
+		a.scheduler = nil
+	}
+	if a.initializedCache {
+		// CacheManager 无 Close（client 由 redisManager 持有）：仅 swap 回全局默认、清理引用。
+		if a.previousCache != nil {
+			cache.SwapDefaultCacheManager(a.previousCache)
+		}
+		a.cacheManager = nil
+		a.previousCache = nil
+		a.initializedCache = false
+	}
+	if a.rateLimitRegistry != nil {
+		// 停止可能已创建的 limiter（Init 期间通常无请求、无 limiter；Stop 幂等）。
+		a.rateLimitRegistry.Stop()
+		if a.previousRateLimitRegistry != nil {
+			middleware.SwapDefaultRateLimitRegistry(a.previousRateLimitRegistry)
+		}
+		a.previousRateLimitRegistry = nil
+		a.rateLimitRegistry = nil
+	}
 	if a.initializedLogger {
 		if err := logger.RestoreDefaultSnapshot(a.loggerSnapshot); err != nil {
 			errs = append(errs, err)
@@ -587,22 +701,40 @@ func (a *App) rollbackReplacedResources() error {
 }
 
 func (a *App) commitReplacedResources() {
+	// Phase 4 多 App 修复：不关闭 previousDB/previousRedis。previous 是 Init 前的全局默认，
+	// 多 App 下可能属于另一个 App 的活跃 manager--关闭会误杀它（B 的 commit 关掉 A 的 redis，
+	// 致 A 的 cache 持有的 client 失效 "redis: client is closed"）。此 App 不 owns previous，
+	// 仅清理回滚引用。单 App 下 previous 为 init() 空默认（无 client，Close 本就是 no-op），
+	// 不关闭无泄漏。用户若手动 InitRedis/InitDB 后再 App.Init，旧 client 的关闭由用户负责。
 	if a.previousDB != nil {
-		if err := a.previousDB.Close(); err != nil {
-			logger.Warnf("关闭被替换的旧数据库 manager 失败: %v", err)
-		}
 		a.previousDB = nil
 	}
 	if a.previousRedis != nil {
-		if err := a.previousRedis.Close(); err != nil {
-			logger.Warnf("关闭被替换的旧 Redis manager 失败: %v", err)
-		}
 		a.previousRedis = nil
 	}
+	if a.previousStorage != nil {
+		// StorageManager 无 Close；Init 成功后仅清理回滚引用，旧实例交由 GC。
+		a.previousStorage = nil
+	}
+	if a.previousScheduler != nil {
+		// App 调度器已 Start 并接管全局默认；旧默认（init 或上一 App 的）无 goroutine 需停
+		// （init 默认从未 Start；上一 App 的已在其 Shutdown 停止）。仅清理回滚引用。
+		a.previousScheduler = nil
+	}
+	if a.previousCache != nil {
+		// CacheManager 无 Close（client 由 redisManager 持有）；仅清理回滚引用。
+		a.previousCache = nil
+	}
+	if a.previousRateLimitRegistry != nil {
+		// Registry 的 limiter 由 App.Shutdown 的 registry.Stop() 停止；此处仅清理回滚引用。
+		a.previousRateLimitRegistry = nil
+	}
 	if a.loggerSnapshot != nil {
-		if err := logger.CloseDefaultSnapshot(a.loggerSnapshot); err != nil {
-			logger.Warnf("关闭被替换的旧 logger writer 失败: %v", err)
-		}
+		// Phase 4 多 App 修复（与 previousDB/previousRedis 对齐）：不关闭 loggerSnapshot 捕获的
+		// 旧 writers。多 App 下该 snapshot 可能捕获的是另一个 App 的活跃 logger writers--关闭会
+		// 误杀它（B 的 commit 关掉 A 的 app.log/api.log writer，A 后续写日志失败/丢失）。此 App
+		// 不 owns 旧 writers：init() 默认为 Nop（无 writer，不泄漏）；另一 App 的 writers 由其自身
+		// Shutdown 关闭；用户手动配置 logger 后再 App.Init 的旧 writer 由用户负责。仅清理回滚引用。
 		a.loggerSnapshot = nil
 	}
 }
@@ -612,7 +744,11 @@ func (a *App) stopCron(timeout time.Duration) error {
 		return nil
 	}
 	a.initializedCron = false
-	if !cron.StopGlobalWithTimeout(timeout) {
+	if a.scheduler == nil {
+		return nil
+	}
+	// 停 App 专属调度器（Phase 3），不再调全局 cron.StopGlobalWithTimeout。
+	if !a.scheduler.StopWithTimeout(timeout) {
 		return fmt.Errorf("cron 调度器停止超时（%s）", timeout)
 	}
 	return nil
@@ -657,6 +793,15 @@ func (a *App) doInit() error {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
+	// trace 先于其它组件初始化：失败即早退，避免已建 DB/Redis 等资源因 trace 失败回滚。
+	// OTel 进程全局，Init 安装全局 TracerProvider；Enabled=false 时为 Noop（安全）。
+	if a.enableTrace {
+		if err := trace.Init(buildTraceConfig(cfg)); err != nil {
+			return fmt.Errorf("初始化 trace 失败: %w", err)
+		}
+		a.initializedTrace = true
+	}
+
 	if a.enableLogger {
 		lm := logger.NewLogManager()
 		snapshot := logger.SnapshotDefault()
@@ -698,14 +843,26 @@ func (a *App) doInit() error {
 	}
 
 	if a.enableStorage {
-		if err := storage.Init(&cfg.Storage); err != nil {
+		sm := storage.NewStorageManager()
+		if err := sm.Init(&cfg.Storage); err != nil {
 			return fmt.Errorf("初始化存储失败: %w", err)
 		}
+		// 实例化 + 提升为全局默认（照 db/redis 的 Swap 模式）。StorageManager 无 Close
+		// （LocalStorage/OSSStorage 无 closeable 资源），Shutdown 不关、仅 Init 失败时 swap 回退。
+		a.previousStorage = storage.SwapDefaultStorageManager(sm)
+		a.storageManager = sm
+		a.initializedStorage = true
 	}
 
 	if a.enableRedis {
-		// Redis 就绪后初始化缓存（cache 依赖 Redis 客户端）
-		cache.Init()
+		// Redis 就绪后初始化缓存。Phase 4：注入 App 的 redisManager.Client()，使缓存走 per-App
+		// Redis 而非全局 database.GetRedis()（修复多 App 跨 Redis 串越）。提升为全局默认供包级
+		// facade（cache.Get 等）代理到此。CacheManager 无 Close（client 由 redisManager 持有）。
+		cm := cache.NewCacheManager()
+		cm.InitWithRedis(a.redisManager.Client())
+		a.previousCache = cache.SwapDefaultCacheManager(cm)
+		a.cacheManager = cm
+		a.initializedCache = true
 	}
 
 	if a.enableAutoMigrate && len(a.migrators) > 0 {
@@ -726,6 +883,17 @@ func (a *App) doInit() error {
 	// 全局中间件链：RequestID 必须最先装入，保证后续 Recovery/日志/响应都能拿到 request_id（#24）
 	a.router.Use(middleware.RequestID())
 	a.router.Use(middleware.Recover())
+	// trace 中间件装在 Recover 之后：Recover 兜底捕获 trace 内 panic，span 覆盖业务 handler。
+	// Enabled=false 时为 Noop tracer，Middleware 不导出；noop span 无 TraceID 则不写 X-Trace-ID。
+	if a.enableTrace {
+		// 用与 buildTraceConfig 一致的回退名（ServiceName 空时取 cfg.App.Name），避免中间件
+		// span 属性与 provider resource 的 service.name 来源不一致。
+		svcName := a.config.Trace.ServiceName
+		if svcName == "" {
+			svcName = a.config.App.Name
+		}
+		a.router.Use(trace.Middleware(svcName))
+	}
 	// 请求级超时（#19），配置后装入，下游走 c.Request.Context() 级联取消
 	if a.requestTimeout > 0 {
 		a.router.Use(middleware.Timeout(a.requestTimeout))
@@ -781,11 +949,22 @@ func (a *App) doInit() error {
 		a.Go(a.dbManager.StartProbing)
 	}
 
-	// 启动 cron 全局调度器（P1 #10），Shutdown 时统一停止。任务须在此前经 cron.AddTask 注册。
+	// 启动 App 专属 cron 调度器（Phase 3 实例化）：创建实例 -> 注册 WithCronTask 收集的任务 ->
+	// 提升为全局默认（包级 cron.AddTask 代理到此）-> Start。Shutdown 时 StopWithTimeout。
 	if a.enableCron {
-		cron.Start()
+		a.scheduler = cron.NewScheduler()
+		for _, ct := range a.cronTasks {
+			a.scheduler.AddTask(ct.name, ct.schedule, ct.handler)
+		}
+		a.previousScheduler = cron.SwapDefaultScheduler(a.scheduler)
+		a.scheduler.Start()
 		a.initializedCron = true
 	}
+
+	// Phase 5：把 New 时预创建的 App 专属 Registry 提升为全局默认，供包级 facade（LoginRateLimit
+	// 等）代理。app-bound 中间件（app.RateLimitRegistry().LoginRateLimit()）直接捕获此实例，
+	// 不查全局默认，实现多 App per-App 计数隔离。不预 Init（懒创建）；Shutdown 时 Stop。
+	a.previousRateLimitRegistry = middleware.SwapDefaultRateLimitRegistry(a.rateLimitRegistry)
 
 	// OnInit hooks：组件初始化完成后触发（#12）
 	for _, h := range a.hooks {
@@ -828,6 +1007,36 @@ func (a *App) resolveConfig() (*config.Config, error) {
 	}
 	a.config = cfg
 	return cfg, nil
+}
+
+// buildTraceConfig 把 config.TraceConfig 映射为 trace.Config，并补友好默认值：
+//   - ServiceName 空时回退 cfg.App.Name（业务侧常已配 app.name，免重复填）；
+//   - ExporterType 空时默认 "otlp-http"（最常用），避免 trace.Init 对空值报"不支持的导出器类型"。
+//
+// 不默认 Endpoint/SampleRatio/Propagator：Endpoint 空时 OTEL 客户端走自身默认（localhost:4318）；
+// SampleRatio=0 是合法值（不采样），不应被默认覆盖；Propagator 空时 trace.Init 已按 w3c 处理。
+// Enabled 完全透传--由 config.Trace.Enabled 决定是否真正导出，WithTrace 只管生命周期。
+func buildTraceConfig(cfg *config.Config) trace.Config {
+	tc := cfg.Trace
+	exporter := tc.ExporterType
+	if exporter == "" {
+		exporter = "otlp-http"
+	}
+	name := tc.ServiceName
+	if name == "" {
+		name = cfg.App.Name
+	}
+	return trace.Config{
+		ServiceName:    name,
+		ServiceVersion: tc.ServiceVersion,
+		Environment:    tc.Environment,
+		ExporterType:   exporter,
+		Endpoint:       tc.Endpoint,
+		Insecure:       tc.Insecure,
+		SampleRatio:    tc.SampleRatio,
+		Enabled:        tc.Enabled,
+		Propagator:     tc.Propagator,
+	}
 }
 
 // Run 启动应用
@@ -1054,8 +1263,21 @@ func (a *App) doShutdown(wasInitialized bool) error {
 		}
 	}
 
-	logger.Info("停止限流器...")
-	middleware.StopRateLimiters()
+	// Phase 5：停 App 专属限流器 Registry（不再调全局 middleware.StopRateLimiters，避免误停其他 App）。
+	if a.rateLimitRegistry != nil {
+		logger.Info("停止限流器...")
+		a.rateLimitRegistry.Stop()
+	}
+
+	// trace.Close 刷出 exporter 批量 span 并释放后台 goroutine/连接（H-14 后幂等）。
+	// 放在 db/redis/logger 关闭之前，避免 exporter 依赖已关闭的日志/连接。
+	if a.initializedTrace {
+		logger.Info("关闭 trace...")
+		if err := trace.Close(ctx); err != nil {
+			logger.Warnf("trace 关闭失败: %v", err)
+			errs = append(errs, err)
+		}
+	}
 
 	// db/redis/logger 经 closeResources 统一关闭（M1）。注意：closeResources 仅供
 	// Shutdown 路径使用；Init 失败的回滚走 failAfterInit 的 rollbackReplacedResources，
@@ -1107,4 +1329,36 @@ func (a *App) GetRouter() *gin.Engine {
 // GetServer 获取 HTTP Server（用于高级自定义）
 func (a *App) GetServer() *http.Server {
 	return a.server
+}
+
+// Scheduler 返回 App 专属的 cron 调度器（Phase 3）。Init 后非 nil，用于动态注册任务
+// （app.Scheduler().AddTask(...)）。未启用 cron 或 Init 前返回 nil。
+func (a *App) Scheduler() *cron.Scheduler {
+	return a.scheduler
+}
+
+// Cache 返回 App 专属的缓存服务（Phase 4）。Init 后非 nil，用于直接操作 App 的缓存
+// （绕过全局 facade，多 App 隔离场景下确保走 App 自己的 Redis）。未启用 Redis 或 Init 前返回 nil。
+func (a *App) Cache() cache.CacheService {
+	if a.cacheManager == nil {
+		return nil
+	}
+	return a.cacheManager.Get()
+}
+
+// RedisClient 返回 App 专属的 Redis 客户端（Phase 5），用于注入到需要 redis client 的
+// 组件（如 middleware.NewRedisRateLimiter(..., middleware.WithRedisClient(app.RedisClient()))），
+// 使其走 App 的 Redis 而非全局。未启用 Redis 或 Init 前返回 nil。
+func (a *App) RedisClient() *redis.Client {
+	if a.redisManager == nil {
+		return nil
+	}
+	return a.redisManager.Client()
+}
+
+// RateLimitRegistry 返回 App 专属的限流器 Registry（Phase 5）。New 后即非 nil，用于装配
+// app-bound 限流中间件（app.RateLimitRegistry().LoginRateLimit() 等）--此类中间件捕获 App
+// 自己的 Registry，请求时不查全局默认，实现多 App per-App 计数隔离。
+func (a *App) RateLimitRegistry() *middleware.RateLimitRegistry {
+	return a.rateLimitRegistry
 }

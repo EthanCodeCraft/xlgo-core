@@ -16,6 +16,51 @@ xlgo 框架更新日志。本文档遵循 [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-12
+
+> **instance+facade 一致性收尾**：cron/storage/cache/ratelimit 四个"纯全局"包按 `database.Manager`/`jwt.Manager` 模式实例化（App 持实例 + `SwapDefault*` 提升全局默认 + 包级 facade 代理），消除单进程多 App 互相污染；trace 纳入 App 生命周期（不做实例隔离，OTel 本身进程全局）；清理 `WithoutWire` 空函数。
+>
+> **修复的多 App 冲突**：① App A `Shutdown` 不再把全局 cron 调度器 / 限流器停掉（B 的任务/限流不受影响）；② App B `Init` 不再覆盖 App A 的 storage driver / cache redis；③ cache/ratelimit 不再硬编码 `database.GetRedis()`，可注入 per-App redis；④ `commitReplacedResources` 不再关闭"被替换的全局默认"DB/Redis manager（多 App 下那可能是另一个 App 的活跃 manager，关闭致 "redis: client is closed"）；⑤ trace.Close 在 `App.Shutdown` 被调用（此前从未调用，exporter 后台 goroutine/连接泄漏）。
+>
+> `go vet` + `go build` + `go test -race ./...` 全绿。本机需 `-buildvcs=false`。
+
+### Breaking ⚠️
+
+- **`xlgo.WithoutWire()` 删除**（app.go）：自 v1.1.0 wire 包删除后遗留的空 no-op 函数，全仓无引用。直接删除，无替代；调用方删除该 Option 即可（无行为变化）。
+- **`cron.AddTask(...)` 在 `App.Init` 之前注册不再生效**（cron/cron.go + app.go）：App 现持专属 `*Scheduler`，`Init` 时创建并 `SwapDefaultScheduler` 提升为全局默认。pre-Init 调用包级 `cron.AddTask` 会注册到 init 默认调度器、被 App swap 丢弃。迁移：改用 `xlgo.WithCronTask(name, schedule, handler)`（蕴含启用 cron），或 `Init` 后 `app.Scheduler().AddTask(...)`。post-Init 的包级 `cron.AddTask` 仍可用（代理到 App 调度器）。`cron` 包 `init()` 现预创建全局默认调度器（曾为懒初始化）。
+- **`middleware.StopRateLimiters()` 语义收窄**（middleware/ratelimit.go）：仅停止全局默认 `RateLimitRegistry` 的限流器。App 现持专属 Registry，`Shutdown` 调 `app` 自己的 `Stop`，不再调全局 `StopRateLimiters`（避免误停其他 App）。`LoginRateLimit`/`APIRateLimit`/`UploadRateLimit`/`CustomRateLimit` 改为请求时从默认 Registry 懒创建限流器（单 App 行为不变；多 App 下各自 Registry 隔离）。
+- **`App.commitReplacedResources` 不再关闭被替换的全局 DB/Redis manager**（app.go）：多 App 下"previous"可能是另一个 App 的活跃 manager，关闭致 `redis: client is closed`。单 App 下 previous 为 init() 空默认（无 client，Close 本就是 no-op），无影响。用户若手动 `database.InitRedis`/`InitDB` 后再 `App.Init`，旧 client 的关闭由用户负责（非常规组合）。
+- **`cache.redisCache` 持注入 redis client**（cache/cache.go）：新增 `cache.NewRedisCacheWithRedis(client)`、`(*CacheManager).InitWithRedis(client)`、`cache.SwapDefaultCacheManager(m)`。`cache.NewRedisCache()` 仍存在（懒取全局 Redis，standalone 用法）。App 现经 `InitWithRedis(a.redisManager.Client())` 注入 per-App client。
+- **`middleware.RedisRateLimiter` 新增 `WithRedisClient(client)` 选项**（middleware/ratelimit.go）：`Allow`/`GetCount`/`Reset` 改用 `rl.redisClient()`（注入优先、`database.GetRedis()` 兜底，照 `jwt.TokenBlacklist` 模型）。包级 `RedisRateLimit` 系列仍用全局 Redis；per-App 隔离用 `middleware.NewRedisRateLimiter(..., middleware.WithRedisClient(app.RedisClient()))`。
+
+### Added
+
+- **`xlgo.WithTrace()`**：把 OpenTelemetry trace 纳入 App 生命周期--`Init` 调 `trace.Init`（按 `config.Trace`）、装入 `trace.Middleware`、`Shutdown` 调 `trace.Close`。实际导出由 `config.Trace.Enabled` 控制。**不做实例隔离**：OTel `TracerProvider`/`Propagator` 是进程级全局单例，多 App 共享（与 OTel 设计一致）。
+- **`xlgo.WithCronTask(name, schedule, handler)`**：注册定时任务到 App 专属调度器（蕴含 `WithCron`），替代旧的全局 `cron.AddTask` pre-Run 注册模式。
+- **`xlgo.App.Scheduler()` / `Cache()` / `RedisClient()`**：分别返回 App 专属的 cron 调度器、缓存服务、Redis 客户端，供多 App 隔离场景直接操作（绕过全局 facade）。
+- **`config.TraceConfig` + `Config.Trace` 字段**：链路追踪 YAML 配置（`service_name`/`exporter_type`/`endpoint`/`insecure`/`sample_ratio`/`enabled`/`propagator` 等）。`Validate` 在 `Enabled` 时校验 `sample_ratio` 范围；导出器/传播器枚举校验委托 `trace.Init`。
+- **`cron.SwapDefaultScheduler(s)`**、**`storage.SwapDefaultStorageManager(m)`**、**`cache.SwapDefaultCacheManager(m)`**、**`middleware.SwapDefaultRateLimitRegistry(r)`**：返回被替换的旧实例，供 App Init 失败回滚（照 `database.SwapDefaultManager`/`SwapDefaultRedisManager` 模式）。
+- **`storage.StorageManager.Close()`**：闭合 Init/Close 生命周期（与 database/redis/logger manager 对称），供 `App.closeResources`（Shutdown 路径）与 `rollbackReplacedResources`（Init 失败路径）对称收口。当前 LocalStorage/OSSStorage 无 closeable 资源（`oss.Client` 未暴露 Close），故为 no-op；经 `io.Closer` 断言调用驱动，未来带连接池的驱动实现 `io.Closer` 即被自动调用，框架骨架无需改动。
+- **`middleware.RateLimitRegistry`**：持 login/api/upload/custom 内存限流器，支持 per-App 隔离。`NewRateLimitRegistry()` / `Init()` / `Stop()` / `GetDefaultRateLimitRegistry()`。
+- **`xlgo.App.RateLimitRegistry()` + App-bound 限流中间件**（middleware/ratelimit.go）：`app.RateLimitRegistry().LoginRateLimit()`/`APIRateLimit()`/`UploadRateLimit()`/`CustomRateLimit(rate, window)` 返回的中间件捕获 App 自己的 Registry（请求时不查全局默认），实现多 App per-App 计数隔离。`RateLimitRegistry` 改在 `New()` 时预创建，使 getter 在 `Init` 前即可用于路由装配；`Init` 失败回滚时 `registry.Stop()` 收口 custom limiter，无泄漏。
+
+### Fixed
+
+- **多 App 限流器互不污染**（middleware/ratelimit.go）：App A `Shutdown` 不再经全局 `StopRateLimiters` 把 App B 的 loginLimiter 置 nil（致 B 下次请求懒创建新 limiter、计数清零，稳态客户端借 A 的 Shutdown 窗口绕过限流）。各 App 持自己的 `RateLimitRegistry`。
+- **多 App cron 调度器隔离**（cron/cron.go + app.go）：App A `Shutdown` 不再经 `cron.StopGlobalWithTimeout` 停掉共享全局调度器（B 的任务不受影响）。
+- **多 App storage / cache 隔离**（storage/cache + app.go）：App B `Init` 不再覆盖 App A 的 storage driver / cache redis；cache 不再硬编码 `database.GetRedis()`（致 A 的缓存读到 B 的 redis）。
+- **trace exporter 泄漏**（app.go）：`App.Shutdown` 现调 `trace.Close` 刷出批量 span 并释放 exporter 后台 goroutine/连接（H-14 修了 `Close` 幂等，但 App 此前从未调它）。
+- **多 App logger writer 跨 App 误杀**（app.go `commitReplacedResources`）：与 `previousDB`/`previousRedis` 对齐，`commitReplacedResources` 不再 `CloseDefaultSnapshot`（旧实现会关掉被替换的全局默认 logger 的 lumberjack writers--多 App 下那可能是另一个 App 的活跃 writer，致其后续写日志失败/丢失）。单 App 下旧默认为 Nop（无 writer，不泄漏）；用户手动配置 logger 后再 `App.Init` 的旧 writer 由用户负责。
+
+### 多 App 边界与已知缺口
+
+本次实例化收尾覆盖 cron/storage/cache/ratelimit + trace 生命周期。多 App 进程下的边界：
+
+- **包级限流 facade 仅绑定最后 Init 的 App**（middleware/ratelimit.go）：`LoginRateLimit`/`APIRateLimit`/`UploadRateLimit`/`CustomRateLimit`（包级）在请求时解析 `GetDefaultRateLimitRegistry()`（全局默认），多 App 下仅最后 Init 的 App 是全局默认。**已提供 per-App 计数隔离路径**：`app.RateLimitRegistry().LoginRateLimit()` 等 App-bound 中间件捕获 App 自己的 Registry（见 Added）。包级 facade 仍为单 App / backcompat 保留。
+- **`CustomRateLimit` 首请求时机**：包级 `CustomRateLimit` 的 `sync.Once` 在首请求时登记 limiter 到全局默认 Registry，首请求若在 `App.Init` swap 前会泄漏 cleanup goroutine。**App-bound 路径 `app.RateLimitRegistry().CustomRateLimit(rate, window)` 已无此问题**（登记到 App 的 Registry，由 `registry.Stop()` 收口）。HTTP server 在 Init 后才起，常规用法不触发泄漏。
+- **trace 进程全局共享**（trace/trace.go，设计限制）：OTel `TracerProvider`/`Propagator` 是进程级单例，任一 App `Shutdown` 调 `trace.Close` 会关闭全局 trace 导出，影响同进程其他 App。多 App 需自行管理 trace 生命周期（不在多个 App 上同时启用 `WithTrace`）。**不可修**（OTel 自身全局设计）。
+- **`StorageManager` 无 `Close`**（storage/storage.go，经核实：oss.Client 无 Close，当前为 no-op；已加 StorageManager.Close() 闭合生命周期（见 Added））：`LocalStorage` 无 closeable 资源；`OSSStorage` 持 `*oss.Client`，但 `oss.Client` **未暴露 `Close` 方法**（aliyun-oss-go-sdk），其 HTTP 空闲连接由 OS 超时 + GC 回收。无显式资源泄漏；未来带连接池的驱动实现 io.Closer 即被 Close 自动调用。
+
 ## [1.3.0] - 2026-07-12
 
 > 同义可失败 API 收敛 + 注释/文档一致性修复 + 前序评审收口。

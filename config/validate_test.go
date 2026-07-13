@@ -43,6 +43,24 @@ func TestValidateJWTSecretAbsentSkipped(t *testing.T) {
 	}
 }
 
+func TestValidateTraceSampleRatioWhenEnabled(t *testing.T) {
+	c := validBase()
+	c.Trace.Enabled = true
+	c.Trace.SampleRatio = 1.5
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "trace.sample_ratio") {
+		t.Fatalf("expected trace.sample_ratio error, got %v", err)
+	}
+}
+
+func TestValidateTraceDisabledSkipsRatio(t *testing.T) {
+	c := validBase()
+	// Enabled=false 时即使 SampleRatio 非法也不校验（trace 未启用）
+	c.Trace.SampleRatio = 1.5
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected error when trace disabled: %v", err)
+	}
+}
+
 func TestValidateDatabaseMissingHost(t *testing.T) {
 	c := validBase()
 	c.Database.Driver = "mysql"

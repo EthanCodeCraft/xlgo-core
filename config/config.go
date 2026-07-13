@@ -37,6 +37,7 @@ type Config struct {
 	Upload   UploadConfig   `mapstructure:"upload"`
 	Log      LogConfig      `mapstructure:"log"`
 	CORS     CORSConfig     `mapstructure:"cors"`
+	Trace    TraceConfig    `mapstructure:"trace"`
 }
 
 // Clone 返回 Config 的深拷贝（M-G 修复）。
@@ -522,6 +523,26 @@ type CORSConfig struct {
 	ExposedHeaders   []string `mapstructure:"exposed_headers"`   // 暴露的响应头
 	AllowCredentials bool     `mapstructure:"allow_credentials"` // 是否允许携带凭证
 	MaxAge           int      `mapstructure:"max_age"`           // 预检请求缓存时间（秒）
+}
+
+// TraceConfig 链路追踪配置（OpenTelemetry）。由 App 在 WithTrace 时读取并调 trace.Init。
+//
+// 语义说明：OTel 的 TracerProvider / TextMapPropagator 本身是进程级全局单例
+// （otel.SetTracerProvider 全局生效），故 trace 不做 per-App 实例隔离--多 App 进程
+// 共享同一 OTel 全局状态，这与 OTel 自身设计一致。App 仅负责把 trace 纳入生命周期
+// （Init/Close）与装入 Middleware，不提供实例隔离。
+//
+// Enabled=false（默认）时 trace.Init 安装 Noop tracer，Middleware 不 panic、不导出。
+type TraceConfig struct {
+	ServiceName    string  `mapstructure:"service_name"`    // 服务名（空则回退 cfg.App.Name）
+	ServiceVersion string  `mapstructure:"service_version"` // 服务版本
+	Environment    string  `mapstructure:"environment"`     // 运行环境
+	ExporterType   string  `mapstructure:"exporter_type"`   // otlp-http(默认) / otlp-grpc / stdout
+	Endpoint       string  `mapstructure:"endpoint"`        // OTLP collector 地址
+	Insecure       bool    `mapstructure:"insecure"`        // 明文（无 TLS）连接 collector
+	SampleRatio    float64 `mapstructure:"sample_ratio"`    // 采样比例 0.0-1.0
+	Enabled        bool    `mapstructure:"enabled"`         // 是否启用导出
+	Propagator     string  `mapstructure:"propagator"`      // w3c(默认) / b3 / jaeger
 }
 
 // GetAllowedOrigins 获取允许的域名列表

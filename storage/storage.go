@@ -725,6 +725,16 @@ func SetDefaultStorageManager(m *StorageManager) {
 	}
 }
 
+// SwapDefaultStorageManager 将指定 StorageManager 置为全局默认，并返回被替换的旧 Manager。
+// 旧 Manager 不会被关闭，供 App 初始化这类需要失败回滚的生命周期流程暂存（照
+// SwapDefaultRedisManager / database.SwapDefaultManager 模式）。nil 被忽略，返回当前默认。
+func SwapDefaultStorageManager(m *StorageManager) *StorageManager {
+	if m == nil {
+		return DefaultStorage.Load()
+	}
+	return DefaultStorage.Swap(m)
+}
+
 // Init 初始化存储
 func (m *StorageManager) Init(cfg *config.StorageConfig) error {
 	if cfg == nil {
@@ -766,6 +776,24 @@ func (m *StorageManager) Set(s Storage) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.current = s
+}
+
+// Close 释放存储资源，闭合 StorageManager 的 Init/Close 生命周期（与 database/redis/logger
+// manager 对齐，供 App.closeResources 统一调用）。当前 LocalStorage 无可关资源；OSSStorage 的
+// *oss.Client 未暴露 Close（aliyun-oss-go-sdk），故当前为 no-op。保留此方法为未来驱动
+// （S3/MinIO/自研等带连接池的驱动）预留收口点：实现了 io.Closer 的 Storage 实现会被自动调用，
+// 框架骨架无需改动。幂等（未初始化或驱动非 io.Closer 时 no-op）。
+func (m *StorageManager) Close() error {
+	m.mu.Lock()
+	current := m.current
+	m.mu.Unlock()
+	if current == nil {
+		return nil
+	}
+	if c, ok := current.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // --- 包级 facade（代理到 DefaultStorage，兼容存量） ---

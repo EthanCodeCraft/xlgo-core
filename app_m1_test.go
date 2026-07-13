@@ -173,14 +173,13 @@ func TestAppInitFailureRollsBackCron_M1(t *testing.T) {
 	})
 
 	var ran atomic.Int32
-	cron.AddTask("canary-m1", cron.Every(time.Millisecond), func(context.Context) error {
-		ran.Add(1)
-		return nil
-	})
-
+	// Phase 3：canary 注册到 App 专属调度器（WithCronTask），Init 失败时 stopCron 必须停掉它。
 	app := xlgo.New(
 		xlgo.WithConfig(testConfig(18104)),
-		xlgo.WithCron(),
+		xlgo.WithCronTask("canary-m1", cron.Every(time.Millisecond), func(context.Context) error {
+			ran.Add(1)
+			return nil
+		}),
 		xlgo.WithHook(xlgo.Hook{Name: "fail", OnInit: func(*xlgo.App) error { return errors.New("boom-init") }}),
 	)
 	err := app.Init()

@@ -32,17 +32,31 @@ type CacheService interface {
 //
 // 不在构造时快照 redis.Client（M12 修复：原 NewRedisCache 构造时取 database.GetRedis()，
 // 若在 database.InitRedis 之前构造则永久 nil、即使后续 Redis 就绪也是 no-op）。
-// 改为每次操作实时取 database.GetRedis()，使"先构造后 Init Redis"的顺序也能正确工作。
-type redisCache struct{}
+// 改为每次操作实时取 redis 客户端，使"先构造后 Init Redis"的顺序也能正确工作。
+//
+// Phase 4：持有可选的注入 client（NewRedisCacheWithRedis），注入优先、否则回退全局
+// database.GetRedis()（照 jwt.TokenBlacklist.redisClient 模型）。App 经 InitWithRedis
+// 注入 per-App redisManager.Client()，使缓存走 App 自己的 Redis 而非全局（修复跨 App 串越）。
+type redisCache struct {
+	injectedClient *redis.Client
+}
 
-// client 返回当前 Redis 客户端（实时取，未初始化则 nil）。
+// client 返回缓存使用的 Redis 客户端：注入优先，否则回退全局 database.GetRedis()。
 func (c *redisCache) client() *redis.Client {
+	if c != nil && c.injectedClient != nil {
+		return c.injectedClient
+	}
 	return database.GetRedis()
 }
 
-// NewRedisCache 创建 Redis 缓存实例
+// NewRedisCache 创建 Redis 缓存实例（懒取全局 Redis，兼容 standalone 用法）。
 func NewRedisCache() CacheService {
 	return &redisCache{}
+}
+
+// NewRedisCacheWithRedis 创建使用指定 Redis 客户端的缓存实例（多 Redis/测试隔离）。
+func NewRedisCacheWithRedis(client *redis.Client) CacheService {
+	return &redisCache{injectedClient: client}
 }
 
 // Get 获取缓存值。命中返回 (true, nil)；未命中返回 (false, nil)；
@@ -191,11 +205,28 @@ func SetDefaultCacheManager(m *CacheManager) {
 	}
 }
 
+// SwapDefaultCacheManager 将指定 CacheManager 置为全局默认，返回被替换的旧 Manager。
+// 旧 Manager 不会被关闭，供 App 初始化这类需要失败回滚的生命周期流程暂存（照
+// SwapDefaultRedisManager / SwapDefaultStorageManager 模式）。nil 被忽略，返回当前默认。
+func SwapDefaultCacheManager(m *CacheManager) *CacheManager {
+	if m == nil {
+		return defaultCachePtr.Load()
+	}
+	return defaultCachePtr.Swap(m)
+}
+
 // Init 初始化缓存服务（基于 DefaultRedis 的客户端）。
 func (m *CacheManager) Init() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.svc = NewRedisCache()
+}
+
+// InitWithRedis 用指定 Redis 客户端初始化缓存服务（多 Redis/测试隔离）。
+func (m *CacheManager) InitWithRedis(client *redis.Client) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.svc = NewRedisCacheWithRedis(client)
 }
 
 // Set 设置缓存服务实现（用于注入 mock 或自定义实现）。

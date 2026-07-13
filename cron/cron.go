@@ -784,11 +784,16 @@ func Cron(minute, hour string) *CronSchedule {
 	return &CronSchedule{Minute: minute, Hour: hour}
 }
 
-// 全局调度器。用 atomic.Pointer 懒初始化，使 StopGlobalWithTimeout 能安全 peek
-// 是否已创建而不触发创建，也消除原 once+裸指针读写的竞态。
+// 全局调度器。init 时预创建默认实例（与 storage.DefaultStorage / cache.defaultCachePtr
+// 对齐），使 SwapDefaultScheduler 返回非 nil、App 回滚总能恢复一个有效默认。用 atomic.Pointer
+// 保护并发读写，消除原 once+裸指针读写竞态。GetScheduler 仍保留懒初始化分支作防御。
 var globalScheduler atomic.Pointer[Scheduler]
 
-// GetScheduler 获取全局调度器（懒初始化，并发安全）。
+func init() {
+	globalScheduler.Store(NewScheduler())
+}
+
+// GetScheduler 获取全局调度器（并发安全；init 后通常非 nil，保留懒初始化作防御）。
 func GetScheduler() *Scheduler {
 	if s := globalScheduler.Load(); s != nil {
 		return s
@@ -798,6 +803,16 @@ func GetScheduler() *Scheduler {
 		return ns
 	}
 	return globalScheduler.Load()
+}
+
+// SwapDefaultScheduler 将指定 Scheduler 置为全局默认，并返回被替换的旧调度器。
+// 旧调度器不会被停止，供 App 初始化这类需要失败回滚的生命周期流程暂存（照
+// database.SwapDefaultManager / SwapDefaultRedisManager 模式）。nil 被忽略，返回当前默认。
+func SwapDefaultScheduler(s *Scheduler) *Scheduler {
+	if s == nil {
+		return globalScheduler.Load()
+	}
+	return globalScheduler.Swap(s)
 }
 
 // AddTask 添加任务到全局调度器

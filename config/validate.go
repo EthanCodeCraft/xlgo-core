@@ -82,6 +82,14 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Trace：仅当启用时校验采样比例。ExporterType/Propagator 的枚举校验委托 trace.Init
+	// （随 OTel 版本可能扩展，避免 config 与 trace 双源枚举漂移）。
+	if c.Trace.Enabled {
+		if c.Trace.SampleRatio < 0 || c.Trace.SampleRatio > 1 {
+			problems = append(problems, fmt.Sprintf("trace.sample_ratio 超出范围(0.0-1.0): %v", c.Trace.SampleRatio))
+		}
+	}
+
 	if len(problems) > 0 {
 		return fmt.Errorf("配置校验失败: %s", strings.Join(problems, "; "))
 	}
