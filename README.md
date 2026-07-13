@@ -339,6 +339,8 @@ err := userRepo.WithTransaction(ctx, func(txRepo *repository.BaseRepo[model.User
 
 ### Redis 缓存
 
+> **v1.4.0**：App 经 `WithRedis()` 启用时自动用 App 的 Redis 客户端初始化缓存（多 App 隔离，不串越）。下方 `cache.Init()` 用于 standalone。
+
 ```go
 // 初始化缓存
 cache.Init()
@@ -415,6 +417,8 @@ err := cache.WithLockAutoExtend(ctx, key, 30*time.Second, 10*time.Second, func(c
 **分布式锁安全特性**：使用 Lua 脚本 + UUID Token，只有锁的持有者才能释放。
 
 ### Redis 分布式限流
+
+> **v1.4.0**：多 App 走各自 Redis 用 `middleware.NewRedisRateLimiter(..., middleware.WithRedisClient(app.RedisClient()))`。
 
 ```go
 // 内存限流（单实例）
@@ -528,6 +532,11 @@ hub.Broadcast([]byte("广播消息"))
 
 ### 定时任务
 
+> **v1.4.0**：App 持专属调度器（实例隔离）。**App 管理的任务用 `xlgo.WithCronTask(name, schedule, handler)`
+> 注册**（蕴含启用 cron，`Init` 时注册+启动，`Shutdown` 时停止）。下方包级 `cron.AddTask`/`cron.Start`
+> 仅用于 standalone（无 App）或 `Init` 之后；**`Init` 之前**调包级 `cron.AddTask` 会注册到 init 默认
+> 调度器、被 App swap 丢弃。`app.Scheduler()` 供动态注册与管理。
+
 ```go
 // 每隔 5 分钟执行
 cron.AddTask("cleanup", cron.Every(5*time.Minute), func(ctx context.Context) error {
@@ -619,6 +628,8 @@ userType := middleware.GetUserType(c)
 ```
 
 ### 限流中间件
+
+> **v1.4.0**：App `Shutdown` 自动 `registry.Stop()`（不再调全局 `StopRateLimiters`，避免误停其他 App）。多 App per-App 计数隔离用 `app.RateLimitRegistry().LoginRateLimit()` 等 App-bound 中间件。
 
 ```go
 // 登录限流（每分钟 10 次）
@@ -841,6 +852,22 @@ docker run -d -p 8080:8080 xlgo-app:latest
 ## 更新日志
 
 > 完整变更历史见 [CHANGELOG.md](./CHANGELOG.md)。
+
+### v1.4.0 (2026-07-12)
+
+> **instance+facade 一致性收尾**：cron/storage/cache/ratelimit 实例化（App 持 per-App 实例 + `SwapDefault*` + 包级 facade 代理，照 `database.Manager`/`jwt.Manager` 模式），消除单进程多 App 互相污染；trace 纳入 App 生命周期（`WithTrace`）；删除 `WithoutWire` 空函数。`go vet` + `go build` + `go test -race ./...` 全绿。完整变更见 [CHANGELOG.md](./CHANGELOG.md)。
+
+主要破坏性变更（升级前必读）：
+
+- **`xlgo.WithoutWire()` 删除**：v1.1.0 wire 包删除后遗留的空 no-op，直接删除调用即可（无行为变化）。
+- **`cron.AddTask` 在 `App.Init` 之前注册失效**：App 持专属调度器，pre-Init 包级 `cron.AddTask` 注册到 init 默认调度器、被 App swap 丢弃。改用 `xlgo.WithCronTask(name, schedule, handler)`（或 Init 后 `app.Scheduler().AddTask`）。
+- **`middleware.StopRateLimiters` 语义收窄**：仅停默认 Registry；App `Shutdown` 调 `app` 自己的 `registry.Stop()`，不再误停其他 App 限流器。
+- **`commitReplacedResources` 不再关闭 `previousDB`/`previousRedis`/`loggerSnapshot`**：多 App 下 previous 可能是另一 App 的活跃资源（致 `redis: client is closed` / logger writer 误杀）。单 App 无影响（init 默认无资源）。
+- **cache/ratelimit redis 注入**（jwt 模型）：`cache.NewRedisCacheWithRedis`/`CacheManager.InitWithRedis`；`middleware.WithRedisClient`。
+
+新增：`WithTrace`/`WithCronTask`；`app.Scheduler()`/`Cache()`/`RedisClient()`/`RateLimitRegistry()`；`cron/storage/cache/middleware` 各 `SwapDefault*`；`config.TraceConfig`；`middleware.RateLimitRegistry` + App-bound 限流中间件；`storage.StorageManager.Close()`。
+
+升级：`go get github.com/EthanCodeCraft/xlgo-core@v1.4.0`（⚠️ 含破坏性变更，详见 CHANGELOG 迁移说明）
 
 ### v1.2.0 (2026-07-04)
 

@@ -513,6 +513,9 @@ type User struct {
 
 ### 5.1 初始化缓存
 
+> **v1.4.0**：App 用户经 `WithRedis()` 启用时，`Init` 自动用 `app.redisManager.Client()` 初始化缓存
+> （走 App 自己的 Redis，多 App 隔离，不串越）。下方 `cache.Init()`（包级）用于 standalone 或回退全局 Redis。
+
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/cache"
 
@@ -908,6 +911,12 @@ token := middleware.GetCSRFToken(c)
 
 ### 8.4 限流（支持 Redis 分布式限流）
 
+> **v1.4.0**：App 持专属 `RateLimitRegistry`，`Shutdown` 调 `registry.Stop()`（不再调全局
+> `StopRateLimiters`，避免误停其他 App 的限流器）。下方包级 `LoginRateLimit`/`APIRateLimit`/等仍可用
+> （请求时解析全局默认 Registry，单 App 场景无变化）。**多 App per-App 计数隔离**用
+> `app.RateLimitRegistry().LoginRateLimit()` 等 App-bound 中间件（捕获 App 自己的 Registry，不查全局）。
+> **多 App 走各自 Redis** 用 `middleware.NewRedisRateLimiter(..., middleware.WithRedisClient(app.RedisClient()))`。
+
 ```go
 // 初始化限流器
 middleware.InitRateLimiters()
@@ -1212,6 +1221,10 @@ storage:
 ```
 
 ### 10.3 使用存储
+
+> **v1.4.0**：App 用户经 `WithStorage()` 启用时，`Init` 自动初始化存储并提升为全局默认；`Shutdown`
+> 经 `StorageManager.Close()` 收口（当前 LocalStorage/OSSStorage 无 closeable 资源为 no-op，为未来
+> 驱动预留）。下方 `storage.Init()`（包级）用于 standalone。
 
 ```go
 import "github.com/EthanCodeCraft/xlgo-core/storage"
@@ -1536,6 +1549,24 @@ count := hub.Count()
 
 ## 13. 定时任务
 
+> **v1.4.0**：App 持专属调度器（实例隔离，多 App 互不污染）。**App 管理的任务用
+> `xlgo.WithCronTask(name, schedule, handler)` 注册**（蕴含启用 cron，`Init` 时注册+启动，
+> `Shutdown` 时停止并等待在跑任务退出）。下方包级 `cron.AddTask`/`cron.Start`/`cron.Stop` 仍可用于
+> standalone（无 App）或 `Init` 之后；**`Init` 之前**调包级 `cron.AddTask` 会注册到 init 默认
+> 调度器、被 App swap 丢弃。`app.Scheduler()` 返回 App 调度器，供动态注册与管理
+> （`AddTask`/`RemoveTask`/`RunTask`/`ListTasks`）。
+>
+> ```go
+> app := xlgo.New(xlgo.WithConfig(cfg),
+>     xlgo.WithCronTask("cleanup", cron.Every(5*time.Minute), func(ctx context.Context) error {
+>         return cleanupOldData()
+>     }),
+>     xlgo.WithCronTask("daily_report", cron.Daily(2, 0), generateReport),
+> )
+> // 动态注册（Init 后）：app.Scheduler().AddTask(...)
+> if err := app.Run(); err != nil { /* ... */ }
+> ```
+
 ### 13.1 添加任务
 
 ```go
@@ -1585,6 +1616,17 @@ scheduler.EnableTask("cleanup")     // 启用任务
 ---
 
 ## 14. 链路追踪
+
+> **v1.4.0**：`xlgo.WithTrace()` 把 trace 纳入 App 生命周期--`Init` 按 `config.Trace` 调
+> `trace.Init`、装入 `trace.Middleware`、`Shutdown` 调 `trace.Close` 刷出 span 并释放 exporter
+> 后台 goroutine。下方手动 `trace.Init`/`trace.Close`/`trace.Middleware` 仍可用于 standalone
+> （无 App）。**trace 不做实例隔离**--OTel `TracerProvider` 是进程级全局单例，多 App 进程共享，
+> 任一 `Shutdown` 会关全局导出；多 App 不要同时开 `WithTrace`。
+>
+> ```go
+> app := xlgo.New(xlgo.WithConfigPath("config.yaml"), xlgo.WithTrace())
+> // config.yaml 配置 trace.enabled / trace.endpoint / trace.exporter_type / trace.sample_ratio ...
+> ```
 
 ### 14.1 初始化
 
